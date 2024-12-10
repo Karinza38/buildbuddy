@@ -19,8 +19,10 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
+	"github.com/buildbuddy-io/buildbuddy/server/rpc/interceptors"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/background"
+	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/canary"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -178,6 +180,9 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
+
+	ctx = interceptors.AddAuthToContext(s.env, ctx)
+	ctx = bazel_request.ParseRequestMetadataOnce(ctx)
 
 	metrics.RemoteExecutionTasksStartedCount.Inc()
 
@@ -398,12 +403,6 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 	md.OutputUploadCompletedTimestamp = timestamppb.Now()
 	md.WorkerCompletedTimestamp = timestamppb.Now()
 	actionResult.ExecutionMetadata = md
-
-	if !task.GetAction().GetDoNotCache() && cmdResult.Error == nil && cmdResult.ExitCode == 0 {
-		if err := cachetools.UploadActionResult(ctx, acClient, adInstanceDigest, actionResult); err != nil {
-			return finishWithErrFn(status.UnavailableErrorf("Error uploading action result: %s", err.Error()))
-		}
-	}
 
 	// If there's an error that we know the client won't retry, return an error
 	// so that the scheduler can retry it.
