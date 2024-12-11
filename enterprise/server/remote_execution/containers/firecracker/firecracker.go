@@ -38,6 +38,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/uffd"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/vbd"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/vmexec_client"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ociconv"
@@ -214,6 +215,11 @@ const (
 	// Firecracker does not allow VMs over a certain size.
 	// See MAX_SUPPORTED_VCPUS in firecracker repo.
 	firecrackerMaxCPU = 32
+
+	// Special file that actions can create in the workspace directory to
+	// invalidate the snapshot the action was run in. This can be written
+	// if the action detects that the snapshot was corrupted upon startup.
+	invalidateSnapshotMarkerFile = ".BUILDBUDDY_INVALIDATE_SNAPSHOT"
 )
 
 var (
@@ -1507,7 +1513,7 @@ func (c *FirecrackerContainer) getJailerConfig(ctx context.Context, kernelImageP
 	cgroupSettings := c.cgroupSettings
 	if cgroupSettings == nil && *enableCPUWeight {
 		// Use the same weight calculation used in ociruntime.
-		cpuWeight := oci.CPUSharesToWeight(oci.CPUMillisToShares(c.cpuWeightMillis))
+		cpuWeight := tasksize.CPUSharesToWeight(tasksize.CPUMillisToShares(c.cpuWeightMillis))
 		cgroupSettings = &scpb.CgroupSettings{
 			CpuWeight: proto.Int64(cpuWeight),
 		}
@@ -1630,10 +1636,10 @@ func mountExt4ImageUsingLoopDevice(imagePath string, mountTarget string) (lm *lo
 }
 
 // copyOutputsToWorkspace copies output files from the workspace filesystem
-// image to the local filesystem workdir. It will not overwrite existing files
-// and it will skip copying rootfs-overlay files. Callers should ensure that
-// data has already been synced to the workspace filesystem and the VM has
-// been paused before calling this.
+// image to the local filesystem workdir. It does not overwrite existing files.
+//
+// Callers should ensure that data has already been synced to the workspace
+// filesystem and the VM has been paused before calling this.
 func (c *FirecrackerContainer) copyOutputsToWorkspace(ctx context.Context) error {
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
@@ -1673,7 +1679,8 @@ func (c *FirecrackerContainer) copyOutputsToWorkspace(ctx context.Context) error
 		}
 		defer m.Unmount()
 	} else {
-		if err := ext4.ImageToDirectory(ctx, workspaceExt4Path, wsDir); err != nil {
+		outputPaths := workspacePathsToExtract(c.task)
+		if err := ext4.ImageToDirectory(ctx, workspaceExt4Path, wsDir, outputPaths); err != nil {
 			return err
 		}
 	}
@@ -1681,10 +1688,6 @@ func (c *FirecrackerContainer) copyOutputsToWorkspace(ctx context.Context) error
 	walkErr := fs.WalkDir(os.DirFS(wsDir), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
-		}
-		// Skip filesystem layerfs write-layer files.
-		if strings.HasPrefix(path, "bbvmroot/") || strings.HasPrefix(path, "bbvmwork/") {
-			return nil
 		}
 		targetLocation := filepath.Join(c.actionWorkingDir, path)
 		alreadyExists, err := disk.FileExists(ctx, targetLocation)
@@ -2423,13 +2426,14 @@ func (c *FirecrackerContainer) remove(ctx context.Context) error {
 		c.memoryStore = nil
 	}
 
-	exists, err := disk.FileExists(ctx, filepath.Join(c.actionWorkingDir, ".BUILDBUDDY_INVALIDATE_SNAPSHOT"))
+	exists, err := disk.FileExists(ctx, filepath.Join(c.actionWorkingDir, invalidateSnapshotMarkerFile))
 	if err != nil {
-		log.CtxWarningf(ctx, "Failed to check existence of .BUILDBUDDY_INVALIDATE_SNAPSHOT: %s", err)
+		log.CtxWarningf(ctx, "Failed to check existence of %s: %s", invalidateSnapshotMarkerFile, err)
 	} else if exists {
+		log.CtxInfof(ctx, "Action created %s file in workspace root; invalidating snapshot for key %v", invalidateSnapshotMarkerFile, c.SnapshotKeySet().GetBranchKey())
 		_, err = snaploader.NewSnapshotService(c.env).InvalidateSnapshot(ctx, c.SnapshotKeySet().GetBranchKey())
 		if err != nil {
-			log.CtxWarningf(ctx, "Failed to invalidate snapshot despite existence of .BUILDBUDDY_INVALIDATE_SNAPSHOT: %s", err)
+			log.CtxWarningf(ctx, "Failed to invalidate snapshot despite existence of %s: %s", invalidateSnapshotMarkerFile, err)
 		}
 	}
 
@@ -2863,4 +2867,29 @@ func getRandomNUMANode() (int, error) {
 	}
 
 	return nodes[rand.IntN(len(nodes))], nil
+}
+
+// Returns the paths relative to the workspace root that should be copied back
+// to the action workspace directory after execution has completed.
+//
+// For performance reasons, we only extract the action's declared outputs,
+// unless the action is running with preserve-workspace=true.
+func workspacePathsToExtract(task *repb.ExecutionTask) []string {
+	if platform.IsTrue(platform.FindEffectiveValue(task, platform.PreserveWorkspacePropertyName)) {
+		return []string{"/"}
+	}
+
+	// Special files
+	// TODO: declare this list as a constant somewhere?
+	paths := []string{
+		".BUILDBUDDY_DO_NOT_RECYCLE",
+		".BUILDBUDDY_INVALIDATE_SNAPSHOT",
+	}
+
+	// Declared paths
+	paths = append(paths, task.GetCommand().GetOutputDirectories()...)
+	paths = append(paths, task.GetCommand().GetOutputFiles()...)
+	paths = append(paths, task.GetCommand().GetOutputPaths()...)
+
+	return paths
 }

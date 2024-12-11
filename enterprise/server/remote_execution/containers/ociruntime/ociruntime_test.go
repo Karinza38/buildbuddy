@@ -24,6 +24,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/persistentworker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
@@ -33,6 +34,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testtar"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -65,6 +67,8 @@ func init() {
 }
 
 func setupNetworking(t *testing.T) {
+	err := networking.Configure(context.Background())
+	require.NoError(t, err)
 	testnetworking.Setup(t)
 	// Disable network pooling in tests to simplify cleanup.
 	flags.Set(t, "executor.oci.network_pool_size", 0)
@@ -1194,7 +1198,7 @@ func TestCPUShares(t *testing.T) {
 	res := c.Run(ctx, cmd, wd, oci.Credentials{})
 
 	require.NoError(t, res.Error)
-	expectedCPUWeight := fmt.Sprintf("%d\n", ociCPUSharesToCgroup2Weight(2500))
+	expectedCPUWeight := fmt.Sprintf("%d\n", tasksize.CPUSharesToWeight(tasksize.CPUMillisToShares(2500)))
 	assert.Equal(t, expectedCPUWeight, string(res.Stdout))
 	assert.Empty(t, string(res.Stderr))
 	assert.Equal(t, 0, res.ExitCode)
@@ -1399,9 +1403,4 @@ func hasMountPermissions(t *testing.T) bool {
 	err := syscall.Unmount(dir2, syscall.MNT_FORCE)
 	require.NoError(t, err, "unmount")
 	return true
-}
-
-func ociCPUSharesToCgroup2Weight(shares int64) int64 {
-	// See https://github.com/containers/crun/blob/main/crun.1.md#cpu-controller
-	return (1 + ((shares-2)*9999)/262142)
 }
