@@ -24,6 +24,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/persistentworker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
@@ -33,6 +34,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testtar"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -65,6 +67,8 @@ func init() {
 }
 
 func setupNetworking(t *testing.T) {
+	err := networking.Configure(context.Background())
+	require.NoError(t, err)
 	testnetworking.Setup(t)
 	// Disable network pooling in tests to simplify cleanup.
 	flags.Set(t, "executor.oci.network_pool_size", 0)
@@ -1194,7 +1198,7 @@ func TestCPUShares(t *testing.T) {
 	res := c.Run(ctx, cmd, wd, oci.Credentials{})
 
 	require.NoError(t, res.Error)
-	expectedCPUWeight := fmt.Sprintf("%d\n", ociCPUSharesToCgroup2Weight(2500))
+	expectedCPUWeight := fmt.Sprintf("%d\n", tasksize.CPUSharesToWeight(tasksize.CPUMillisToShares(2500)))
 	assert.Equal(t, expectedCPUWeight, string(res.Stdout))
 	assert.Empty(t, string(res.Stderr))
 	assert.Equal(t, 0, res.ExitCode)
@@ -1401,7 +1405,62 @@ func hasMountPermissions(t *testing.T) bool {
 	return true
 }
 
-func ociCPUSharesToCgroup2Weight(shares int64) int64 {
-	// See https://github.com/containers/crun/blob/main/crun.1.md#cpu-controller
-	return (1 + ((shares-2)*9999)/262142)
+// TestPullImage is a simple integration test that pulls images from a public repository.
+// Can be used as a smoke test to verify that the image pulling functionality works.
+// This is setup as a separate, manual test target in BUILD file to help aid development.
+//
+// Example:
+//
+//	bazel test \
+//	     --config=remote \
+//	     --test_output=all \
+//	     --test_sharding_strategy=disabled \
+//	     --test_tag_filters=+docker \
+//	     --test_filter=TestPullImage \
+//	     --test_env=TEST_PULLIMAGE=1 \
+//	     enterprise/server/remote_execution/containers/ociruntime:ociruntime_test
+func TestPullImage(t *testing.T) {
+	if os.Getenv("TEST_PULLIMAGE") == "" {
+		t.Skip("Skipping integration test..")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		image string
+	}{
+		{
+			name:  "dockerhub_busybox",
+			image: "busybox:latest",
+		},
+		{
+			name:  "ghcr_nix",
+			image: "ghcr.io/avdv/nix-build@sha256:5f731adacf7290352fed6c1960dfb56ec3fdb31a376d0f2170961fbc96944d50",
+		},
+		{
+			name:  "executor_image",
+			image: "gcr.io/flame-public/buildbuddy-executor-enterprise:latest",
+		},
+		{
+			name:  "executor_docker",
+			image: "gcr.io/flame-public/executor-docker-default:enterprise-v1.6.0",
+		},
+		{
+			name:  "workflow_2004",
+			image: "gcr.io/flame-public/rbe-ubuntu20-04:latest",
+		},
+		{
+			name:  "workflow_2204",
+			image: "gcr.io/flame-public/rbe-ubuntu22-04:latest",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layerDir := t.TempDir()
+			imgStore := ociruntime.NewImageStore(layerDir)
+
+			ctx := context.Background()
+			img, err := imgStore.Pull(ctx, tc.image, oci.Credentials{})
+			require.NoError(t, err)
+			require.NotNil(t, img)
+		})
+	}
 }
