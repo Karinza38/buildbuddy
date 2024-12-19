@@ -398,6 +398,9 @@ func handleSymlink(dirHelper *DirHelper, rootDir string, cmd *repb.Command, acti
 	// Check whether the current client is using REAPI version before or after v2.1.
 	if len(cmd.OutputPaths) > 0 && len(cmd.OutputFiles) == 0 && len(cmd.OutputDirectories) == 0 {
 		// REAPI >= v2.1
+		if !dirHelper.IsOutputPath(fqfn) {
+			return nil
+		}
 		actionResult.OutputSymlinks = append(actionResult.OutputSymlinks, symlink)
 		// REAPI specification:
 		//   Servers that wish to be compatible with v2.0 API should still
@@ -420,10 +423,9 @@ func handleSymlink(dirHelper *DirHelper, rootDir string, cmd *repb.Command, acti
 		}
 		if symlinkInfo.IsDir() {
 			actionResult.OutputDirectorySymlinks = append(actionResult.OutputDirectorySymlinks, symlink)
-			return nil
+		} else {
+			actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
 		}
-
-		actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
 		return nil
 	}
 
@@ -444,7 +446,6 @@ func handleSymlink(dirHelper *DirHelper, rootDir string, cmd *repb.Command, acti
 }
 
 func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, instanceName string, digestFunction repb.DigestFunction_Value, rootDir string, cmd *repb.Command, actionResult *repb.ActionResult) (*TransferInfo, error) {
-	txInfo := &TransferInfo{}
 	startTime := time.Now()
 	outputDirectoryPaths := make([]string, 0)
 	filesToUpload := make([]*fileToUpload, 0)
@@ -502,8 +503,6 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 				if _, ok := dirHelper.FindParentOutputPath(childFullPath); !ok && !isOutputDirectory {
 					continue
 				}
-				txInfo.FileCount += 1
-				txInfo.BytesTransferred += dirNode.GetDigest().GetSizeBytes()
 				directory.Directories = append(directory.Directories, dirNode)
 			} else if info.Mode().IsRegular() {
 				if !dirHelper.ShouldUploadFile(childFullPath) {
@@ -513,8 +512,6 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 				if err != nil {
 					return nil, err
 				}
-				txInfo.FileCount += 1
-				txInfo.BytesTransferred += fileNode.GetDigest().GetSizeBytes()
 				directory.Files = append(directory.Files, fileNode)
 			} else if info.Mode()&os.ModeSymlink == os.ModeSymlink {
 				if err := handleSymlink(dirHelper, rootDir, cmd, actionResult, directory, childFullPath); err != nil {

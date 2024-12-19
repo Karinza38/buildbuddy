@@ -138,8 +138,8 @@ func TestGuestAPIVersion(t *testing.T) {
 	// Note that if you go with option 1, ALL VM snapshots will be invalidated
 	// which will negatively affect customer experience. Be careful!
 	const (
-		expectedHash    = "d9644bd5f756f270b44cba7fef86476de294590c6ffaca232cd32e9bef80a477"
-		expectedVersion = "13"
+		expectedHash    = "e1c2d9e722ba1c640053a9cd58c35ae663a588db617d64c426f104d76e9f45c8"
+		expectedVersion = "14"
 	)
 	assert.Equal(t, expectedHash, firecracker.GuestAPIHash)
 	assert.Equal(t, expectedVersion, firecracker.GuestAPIVersion)
@@ -185,8 +185,10 @@ type envOpts struct {
 }
 
 func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEnv {
+	err := networking.Configure(ctx)
+	require.NoError(t, err)
 	testnetworking.Setup(t)
-	err := networking.EnableMasquerading(ctx)
+	err = networking.EnableMasquerading(ctx)
 	require.NoError(t, err)
 	// Set up a lockfile directory to coordinate network locking across sharded
 	// test processes on the host.
@@ -1404,7 +1406,11 @@ func TestFirecrackerRun_ReapOrphanedZombieProcess(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"sh.pid", "sleep.pid"},
+		},
+	}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1815,7 +1821,11 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"preserves.txt"},
+		},
+	}, opts)
 	require.NoError(t, err)
 	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
 	require.NoError(t, err)
@@ -1988,7 +1998,11 @@ func TestFirecrackerRun_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"output.txt"},
+		},
+	}, opts)
 	require.NoError(t, err)
 
 	cmd := &repb.Command{Arguments: []string{"sh", "-c", `
@@ -2032,7 +2046,11 @@ func TestFirecrackerExec_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"output.txt"},
+		},
+	}, opts)
 	require.NoError(t, err)
 	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
 	require.NoError(t, err)
