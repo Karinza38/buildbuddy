@@ -20,8 +20,10 @@ go_library(
         "//server/metrics",
         "//server/remote_cache/cachetools",
         "//server/remote_cache/digest",
+        "//server/rpc/interceptors",
         "//server/util/alert",
         "//server/util/background",
+        "//server/util/bazel_request",
         "//server/util/canary",
         "//server/util/disk",
         "//server/util/log",
@@ -31,6 +33,7 @@ go_library(
         "//server/util/tracing",
         "@com_github_prometheus_client_golang//prometheus",
         "@org_golang_google_protobuf//types/known/anypb",
+        "@org_golang_google_protobuf//types/known/durationpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )

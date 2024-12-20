@@ -356,7 +356,7 @@ func getBaseBranchAndCommit(remoteData string) (branch string, commit string, er
 	if currentBranchExistsRemotely {
 		branch = currentBranch
 
-		currentCommitHash, err := runGit("rev-parse", "HEAD")
+		currentCommitHash, err := getHeadCommitForLocalBranch("HEAD")
 		if err != nil {
 			return "", "", status.WrapError(err, "get current commit hash")
 		}
@@ -385,9 +385,9 @@ func getBaseBranchAndCommit(remoteData string) (branch string, commit string, er
 		}
 		branch = defaultBranch
 
-		defaultBranchCommitHash, err := getHeadCommitForRemoteBranch(remoteData, defaultBranch)
+		defaultBranchCommitHash, err := getHeadCommitForLocalBranch(defaultBranch)
 		if err != nil {
-			return "", "", status.WrapError(err, "get default branch commit hash")
+			return "", "", err
 		}
 		commit = defaultBranchCommitHash
 	}
@@ -443,7 +443,17 @@ func getHeadCommitForRemoteBranch(remoteData string, branch string) (string, err
 	if len(match) > 1 {
 		return match[1], nil
 	}
-	return "", status.NotFoundErrorf("Failed to get HEAD commit for branch %s from:\n%s", branch, remoteData)
+	return "", status.NotFoundErrorf("failed to get HEAD commit for remote branch %s from:\n%s", branch, remoteData)
+}
+
+// getHeadCommitForLocalBranch returns the commit at HEAD for the local branch.
+func getHeadCommitForLocalBranch(branch string) (string, error) {
+	headCommit, err := runGit("rev-parse", branch)
+	if err != nil {
+		return "", status.WrapErrorf(err, "get head commit for local branch %s", branch)
+	}
+	headCommit = strings.Trim(headCommit, "\n")
+	return headCommit, nil
 }
 
 // generates diffs between the current state of the repo and `baseCommit`
@@ -767,6 +777,7 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 		return 1, status.UnavailableErrorf("could not connect to BuildBuddy remote bazel service %q: %s", opts.Server, err)
 	}
 	bbClient := bbspb.NewBuildBuddyServiceClient(conn)
+	execClient := repb.NewExecutionClient(conn)
 
 	reqOS := runtime.GOOS
 	if *execOs != "" {
@@ -898,7 +909,7 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 
 	eg := errgroup.Group{}
 	var inRsp *inpb.GetInvocationResponse
-	var exRsp *espb.GetExecutionResponse
+	var executeResponse *repb.ExecuteResponse
 	eg.Go(func() error {
 		var err error
 		inRsp, err = bbClient.GetInvocation(ctx, &inpb.GetInvocationRequest{Lookup: &inpb.InvocationLookup{InvocationId: iid}})
@@ -911,18 +922,30 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 		return nil
 	})
 	eg.Go(func() error {
-		var err error
-		exRsp, err = bbClient.GetExecution(ctx, &espb.GetExecutionRequest{ExecutionLookup: &espb.ExecutionLookup{
+		execution, err := bbClient.GetExecution(ctx, &espb.GetExecutionRequest{ExecutionLookup: &espb.ExecutionLookup{
 			InvocationId: iid,
 		}})
 		if err != nil {
 			return fmt.Errorf("could not retrieve ci_runner execution: %s", err)
 		}
-		if len(exRsp.GetExecution()) == 0 {
+		if len(execution.GetExecution()) == 0 {
 			return fmt.Errorf("ci_runner execution not found")
 		}
+		executionID := execution.GetExecution()[0].GetExecutionId()
+		waitExecutionStream, err := execClient.WaitExecution(ctx, &repb.WaitExecutionRequest{
+			Name: executionID,
+		})
+		if err != nil {
+			return fmt.Errorf("wait execution: %w", err)
+		}
+		rsp, err := rexec.Wait(rexec.NewRetryingStream(ctx, execClient, waitExecutionStream, executionID))
+		if err != nil {
+			return fmt.Errorf("wait execution: %w", err)
+		}
+		executeResponse = rsp.ExecuteResponse
 		return nil
 	})
+
 	err = eg.Wait()
 	if err != nil {
 		return 1, err
@@ -947,7 +970,7 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 		}
 	}
 
-	exitCode := int(exRsp.GetExecution()[0].ExitCode)
+	exitCode := int(executeResponse.GetResult().GetExitCode())
 	if opts.FetchOutputs && exitCode == 0 {
 		if childIID != "" {
 			conn, err := grpc_client.DialSimple(opts.Server)

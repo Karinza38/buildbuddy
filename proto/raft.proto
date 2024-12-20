@@ -587,10 +587,24 @@ message AddReplicaResponse {
   RangeDescriptor range = 1;
 }
 
+// RemoveReplicaRequest specifies a request to remove the replica from raft
+// memberhsip, and remove the replica from the range descriptor. It does *not*
+// remove the data from the machine.
 message RemoveReplicaRequest {
+  // Either specify range or range_id:
+  //  -- When a range is provided, it is expected that the range is up-to-date.
+  //  The
+  // call removes the replica from the range descriptor and also from the raft
+  // membership.
+  //  -- When a range_id is provided, it is expected that the replica_id is
+  // already removed from the range descriptor. For example, when we detected a
+  // zombie.
   RangeDescriptor range = 1;
+  uint64 range_id = 3;
+
   uint64 replica_id = 2;
 }
+
 message RemoveReplicaResponse {
   // The range with the specified node removed.
   RangeDescriptor range = 1;
@@ -680,3 +694,28 @@ message UpdateAtimeRequest {
   int64 access_time_usec = 2;
 }
 message UpdateAtimeResponse {}
+
+message RaftMembership {
+  repeated ReplicaDescriptor voters = 1;
+  repeated ReplicaDescriptor non_voters = 2;
+  repeated ReplicaDescriptor witnesses = 3;
+  repeated uint64 removed = 4;
+}
+
+message RaftLeaderInfo {
+  uint64 leader_id = 1;
+  uint64 term = 2;
+  bool valid = 3;
+}
+
+message GetRangeDebugInfoRequest {
+  uint64 range_id = 1;
+}
+
+message GetRangeDebugInfoResponse {
+  string nhid = 1;
+  RangeDescriptor range_descriptor = 2;
+  RaftLeaderInfo leader = 3;
+  bool has_lease = 4;
+  RaftMembership membership = 5;
+}

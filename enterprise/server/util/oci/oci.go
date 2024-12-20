@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"runtime"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
@@ -23,23 +24,35 @@ import (
 
 var (
 	registries = flag.Slice("executor.container_registries", []Registry{}, "")
+	mirrors    = flag.Slice("executor.container_registry_mirrors", []MirrorConfig{}, "")
 )
 
-// The OCI spec only supports "shares" for specifying CPU weights, which are
-// based on cgroup v1 CPU shares. These are transformed to cgroup2 weights
-// internally by crun using a simple linear mapping. These are the min/max
-// values for "shares". See
-// https://github.com/containers/crun/blob/main/crun.1.md#cpu-controller
-const (
-	cpuSharesMin = 2
-	cpuSharesMax = 262_144
-)
+type MirrorConfig struct {
+	OriginalURL string `yaml:"original_url" json:"original_url"`
+	MirrorURL   string `yaml:"mirror_url" json:"mirror_url"`
+}
 
-// Min/max values for cgroup2 CPU weight.
-const (
-	cpuWeightMin = 1
-	cpuWeightMax = 10_000
-)
+func (mc MirrorConfig) matches(u *url.URL) (bool, error) {
+	originalURL, err := url.Parse(mc.OriginalURL)
+	if err != nil {
+		return false, err
+	}
+	match := originalURL.Host == u.Host
+	return match, nil
+}
+
+func (mc MirrorConfig) rewriteRequest(originalRequest *http.Request) (*http.Request, error) {
+	mirrorURL, err := url.Parse(mc.MirrorURL)
+	if err != nil {
+		return nil, err
+	}
+	originalURL := originalRequest.URL.String()
+	req := originalRequest.Clone(originalRequest.Context())
+	req.URL.Scheme = mirrorURL.Scheme
+	req.URL.Host = mirrorURL.Host
+	log.Debugf("%q rewritten to %s", originalURL, req.URL.String())
+	return req, nil
+}
 
 type Registry struct {
 	Hostnames []string `yaml:"hostnames" json:"hostnames"`
@@ -158,7 +171,9 @@ func Resolve(ctx context.Context, imageName string, platform *rgpb.Platform, cre
 			Password: credentials.Password,
 		}))
 	}
-
+	if len(*mirrors) > 0 {
+		remoteOpts = append(remoteOpts, remote.WithTransport(newMirrorTransport(remote.DefaultTransport, *mirrors)))
+	}
 	remoteDesc, err := remote.Get(imageRef, remoteOpts...)
 	if err != nil {
 		if t, ok := err.(*transport.Error); ok && t.StatusCode == http.StatusUnauthorized {
@@ -194,23 +209,36 @@ func RuntimePlatform() *rgpb.Platform {
 	}
 }
 
-// CPUSharesToWeight converts "OCI" CPU share units (which are based on cgroup
-// v1 CPU shares) to cgroup2 CPU weight units.
-func CPUSharesToWeight(shares int64) int64 {
-	// Clamp to min/max allowed values
-	shares = min(shares, cpuSharesMax)
-	shares = max(shares, cpuSharesMin)
-	// Apply linear mapping
-	return (cpuWeightMin + ((shares-cpuSharesMin)*(cpuWeightMax-cpuWeightMin))/cpuSharesMax)
+// verify that mirrorTransport implements the RoundTripper interface.
+var _ http.RoundTripper = (*mirrorTransport)(nil)
+
+type mirrorTransport struct {
+	inner   http.RoundTripper
+	mirrors []MirrorConfig
 }
 
-// CPUMillisToShares converts a milliCPU value to an appropriate value of OCI
-// CPU shares.
-func CPUMillisToShares(cpuMillis int64) int64 {
-	// The max value is ~260000, so directly using cpuMillis should work well as
-	// the CPU share value. Just clamp to ensure it's within bounds.
-	cpuShares := cpuMillis
-	cpuShares = min(cpuShares, cpuSharesMax)
-	cpuShares = max(cpuShares, cpuSharesMin)
-	return cpuShares
+func newMirrorTransport(inner http.RoundTripper, mirrors []MirrorConfig) http.RoundTripper {
+	return &mirrorTransport{
+		inner:   inner,
+		mirrors: mirrors,
+	}
+}
+
+func (t *mirrorTransport) RoundTrip(in *http.Request) (out *http.Response, err error) {
+	for _, mirror := range t.mirrors {
+		if match, err := mirror.matches(in.URL); err == nil && match {
+			mirroredRequest, err := mirror.rewriteRequest(in)
+			if err != nil {
+				log.Errorf("error mirroring request: %s", err)
+				continue
+			}
+			out, err = t.inner.RoundTrip(mirroredRequest)
+			if err != nil {
+				log.Errorf("mirror err: %s", err)
+				continue
+			}
+			return out, err
+		}
+	}
+	return t.inner.RoundTrip(in)
 }

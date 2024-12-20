@@ -27,6 +27,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/cgroup"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
@@ -54,6 +55,7 @@ var (
 	cpuSharesEnabled = flag.Bool("executor.oci.cpu_shares_enabled", false, "Enable CPU weighting based on task size.")
 	dns              = flag.String("executor.oci.dns", "8.8.8.8", "Specifies a custom DNS server for use inside OCI containers. If set to the empty string, mount /etc/resolv.conf from the host.")
 	netPoolSize      = flag.Int("executor.oci.network_pool_size", -1, "Limit on the number of networks to be reused between containers. Setting to 0 disables pooling. Setting to -1 uses the recommended default.")
+	fakeCPUInfo      = flag.Bool("executor.oci.fake_cpu_info", false, "Use lxcfs to fake cpu info inside containers.")
 )
 
 const (
@@ -111,6 +113,24 @@ var (
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOSTNAME=localhost",
 	}
+
+	// These files will be overridden by lxcfs when
+	// executor.oci.fake_cpu_info == true. They contain information about
+	// the number of CPUs on the running system, and are often used by
+	// the workloads inside containers to configure parallelism. Overriding
+	// them to correct values (based on the container size) prevents
+	// workloads from trying to over-allocate CPU and then not having the
+	// resources to do that work.
+	lxcfsFiles = []string{
+		"/proc/cpuinfo",
+		"/proc/diskstats",
+		"/proc/meminfo",
+		"/proc/stat",
+		"/proc/swaps",
+		"/proc/uptime",
+		"/proc/slabinfo",
+		"/sys/devices/system/cpu/online",
+	}
 )
 
 type provider struct {
@@ -138,6 +158,12 @@ type provider struct {
 	runtime string
 
 	networkPool *networking.ContainerNetworkPool
+
+	// Optional. "" if executor.oci.fake_cpu_info == false.
+	// lxcfs mount dir -- files in here can be bind mounted into a container
+	// to provide "fake" cpu info that is appropriate to the container's
+	// configured memory and cpu.
+	lxcfsMount string
 }
 
 func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, error) {
@@ -160,6 +186,39 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 		return nil, status.FailedPreconditionError("could not find a usable container runtime in PATH")
 	}
 
+	lxcfsMount := "" // set below if configured.
+	// Enable lxcfs, if configured.
+	if *fakeCPUInfo {
+		lxcfsMountDir := "/var/lib/lxcfs"
+		if err := os.MkdirAll(lxcfsMountDir, 0755); err != nil {
+			return nil, err
+		}
+
+		// Unmount if it's already mounted (container restarted)
+		if err := syscall.Unmount(lxcfsMountDir, 0); err == nil {
+			log.Infof("successfully unmounted dead lxcfs path, re-mounting shortly")
+		}
+
+		// Mount lxcfs fuse fs on lxcfsMountDir.
+		c := exec.CommandContext(env.GetServerContext(), "lxcfs", "-f", "--enable-cfs", lxcfsMountDir)
+		if err := c.Start(); err != nil {
+			return nil, err
+		}
+
+		// Wait (in bg) for foregrounded lxcfs process . It will exit
+		// when the executor dies.
+		go func() {
+			if err := c.Wait(); err != nil {
+				log.Errorf("[LXCFS] err: %s", err)
+			}
+		}()
+		testPath := filepath.Join(lxcfsMountDir, lxcfsFiles[0])
+		if err := disk.WaitUntilExists(env.GetServerContext(), testPath, disk.WaitOpts{}); err != nil {
+			return nil, status.UnavailableErrorf("lxcfs did not mount %q: %s", testPath, err)
+		}
+		log.Infof("lxcfs mounted on %q", lxcfsMountDir)
+		lxcfsMount = lxcfsMountDir
+	}
 	containersRoot := filepath.Join(buildRoot, "executor", "oci", "run")
 	if err := os.MkdirAll(containersRoot, 0755); err != nil {
 		return nil, err
@@ -181,6 +240,7 @@ func NewProvider(env environment.Env, buildRoot, cacheRoot string) (*provider, e
 		imageCacheRoot: imageCacheRoot,
 		imageStore:     imageStore,
 		networkPool:    networkPool,
+		lxcfsMount:     lxcfsMount,
 	}, nil
 }
 
@@ -193,6 +253,7 @@ func (p *provider) New(ctx context.Context, args *container.Init) (container.Com
 		imageCacheRoot: p.imageCacheRoot,
 		imageStore:     p.imageStore,
 		networkPool:    p.networkPool,
+		lxcfsMount:     p.lxcfsMount,
 
 		blockDevice:    args.BlockDevice,
 		cgroupParent:   args.CgroupParent,
@@ -225,6 +286,7 @@ type ociContainer struct {
 	stats            container.UsageStats
 	networkPool      *networking.ContainerNetworkPool
 	network          *networking.ContainerNetwork
+	lxcfsMount       string
 
 	imageRef       string
 	networkEnabled bool
@@ -531,11 +593,6 @@ func (c *ociContainer) cleanupNetwork(ctx context.Context) error {
 }
 
 func (c *ociContainer) Stats(ctx context.Context) (*repb.UsageStats, error) {
-	lifetimeStats, err := c.cgroupPaths.Stats(ctx, c.cid, c.blockDevice)
-	if err != nil {
-		return nil, err
-	}
-	c.stats.Update(lifetimeStats)
 	return c.stats.TaskStats(), nil
 }
 
@@ -543,15 +600,16 @@ func (c *ociContainer) Stats(ctx context.Context) (*repb.UsageStats, error) {
 // metrics are updated while the function is being executed, and that the
 // resource usage results are populated in the returned CommandResult.
 func (c *ociContainer) doWithStatsTracking(ctx context.Context, invokeRuntimeFn func(ctx context.Context) *interfaces.CommandResult) *interfaces.CommandResult {
-	c.stats.Reset()
-	stop, statsCh := container.TrackStats(ctx, c)
+	stop := c.stats.TrackExecution(ctx, func(ctx context.Context) (*repb.UsageStats, error) {
+		return c.cgroupPaths.Stats(ctx, c.cid, c.blockDevice)
+	})
 	res := invokeRuntimeFn(ctx)
 	stop()
 	// statsCh will report stats for processes inside the container, and
 	// res.UsageStats will report stats for the container runtime itself.
 	// Combine these stats to get the total usage.
 	runtimeProcessStats := res.UsageStats
-	taskStats := <-statsCh
+	taskStats := c.stats.TaskStats()
 	if taskStats == nil {
 		taskStats = &repb.UsageStats{}
 	}
@@ -745,7 +803,7 @@ func (c *ociContainer) createSpec(ctx context.Context, cmd *repb.Command) (*spec
 			cpuSpecs.Period = pointer(uint64(period.Microseconds()))
 		}
 		if *cpuSharesEnabled {
-			cpuSpecs.Shares = pointer(uint64(oci.CPUMillisToShares(c.milliCPU)))
+			cpuSpecs.Shares = pointer(uint64(tasksize.CPUMillisToShares(c.milliCPU)))
 		}
 		resources = &specs.LinuxResources{
 			Pids: pids,
@@ -916,7 +974,16 @@ func (c *ociContainer) createSpec(ctx context.Context, cmd *repb.Command) (*spec
 			})
 		}
 	}
-
+	if c.lxcfsMount != "" {
+		for _, mountpoint := range lxcfsFiles {
+			spec.Mounts = append(spec.Mounts, specs.Mount{
+				Destination: mountpoint,
+				Type:        "bind",
+				Source:      filepath.Join(c.lxcfsMount, mountpoint),
+				Options:     []string{"bind", "rprivate"},
+			})
+		}
+	}
 	return &spec, nil
 }
 
@@ -1281,6 +1348,10 @@ func (s *ImageStore) pull(ctx context.Context, imageName string, creds oci.Crede
 
 // downloadLayer downloads and extracts the given layer to the given destination
 // dir. The extracted layer is suitable for use as an overlayfs lowerdir.
+//
+// For reference implementations, see:
+//   - Podman: https://github.com/containers/storage/blob/664fe5d9b95004e1be3eee004d56a1715c8ca790/pkg/archive/archive.go#L707-L729
+//   - Moby (Docker): https://github.com/moby/moby/blob/9633556bef3eb20dfe888903660c3df89a73605b/pkg/archive/archive.go#L726-L735
 func downloadLayer(ctx context.Context, layer ctr.Layer, destDir string) error {
 	rc, err := layer.Uncompressed()
 	if err != nil {
@@ -1307,9 +1378,24 @@ func downloadLayer(ctx context.Context, layer ctr.Layer, destDir string) error {
 		if slices.Contains(strings.Split(header.Name, string(os.PathSeparator)), "..") {
 			return status.UnavailableErrorf("tar entry is not clean: %q", header.Name)
 		}
-		target := filepath.Join(tempUnpackDir, filepath.Clean(header.Name))
-		base := filepath.Base(target)
-		dir := filepath.Dir(target)
+
+		// filepath.Join applies filepath.Clean to all arguments
+		file := filepath.Join(tempUnpackDir, header.Name)
+		base := filepath.Base(file)
+		dir := filepath.Dir(file)
+
+		if header.Typeflag == tar.TypeDir ||
+			header.Typeflag == tar.TypeReg ||
+			header.Typeflag == tar.TypeSymlink ||
+			header.Typeflag == tar.TypeLink {
+			// Ensure that parent dir exists
+			if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+				return status.UnavailableErrorf("create directory: %s", err)
+			}
+		} else {
+			log.CtxInfof(ctx, "Ignoring unsupported tar header %q type %q in oci layer", header.Name, header.Typeflag)
+			continue
+		}
 
 		const whiteoutPrefix = ".wh."
 		// Handle whiteout
@@ -1333,11 +1419,11 @@ func downloadLayer(ctx context.Context, layer ctr.Layer, destDir string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
+			if err := os.MkdirAll(file, os.FileMode(header.Mode)); err != nil {
 				return status.UnavailableErrorf("create directory: %s", err)
 			}
 		case tar.TypeReg:
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(header.Mode))
+			f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY, os.FileMode(header.Mode))
 			if err != nil {
 				return status.UnavailableErrorf("create file: %s", err)
 			}
@@ -1351,25 +1437,24 @@ func downloadLayer(ctx context.Context, layer ctr.Layer, destDir string) error {
 			}
 			f.Close()
 		case tar.TypeSymlink:
-			if err := os.Symlink(header.Linkname, target); err != nil {
+			// Symlink's target is only evaluated at runtime, inside the container context.
+			// So it's safe to have the symlink targeting paths outside unpackdir.
+			if err := os.Symlink(header.Linkname, file); err != nil {
 				return status.UnavailableErrorf("create symlink: %s", err)
 			}
-			if err := os.Lchown(target, header.Uid, header.Gid); err != nil {
+			if err := os.Lchown(file, header.Uid, header.Gid); err != nil {
 				return status.UnavailableErrorf("chown link: %s", err)
 			}
 		case tar.TypeLink:
-			if slices.Contains(strings.Split(header.Linkname, string(os.PathSeparator)), "..") {
-				return status.UnavailableErrorf("tar entry is not clean: %q", header.Name)
+			target := filepath.Join(tempUnpackDir, header.Linkname)
+			if !strings.HasPrefix(target, tempUnpackDir) {
+				return status.UnavailableErrorf("breakout attempt detected with link: %q -> %q", header.Name, header.Linkname)
 			}
-			source := filepath.Join(tempUnpackDir, filepath.Clean(header.Linkname))
-			if err := os.Link(source, target); err != nil {
+			// Note that this will call linkat(2) without AT_SYMLINK_FOLLOW,
+			// so if target is a symlink, the hardlink will point to the symlink itself and not the symlink target.
+			if err := os.Link(target, file); err != nil {
 				return status.UnavailableErrorf("create hard link: %s", err)
 			}
-			if err := os.Chown(target, header.Uid, header.Gid); err != nil {
-				return status.UnavailableErrorf("chown file: %s", err)
-			}
-		default:
-			return status.UnavailableErrorf("unsupported tar entry type %q", header.Typeflag)
 		}
 	}
 

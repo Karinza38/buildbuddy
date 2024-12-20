@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -74,7 +75,7 @@ const (
 	RecycleRunnerPropertyName            = "recycle-runner"
 	AffinityRoutingPropertyName          = "affinity-routing"
 	RunnerRecyclingMaxWaitPropertyName   = "runner-recycling-max-wait"
-	preserveWorkspacePropertyName        = "preserve-workspace"
+	PreserveWorkspacePropertyName        = "preserve-workspace"
 	nonrootWorkspacePropertyName         = "nonroot-workspace"
 	overlayfsWorkspacePropertyName       = "overlayfs-workspace"
 	cleanWorkspaceInputsPropertyName     = "clean-workspace-inputs"
@@ -136,10 +137,27 @@ const (
 	FirecrackerContainerType ContainerType = "firecracker"
 	OCIContainerType         ContainerType = "oci"
 	SandboxContainerType     ContainerType = "sandbox"
+	// If you add a container type, also add it to KnownContainerTypes
 
 	// The app will mint a signed client identity token to workflows.
 	workflowClientIdentityTokenLifetime = 12 * time.Hour
 )
+
+// KnownContainerTypes are all the types that are currently supported, or were
+// previously supported.
+var KnownContainerTypes []ContainerType = []ContainerType{BareContainerType, PodmanContainerType, DockerContainerType, FirecrackerContainerType, OCIContainerType, SandboxContainerType}
+
+// CoerceContainerType returns t if it's empty or in KnownContainerTypes.
+// Otherwise it returns "Unknown".
+func CoerceContainerType(t string) string {
+	if t == "" {
+		return ""
+	}
+	if slices.Contains(KnownContainerTypes, ContainerType(t)) {
+		return t
+	}
+	return "unknown"
+}
 
 func VFSEnabled() bool {
 	return *enableVFS
@@ -351,7 +369,7 @@ func ParseProperties(task *repb.ExecutionTask) (*Properties, error) {
 		RunnerRecyclingMaxWait:    runnerRecyclingMaxWait,
 		EnableVFS:                 vfsEnabled,
 		IncludeSecrets:            boolProp(m, IncludeSecretsPropertyName, false),
-		PreserveWorkspace:         boolProp(m, preserveWorkspacePropertyName, false),
+		PreserveWorkspace:         boolProp(m, PreserveWorkspacePropertyName, false),
 		OverlayfsWorkspace:        boolProp(m, overlayfsWorkspacePropertyName, false),
 		NonrootWorkspace:          boolProp(m, nonrootWorkspacePropertyName, false),
 		CleanWorkspaceInputs:      stringProp(m, cleanWorkspaceInputsPropertyName, ""),
