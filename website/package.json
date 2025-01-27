@@ -19,7 +19,7 @@
     "classnames": "^2.2.6",
     "express": "4.21.1",
     "get-intrinsic": "1.2.4",
-    "lucide-react": "^0.16.25",
+    "lucide-react": "^0.469.0",
     "path-to-regexp": "1.9.0",
     "prop-types": "^15.8.1",
     "react": "^18.2.0",
