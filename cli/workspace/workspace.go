@@ -25,7 +25,12 @@ var (
 	pathErr  error
 	basename string
 
-	WorkspaceIndicatorFiles = []string{WorkspaceFileName, WorkspaceAltFileName, ModuleFileName}
+	WorkspaceIndicatorFiles = []string{
+		// Prioritize MODULE if both MODULE and WORKSPACE exist, since MODULE is
+		// newer.
+		ModuleFileName,
+		WorkspaceFileName, WorkspaceAltFileName,
+	}
 )
 
 // Path returns the current Bazel workspace path by traversing upwards until
@@ -67,9 +72,21 @@ func path() (string, string, error) {
 }
 
 // TODO: Take workspace dir as a param everywhere so that this isn't needed.
-func SetForTest(path string) {
+func SetForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, path string) {
 	_, _ = Path()
+	previousPathVal := pathVal
+	previousPathErr := pathErr
+	previousBasename := basename
 	pathVal, pathErr = path, nil
+	basename = ""
+	t.Cleanup(func() {
+		pathVal = previousPathVal
+		pathErr = previousPathErr
+		basename = previousBasename
+	})
 }
 
 func CreateModuleIfNotExists() (string, string, error) {

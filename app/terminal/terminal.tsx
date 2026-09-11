@@ -1,16 +1,17 @@
-import { WrapText, Download, ArrowUp, ArrowDown, X, Expand, Shrink } from "lucide-react";
-import React from "react";
-import { FixedSizeList } from "react-window";
+import { ArrowDown, ArrowUp, CaseSensitive, Check, Copy, Download, Expand, Shrink, WrapText, X } from "lucide-react";
 import memoizeOne from "memoize-one";
-import Spinner from "../components/spinner/spinner";
+import React from "react";
+import AutoSizer from "react-virtualized-auto-sizer";
+import { FixedSizeList } from "react-window";
+import capabilities from "../capabilities/capabilities";
 import TextInput from "../components/input/input";
+import Spinner from "../components/spinner/spinner";
+import router from "../router/router";
 import { mod } from "../util/math";
 import { Scroller } from "../util/scroller";
-import AutoSizer from "react-virtualized-auto-sizer";
+import { copyTerminalText } from "./copy";
 import { Row, ROW_HEIGHT_PX } from "./row";
-import { getContent, updatedMatchIndexForSearch, toPlainText, Range, ListData } from "./text";
-import router from "../router/router";
-import capabilities from "../capabilities/capabilities";
+import { getContent, ListData, Range, SearchQuery, toPlainText, updatedMatchIndexForSearch } from "./text";
 
 const WRAP_LOCAL_STORAGE_KEY = "terminal-wrap";
 const WRAP_LOCAL_STORAGE_VALUE = "wrap";
@@ -44,10 +45,11 @@ interface State {
    */
   lineLengthLimit: number | null;
 
-  search: string;
+  searchQuery: SearchQuery;
   activeMatchIndex: number;
 
   isLoadingFullLog: boolean;
+  copied: boolean;
 }
 
 /** DOM snapshot returned by the `getSnapshotBeforeUpdate` lifecycle method. */
@@ -65,8 +67,9 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
     lineLengthLimit: null,
     isLoadingFullLog: false,
 
-    search: "",
+    searchQuery: { match: "", caseSensitive: false },
     activeMatchIndex: -1,
+    copied: false,
   };
 
   private terminalRef = React.createRef<HTMLDivElement>();
@@ -78,6 +81,7 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
   private windowKeyDownListener?: (this: Window, ev: KeyboardEvent) => any;
   private fullScreenListener?: (this: Window) => any;
   private resizeListener?: (this: Window) => any;
+  private copyResetTimeout: number | null = null;
 
   private scroller = new Scroller(() => {
     const list = this.list;
@@ -98,9 +102,9 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
 
   componentDidMount() {
     this.initialScrollToEnd();
-    window.addEventListener("keydown", (this.windowKeyDownListener = this.onWindowKeyDown.bind(this)));
-    window.addEventListener("fullscreenchange", (this.fullScreenListener = () => this.forceUpdate.bind(this)));
-    window.addEventListener("resize", (this.resizeListener = this.updateLineLengthLimit.bind(this)));
+    window.addEventListener("keydown", (this.windowKeyDownListener = (e) => this.onWindowKeyDown(e)));
+    window.addEventListener("fullscreenchange", (this.fullScreenListener = () => this.forceUpdate()));
+    window.addEventListener("resize", (this.resizeListener = () => this.updateLineLengthLimit()));
   }
 
   componentWillUnmount() {
@@ -112,6 +116,9 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
     }
     if (this.resizeListener) {
       window.removeEventListener("resize", this.resizeListener);
+    }
+    if (this.copyResetTimeout !== null) {
+      window.clearTimeout(this.copyResetTimeout);
     }
   }
 
@@ -163,10 +170,11 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
       () => {
         const content = this.getContent();
         const match = this.state.activeMatchIndex === -1 ? null : content.matches[this.state.activeMatchIndex];
-        const nextContent = this.getContent(this.props.value, search);
+        const newSearchQuery = { match: search, caseSensitive: this.state.searchQuery.caseSensitive };
+        const nextContent = this.getContent(this.props.value, newSearchQuery);
         this.setState({
-          search,
-          activeMatchIndex: updatedMatchIndexForSearch(nextContent, search, match, this.getRowRangeInView()),
+          searchQuery: newSearchQuery,
+          activeMatchIndex: updatedMatchIndexForSearch(nextContent, newSearchQuery, match, this.getRowRangeInView()),
         });
       },
       // If logs are small, no need to debounce.
@@ -183,12 +191,26 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
     }
   }
   private onClearSearchClick() {
-    this.setState({ search: "", activeMatchIndex: -1 });
+    this.setState({
+      searchQuery: { match: "", caseSensitive: this.state.searchQuery.caseSensitive },
+      activeMatchIndex: -1,
+    });
     const input = this.searchInputRef.current;
     if (input) {
       input.value = "";
       input.focus();
     }
+  }
+  private onCaseSensitiveClick() {
+    const caseSensitive = !this.state.searchQuery.caseSensitive;
+    const content = this.getContent();
+    const match = this.state.activeMatchIndex === -1 ? null : content.matches[this.state.activeMatchIndex];
+    const newSearchQuery = { match: this.state.searchQuery.match, caseSensitive };
+    const nextContent = this.getContent(this.props.value, newSearchQuery);
+    this.setState({
+      searchQuery: newSearchQuery,
+      activeMatchIndex: updatedMatchIndexForSearch(nextContent, newSearchQuery, match, this.getRowRangeInView()),
+    });
   }
 
   /**
@@ -196,10 +218,10 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
    */
   private getContent(
     text = this.props.value || DEFAULT_VALUE,
-    search = this.state.search,
+    searchQuery = this.state.searchQuery,
     lineLengthLimit = this.state.lineLengthLimit
   ) {
-    return this.memoizedGetContent(text, search, lineLengthLimit);
+    return this.memoizedGetContent(text, searchQuery, lineLengthLimit);
   }
   /**
    * memoizes getContent for a single output value per component instance. This
@@ -337,6 +359,23 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
     element.click();
   }
 
+  private onCopyClick() {
+    try {
+      copyTerminalText(this.props.value);
+      if (this.copyResetTimeout !== null) {
+        window.clearTimeout(this.copyResetTimeout);
+      }
+      this.setState({ copied: true });
+      this.copyResetTimeout = window.setTimeout(() => {
+        this.copyResetTimeout = null;
+        this.setState({ copied: false });
+      }, 2000);
+    } catch (e) {
+      console.error("Failed to copy log text", e);
+      this.setState({ copied: false });
+    }
+  }
+
   render() {
     const content = this.getContent();
     const iconClass = this.props.lightTheme ? "" : "white";
@@ -378,21 +417,27 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
                   disabled={content.matches.length <= 1}
                   className={`terminal-action ${content.matches.length ? "active" : ""}`}
                   onClick={this.onPreviousMatchClick.bind(this)}>
-                  <ArrowUp className={`icon ${iconClass}`} />
+                  <ArrowUp className={iconClass} />
                 </button>
                 <button
                   title="Next match (Enter)"
                   disabled={content.matches.length <= 1}
                   className={`terminal-action ${content.matches.length ? "active" : ""}`}
                   onClick={this.onNextMatchClick.bind(this)}>
-                  <ArrowDown className={`icon ${iconClass}`} />
+                  <ArrowDown className={iconClass} />
+                </button>
+                <button
+                  title="Case sensitive"
+                  className={`terminal-action ${this.state.searchQuery.caseSensitive ? "active" : ""}`}
+                  onClick={this.onCaseSensitiveClick.bind(this)}>
+                  <CaseSensitive className={iconClass} />
                 </button>
                 <button
                   title="Clear search"
-                  disabled={!this.state.search}
-                  className={`terminal-action ${this.state.search ? "active" : ""}`}
+                  disabled={!this.state.searchQuery.match}
+                  className={`terminal-action ${this.state.searchQuery.match ? "active" : ""}`}
                   onClick={this.onClearSearchClick.bind(this)}>
-                  <X className={`icon ${iconClass}`} />
+                  <X className={iconClass} />
                 </button>
               </div>
             </div>
@@ -400,14 +445,14 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
               title="Wrap"
               onClick={this.onWrapClick.bind(this)}
               className={`terminal-action ${this.getWrapPreference() ? "active" : ""}`}>
-              <WrapText className={`icon ${iconClass}`} />
+              <WrapText className={iconClass} />
             </button>
             {window.document.fullscreenEnabled && !window.document.fullscreenElement && (
               <button
                 title="Full Screen"
                 onClick={(e) => this.terminalRef.current?.parentElement?.requestFullscreen()}
                 className="terminal-action active">
-                <Expand className={`icon ${iconClass}`} />
+                <Expand className={iconClass} />
               </button>
             )}
             {window.document.fullscreenEnabled && window.document.fullscreenElement && (
@@ -415,19 +460,21 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
                 title="Exit Full Screen"
                 onClick={(e) => window.document.exitFullscreen()}
                 className="terminal-action active">
-                <Shrink className={`icon ${iconClass}`} />
+                <Shrink className={iconClass} />
               </button>
             )}
+            <button
+              title={this.state.copied ? "Copied" : "Copy"}
+              onClick={this.onCopyClick.bind(this)}
+              className="terminal-action active">
+              {this.state.copied ? <Check className={iconClass} /> : <Copy className={iconClass} />}
+            </button>
             <button
               title="Download"
               onClick={this.onDownloadClick.bind(this)}
               className="terminal-action active"
               disabled={this.state.isLoadingFullLog}>
-              {this.state.isLoadingFullLog ? (
-                <Spinner className={iconClass} />
-              ) : (
-                <Download className={`icon ${iconClass}`} />
-              )}
+              {this.state.isLoadingFullLog ? <Spinner className={iconClass} /> : <Download className={iconClass} />}
             </button>
           </div>
         </div>
@@ -462,7 +509,7 @@ export default class TerminalComponent extends React.Component<TerminalProps, St
                       : {
                           rows: content.rows,
                           rowLength: this.state.lineLengthLimit,
-                          search: this.state.search,
+                          searchQuery: this.state.searchQuery,
                           activeMatchIndex: this.state.activeMatchIndex,
                         }
                   }>

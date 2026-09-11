@@ -3,6 +3,7 @@ package content_addressable_storage_server
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -16,17 +17,22 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/chunking"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/directory_size"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/hit_tracker"
+	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/background"
+	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/capabilities"
+	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
 	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
+	"github.com/buildbuddy-io/buildbuddy/server/util/findmissing"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+	"github.com/buildbuddy-io/buildbuddy/server/util/quota"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 
@@ -34,8 +40,8 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
-	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
+	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 	remote_cache_config "github.com/buildbuddy-io/buildbuddy/server/remote_cache/config"
@@ -43,17 +49,29 @@ import (
 	gstatus "google.golang.org/grpc/status"
 )
 
-const TreeCacheRemoteInstanceName = "_bb_treecache_"
+const (
+	// defaultFindMissingChunkFallbackConcurrency is the default value of the
+	// cache.find_missing_chunk_fallback_concurrency experiment, which bounds
+	// how many chunked-manifest fallback lookups FindMissingBlobs performs in
+	// parallel. Each lookup issues independent cache reads, so the work is
+	// I/O-bound.
+	defaultFindMissingChunkFallbackConcurrency = 8
+
+	// Values for the metrics.SpliceBlobValidation label.
+	spliceValidationFull    = "full"
+	spliceValidationSkipped = "skipped"
+)
 
 var (
 	enableTreeCaching         = flag.Bool("cache.enable_tree_caching", true, "If true, cache GetTree responses (full and partial)")
 	treeCacheSeed             = flag.String("cache.tree_cache_seed", "treecache-09032024", "If set, hash this with digests before caching / reading from tree cache")
-	minTreeCacheLevel         = flag.Int("cache.tree_cache_min_level", 2, "The min level at which the tree may be cached. 0 is the root")
+	minTreeCacheLevel         = flag.Int("cache.tree_cache_min_level", 1, "The min level at which the tree may be cached. 0 is the root")
 	minTreeCacheDescendents   = flag.Int("cache.tree_cache_min_descendents", 3, "The min number of descendents a node must parent in order to be cached")
-	maxTreeCacheSetDuration   = flag.Duration("cache.max_tree_cache_set_duration", time.Second, "The max amount of time to wait for unfinished tree cache entries to be set.")
-	treeCacheWriteProbability = flag.Float64("cache.tree_cache_write_probability", .10, "Write to the tree cache with this probability")
-	enableTreeCacheSplitting  = flag.Bool("cache.tree_cache_splitting", false, "If true, try to split up TreeCache entries to save space.")
+	treeCacheWriteProbability = flag.Float64("cache.tree_cache_write_probability", .01, "Write to the tree cache with this probability")
+	enableTreeCacheSplitting  = flag.Bool("cache.tree_cache_splitting", true, "If true, try to split up TreeCache entries to save space.")
 	treeCacheSplittingMinSize = flag.Int("cache.tree_cache_splitting_min_size", 10000, "Minimum number of files in a subtree before we'll split it in the treecache.")
+	getTreeSubtreeSupport     = flag.Bool("cache.get_tree_subtree_support", true, "If true, respect the 'send_cache_subtrees' field on GetTree")
+	getTreeSubtreeMinDirCount = flag.Int("cache.get_tree_subtree_min_dir_count", 10, "The minimum number of directory children a subtree must have before we're willing to tell the client to cache it (inclusive).")
 )
 
 type ContentAddressableStorageServer struct {
@@ -72,7 +90,7 @@ func Register(env *real_environment.RealEnv) error {
 	}
 	env.SetCASServer(casServer)
 
-	conn, err := grpc_client.DialInternal(env, fmt.Sprintf("grpc://localhost:%d", grpc_server.GRPCPort()))
+	conn, err := grpc_client.DialInternalWithoutPooling(env, fmt.Sprintf("grpc://localhost:%d", grpc_server.GRPCPort()))
 	casClient := repb.NewContentAddressableStorageClient(conn)
 	if err != nil {
 		return status.InternalErrorf("Error initializing ContentAddressableStorageClient: %s", err)
@@ -101,7 +119,7 @@ func NewContentAddressableStorageServer(env environment.Env) (*ContentAddressabl
 // There are no method-specific errors.
 func (s *ContentAddressableStorageServer) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
 	rsp := &repb.FindMissingBlobsResponse{}
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
 	}
@@ -113,11 +131,68 @@ func (s *ContentAddressableStorageServer) FindMissingBlobs(ctx context.Context, 
 		}
 		digestsToLookup = append(digestsToLookup, rn.ToProto())
 	}
-	missing, err := s.cache.FindMissing(ctx, digestsToLookup)
+	// Forward the incoming request's purpose so present/absent metrics are
+	// attributed to the originating code path.
+	missing, err := s.cache.FindMissing(findmissing.ContextWithPurpose(ctx, req.GetPurpose()), digestsToLookup)
 	if err != nil {
 		return nil, err
 	}
-	rsp.MissingBlobDigests = append(rsp.MissingBlobDigests, missing...)
+
+	// The chunked-manifest fallback lookup is skipped when the caller signals
+	// that these digests are individual content-defined chunks, not whole blobs.
+	// Otherwise, only check manifests for blobs above the current whole-blob
+	// write threshold. Blobs at or below the threshold should be uploaded as
+	// whole blobs.
+	if len(missing) > 0 && !cdc.IsChunked(ctx) {
+		checker := chunking.NewMissingChunkChecker(s.cache, repb.FindMissingBlobsRequest_FMB_CHUNK_VALIDATION)
+		maxChunkSizeBytes := chunking.MaxChunkSizeBytes()
+		efp := s.env.GetExperimentFlagProvider()
+
+		var mu sync.Mutex
+		stillMissing := make([]*repb.Digest, 0, len(missing))
+		markMissing := func(d *repb.Digest) {
+			mu.Lock()
+			stillMissing = append(stillMissing, d)
+			mu.Unlock()
+		}
+		concurrency := defaultFindMissingChunkFallbackConcurrency
+		if efp != nil {
+			concurrency = int(efp.Int64(ctx, "cache.find_missing_chunk_fallback_concurrency", defaultFindMissingChunkFallbackConcurrency))
+		}
+		if concurrency <= 0 {
+			concurrency = 1
+		}
+		eg, egCtx := errgroup.WithContext(ctx)
+		eg.SetLimit(concurrency)
+		for _, d := range missing {
+			if d.GetSizeBytes() <= maxChunkSizeBytes {
+				markMissing(d)
+				continue
+			}
+			eg.Go(func() error {
+				manifest, err := chunking.LoadManifest(egCtx, s.cache, d, req.GetInstanceName(), req.GetDigestFunction())
+				if err != nil {
+					// Not stored as a chunked manifest, so it's genuinely missing.
+					markMissing(d)
+					return nil
+				}
+				anyMissing, err := checker.AnyChunkMissing(egCtx, manifest)
+				if err != nil {
+					return status.WrapErrorf(err, "missing chunks for %s", d.GetHash())
+				}
+				if anyMissing {
+					markMissing(d)
+				}
+				return nil
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			return nil, err
+		}
+		missing = stillMissing
+	}
+
+	rsp.MissingBlobDigests = missing
 	return rsp, nil
 }
 
@@ -147,12 +222,12 @@ func (s *ContentAddressableStorageServer) FindMissingBlobs(ctx context.Context, 
 // provided data.
 func (s *ContentAddressableStorageServer) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
 	rsp := &repb.BatchUpdateBlobsResponse{}
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
 	}
 
-	canWrite, err := capabilities.IsGranted(ctx, s.env, akpb.ApiKey_CACHE_WRITE_CAPABILITY|akpb.ApiKey_CAS_WRITE_CAPABILITY)
+	canWrite, err := capabilities.IsGranted(ctx, s.env.GetAuthenticator(), cappb.Capability_CACHE_WRITE|cappb.Capability_CAS_WRITE)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +242,19 @@ func (s *ContentAddressableStorageServer) BatchUpdateBlobs(ctx context.Context, 
 		return rsp, nil
 	}
 
+	if qm := s.env.GetQuotaManager(); qm != nil {
+		totalUploadSize := int64(0)
+		for _, uploadRequest := range req.Requests {
+			totalUploadSize += uploadRequest.GetDigest().GetSizeBytes()
+		}
+		if err := qm.Allow(ctx, quota.GetSKUKey(sku.RemoteCacheCASUploadedBytes), totalUploadSize); err != nil {
+			return nil, err
+		}
+	}
+
 	rsp.Responses = make([]*repb.BatchUpdateBlobsResponse_Response, 0, len(req.Requests))
 
-	ht := hit_tracker.NewHitTracker(ctx, s.env, false)
+	ht := s.env.GetHitTrackerFactory().NewCASHitTracker(ctx, bazel_request.GetRequestMetadata(ctx))
 	kvs := make(map[*rspb.ResourceName][]byte, len(req.Requests))
 	for _, uploadRequest := range req.Requests {
 		rn := digest.NewResourceName(uploadRequest.GetDigest(), req.GetInstanceName(), rspb.CacheType_CAS, req.GetDigestFunction())
@@ -220,9 +305,9 @@ func (s *ContentAddressableStorageServer) BatchUpdateBlobs(ctx context.Context, 
 			}
 		}
 		checksum.Write(decompressedData)
-		computedDigest := fmt.Sprintf("%x", checksum.Sum(nil))
+		computedDigest := hex.EncodeToString(checksum.Sum(nil))
 		if computedDigest != rn.GetDigest().GetHash() {
-			err := status.DataLossErrorf("Uploaded bytes checksum (%q) did not match digest (%q).", computedDigest, rn.GetDigest().GetHash())
+			err := status.InvalidArgumentErrorf("Uploaded bytes checksum (%q) did not match digest (%q).", computedDigest, rn.GetDigest().GetHash())
 			rsp.Responses = append(rsp.Responses, &repb.BatchUpdateBlobsResponse_Response{
 				Digest: rn.GetDigest(),
 				Status: gstatus.Convert(err).Proto(),
@@ -230,7 +315,7 @@ func (s *ContentAddressableStorageServer) BatchUpdateBlobs(ctx context.Context, 
 			continue
 		}
 		if int64(len(decompressedData)) != rn.GetDigest().GetSizeBytes() {
-			err := status.DataLossErrorf("Uploaded blob size (%d) did not match expected size (%d).", len(decompressedData), rn.GetDigest().GetSizeBytes())
+			err := status.InvalidArgumentErrorf("Uploaded blob size (%d) did not match expected size (%d).", len(decompressedData), rn.GetDigest().GetSizeBytes())
 			rsp.Responses = append(rsp.Responses, &repb.BatchUpdateBlobsResponse_Response{
 				Digest: rn.GetDigest(),
 				Status: gstatus.Convert(err).Proto(),
@@ -289,19 +374,37 @@ type downloadTrackerData struct {
 // status.
 func (s *ContentAddressableStorageServer) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
 	rsp := &repb.BatchReadBlobsResponse{}
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
+	}
+
+	totalDownloadSize := int64(0)
+	for _, readDigest := range req.GetDigests() {
+		size := readDigest.GetSizeBytes()
+		if size < 0 {
+			return nil, status.InvalidArgumentError("Invalid (negative) digest size")
+		}
+		if totalDownloadSize > rpcutil.GRPCMaxSizeBytes-size {
+			return nil, status.InvalidArgumentErrorf("BatchReadBlobs request exceeds server limit of %d bytes", rpcutil.GRPCMaxSizeBytes)
+		}
+		totalDownloadSize += size
+	}
+	if qm := s.env.GetQuotaManager(); qm != nil {
+		if err := qm.Allow(ctx, quota.GetSKUKey(sku.RemoteCacheCASDownloadedBytes), totalDownloadSize); err != nil {
+			return nil, err
+		}
 	}
 
 	type closeTrackerFunc func(data downloadTrackerData)
 	closeTrackerFuncs := make([]closeTrackerFunc, 0, len(req.Digests))
 	closeTrackerData := make([]downloadTrackerData, 0, len(req.Digests))
-	ht := hit_tracker.NewHitTracker(ctx, s.env, false)
+	ht := s.env.GetHitTrackerFactory().NewCASHitTracker(ctx, bazel_request.GetRequestMetadata(ctx))
 
 	cacheRequest := make([]*rspb.ResourceName, 0, len(req.Digests))
 	rsp.Responses = make([]*repb.BatchReadBlobsResponse_Response, 0, len(req.Digests))
 	clientAcceptsZstd := remote_cache_config.ZstdTranscodingEnabled() && clientAcceptsCompressor(req.AcceptableCompressors, repb.Compressor_ZSTD)
+	chunkedReadFallbackSizeBytes := chunking.MinChunkedReadFallbackSizeBytes()
 	readZstd := clientAcceptsZstd && s.cache.SupportsCompressor(repb.Compressor_ZSTD)
 
 	requestedResources := make([]*digest.ResourceName, 0, len(req.GetDigests()))
@@ -337,6 +440,17 @@ func (s *ContentAddressableStorageServer) BatchReadBlobs(ctx context.Context, re
 		}
 
 		data, ok := cacheRsp[rn.GetDigest()]
+
+		// It's unexpected, but BatchReadBlobs may be used for blobs that are
+		// large enough to be chunked. If the blob was not found and it's large
+		// enough to be chunked, try to reassemble it from CDC chunks.
+		if (!ok || os.IsNotExist(err)) && rn.GetDigest().GetSizeBytes() > chunkedReadFallbackSizeBytes {
+			if assembled, assembleErr := s.readChunkedBlob(ctx, rn.GetDigest(), req.GetInstanceName(), req.GetDigestFunction(), readZstd); assembleErr == nil {
+				data = assembled
+				ok = true
+			}
+		}
+
 		blobRsp := &repb.BatchReadBlobsResponse_Response{
 			Digest: rn.GetDigest(),
 			Data:   data,
@@ -391,12 +505,7 @@ func clientAcceptsCompressor(acceptableCompressors []repb.Compressor_Value, comp
 	if compressor == repb.Compressor_IDENTITY {
 		return true
 	}
-	for _, c := range acceptableCompressors {
-		if c == compressor {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(acceptableCompressors, compressor)
 }
 
 func zstdDecompress(data []byte, decompressedLength int64) ([]byte, error) {
@@ -434,7 +543,7 @@ func makeTreeCachePointer(directoryNode *rspb.ResourceName, digestFunction repb.
 	if err != nil {
 		return nil, err
 	}
-	instanceName := fmt.Sprintf("%s/%d", TreeCacheRemoteInstanceName, d.GetSizeBytes())
+	instanceName := digest.GetTreeCacheInstanceName(d)
 	// N.B: This is a AC digest, not a CAS one like the pointer below.
 	return digest.NewResourceName(d, instanceName, rspb.CacheType_AC, digestFunction), nil
 }
@@ -444,7 +553,7 @@ func makeTreeCacheDigest(digestFunction repb.DigestFunction_Value, buf []byte) (
 	if err != nil {
 		return nil, err
 	}
-	instanceName := fmt.Sprintf("%s/%d", TreeCacheRemoteInstanceName, d.GetSizeBytes())
+	instanceName := digest.GetTreeCacheInstanceName(d)
 	// N.B: This is a CAS digest, not an AC one like the pointer above.
 	return digest.NewResourceName(d, instanceName, rspb.CacheType_CAS, digestFunction), nil
 }
@@ -453,7 +562,7 @@ func makeTreeCacheActionResult(blob *rspb.ResourceName) ([]byte, error) {
 	ar := &repb.ActionResult{
 		OutputFiles: []*repb.OutputFile{
 			{
-				Path:   TreeCacheRemoteInstanceName,
+				Path:   digest.TreeCacheRemoteInstanceName,
 				Digest: blob.GetDigest(),
 			},
 		},
@@ -476,7 +585,7 @@ func (s *ContentAddressableStorageServer) cacheTreeNode(ctx context.Context, roo
 		return nil
 	}
 
-	var childBytesWritten = 0
+	childBytesWritten := 0
 	if len(childCaches) > 0 {
 		mu := &sync.Mutex{}
 		eg, egCtx := errgroup.WithContext(ctx)
@@ -513,6 +622,13 @@ func (s *ContentAddressableStorageServer) cacheTreeNode(ctx context.Context, roo
 		if err := eg.Wait(); err != nil {
 			return err
 		}
+		// The append order above depends on goroutine return order, so sort the
+		// children to keep the serialized root TreeCache (and thus its digest)
+		// deterministic for identical trees.
+		slices.SortFunc(rootCache.TreeCacheChildren, func(a *rspb.ResourceName, b *rspb.ResourceName) int {
+			return strings.Compare(a.GetDigest().GetHash(), b.GetDigest().GetHash())
+		})
+		rootCache.TreeCacheChildren = slices.CompactFunc(rootCache.TreeCacheChildren, dedupeResourceProtos)
 	}
 
 	buf, err := proto.Marshal(rootCache)
@@ -610,13 +726,16 @@ func (s *ContentAddressableStorageServer) lookupCachedTreeNodeInCAS(ctx context.
 	return nil, 0, status.NotFoundErrorf("tree-cache-not-found")
 }
 
-func (s *ContentAddressableStorageServer) lookupCachedTreeNode(ctx context.Context, level int, treeCachePointer *digest.ResourceName) ([]*capb.DirectoryWithDigest, error) {
+// Given a resource name for the AC pointer to a cached tree, this returns the
+// cached tree and a direct pointer to its location in the CAS.  If the tree
+// isn't found, a NotFoundError is returned instead.
+func (s *ContentAddressableStorageServer) lookupCachedTreeNode(ctx context.Context, level int, treeCachePointer *digest.ResourceName) ([]*capb.DirectoryWithDigest, *digest.ResourceName, error) {
 	levelLabel := fmt.Sprintf("%d", min(level, 12))
 
 	if pointerBuf, err := s.cache.Get(ctx, treeCachePointer.ToProto()); err == nil {
 		ar := &repb.ActionResult{}
 		if err := proto.Unmarshal(pointerBuf, ar); err == nil {
-			if len(ar.OutputFiles) >= 1 && ar.OutputFiles[0].Path == TreeCacheRemoteInstanceName {
+			if len(ar.OutputFiles) >= 1 && ar.OutputFiles[0].Path == digest.TreeCacheRemoteInstanceName {
 				treeCacheRN := digest.NewResourceName(ar.OutputFiles[0].Digest, treeCachePointer.GetInstanceName(), rspb.CacheType_CAS, treeCachePointer.GetDigestFunction())
 				children, bytesRead, err := s.lookupCachedTreeNodeInCAS(ctx, treeCacheRN)
 				if err == nil {
@@ -628,7 +747,7 @@ func (s *ContentAddressableStorageServer) lookupCachedTreeNode(ctx context.Conte
 						metrics.TreeCacheOperation: "read",
 					}).Add(float64(bytesRead))
 
-					return children, err
+					return children, treeCacheRN, err
 				}
 			}
 		}
@@ -637,7 +756,7 @@ func (s *ContentAddressableStorageServer) lookupCachedTreeNode(ctx context.Conte
 		metrics.TreeCacheLookupStatus: "miss",
 		metrics.TreeCacheLookupLevel:  levelLabel,
 	}).Inc()
-	return nil, status.NotFoundErrorf("tree-cache-not-found")
+	return nil, nil, status.NotFoundErrorf("tree-cache-not-found")
 }
 
 func (s *ContentAddressableStorageServer) fetchDirectory(ctx context.Context, remoteInstanceName string, digestFunction repb.DigestFunction_Value, dd *capb.DirectoryWithDigest) ([]*capb.DirectoryWithDigest, error) {
@@ -678,6 +797,29 @@ func (s *ContentAddressableStorageServer) fetchDirectory(ctx context.Context, re
 	return children, nil
 }
 
+func compareSubtrees(a *digest.ResourceName, b *digest.ResourceName) int {
+	if hashCompare := strings.Compare(a.GetDigest().GetHash(), b.GetDigest().GetHash()); hashCompare != 0 {
+		return hashCompare
+	}
+	aSize := a.GetDigest().GetSizeBytes()
+	bSize := b.GetDigest().GetSizeBytes()
+	if aSize == bSize {
+		return 0
+	} else if aSize > bSize {
+		return 1
+	} else {
+		return -1
+	}
+}
+
+func dedupeResources(a *digest.ResourceName, b *digest.ResourceName) bool {
+	return a.GetDigest().GetHash() == b.GetDigest().GetHash() && a.GetDigest().GetSizeBytes() == b.GetDigest().GetSizeBytes()
+}
+
+func dedupeResourceProtos(a *rspb.ResourceName, b *rspb.ResourceName) bool {
+	return a.GetDigest().GetHash() == b.GetDigest().GetHash() && a.GetDigest().GetSizeBytes() == b.GetDigest().GetSizeBytes()
+}
+
 // GetTree fetches the entire directory tree rooted at a node.
 //
 // This request must be targeted at a
@@ -714,7 +856,7 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 		return nil
 	}
 
-	ctx, err := prefix.AttachUserPrefixToContext(stream.Context(), s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(stream.Context(), s.env.GetAuthenticator())
 	if err != nil {
 		return err
 	}
@@ -735,17 +877,16 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 		defer mu.Unlock()
 
 		dir := dirWithDigest.Directory
-		rn := digest.ResourceNameFromProto(dirWithDigest.ResourceName)
-		d := rn.GetDigest()
+		size := dirWithDigest.GetResourceName().GetDigest().GetSizeBytes()
 
-		if rspSizeBytes+d.GetSizeBytes() > rpcutil.GRPCMaxSizeBytes {
+		if rspSizeBytes+size > rpcutil.GRPCMaxSizeBytes {
 			if err := stream.Send(rsp); err != nil {
 				return err
 			}
 			rsp = &repb.GetTreeResponse{}
 			rspSizeBytes = 0
 		}
-		rspSizeBytes += d.GetSizeBytes()
+		rspSizeBytes += size
 		rsp.Directories = append(rsp.Directories, dir)
 		dirCount += 1
 		return nil
@@ -761,10 +902,28 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 		}()
 	}()
 
-	var fetch func(ctx context.Context, dirWithDigest *capb.DirectoryWithDigest, level int) ([]*capb.DirectoryWithDigest, error)
-	fetch = func(ctx context.Context, dirWithDigest *capb.DirectoryWithDigest, level int) ([]*capb.DirectoryWithDigest, error) {
+	type fetchResult struct {
+		// If the root node of the tree was found in the TreeCache, this value
+		// will be non-nil and contain the CAS RN of the whole tree.
+		cachedRoot *digest.ResourceName
+		// The trees that should be sent directly to the client (they are not
+		// part of a cached subtree).  Note that when cachedRoot is set, this
+		// slice will contain the entire tree.
+		mainDirectories []*capb.DirectoryWithDigest
+		// Resource names pointing to subtrees that were found in the cache and
+		// are considered big enough to be worth caching on the client side.
+		cachedSubtrees []*digest.ResourceName
+		// The digests of the directories contained in cachedSubtrees--this is
+		// tracked so that we can validate the full tree after fetching.
+		subtreeDirectories []*capb.DirectoryWithDigest
+	}
+
+	var fetch func(ctx context.Context, dirWithDigest *capb.DirectoryWithDigest, level int) (*fetchResult, error)
+	fetch = func(ctx context.Context, dirWithDigest *capb.DirectoryWithDigest, level int) (*fetchResult, error) {
 		if len(dirWithDigest.Directory.Directories) == 0 {
-			return []*capb.DirectoryWithDigest{dirWithDigest}, nil
+			return &fetchResult{
+				mainDirectories: []*capb.DirectoryWithDigest{dirWithDigest},
+			}, nil
 		}
 
 		treeCachePointer, err := makeTreeCachePointer(dirWithDigest.GetResourceName(), req.GetDigestFunction())
@@ -772,8 +931,11 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 			return nil, err
 		}
 		if *enableTreeCaching && level >= *minTreeCacheLevel {
-			if children, err := s.lookupCachedTreeNode(ctx, level, treeCachePointer); err == nil {
-				return children, nil
+			if children, rn, err := s.lookupCachedTreeNode(ctx, level, treeCachePointer); err == nil {
+				return &fetchResult{
+					mainDirectories: children,
+					cachedRoot:      rn,
+				}, nil
 			}
 		}
 
@@ -789,19 +951,45 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 
 		allDescendents := make([]*capb.DirectoryWithDigest, 0, len(children))
 		allDescendents = append(allDescendents, dirWithDigest)
+		allCachedSubtrees := make([]*digest.ResourceName, 0)
+		allCachedSubtreeContents := make([]*capb.DirectoryWithDigest, 0)
 
 		eg, egCtx := errgroup.WithContext(ctx)
 		for _, childDirWithDigest := range children {
-			childDirWithDigest := childDirWithDigest
 			l := level
 			eg.Go(func() error {
-				grandChildren, err := fetch(egCtx, childDirWithDigest, l+1)
+				grandchild, err := fetch(egCtx, childDirWithDigest, l+1)
 				if err != nil {
 					return err
 				}
 				mu.Lock()
 				defer mu.Unlock()
-				allDescendents = append(allDescendents, grandChildren...)
+				subtreesRequested := *getTreeSubtreeSupport && req.GetSendCachedSubtreeDigests()
+				if subtreesRequested && grandchild.cachedRoot != nil && len(grandchild.mainDirectories) >= *getTreeSubtreeMinDirCount {
+					// This grandchild was cached--we are guaranteed that cachedSubtrees
+					// will be empty (TreeCache entries are always complete), so we
+					// record the subtree root for our response.  The only purpose of
+					// saving the subtree's contents is so that we can validate the
+					// entire tree at the end of the request.
+					allCachedSubtrees = append(allCachedSubtrees, grandchild.cachedRoot)
+					allCachedSubtreeContents = append(allCachedSubtreeContents, grandchild.mainDirectories...)
+				} else {
+					// Three possibilities here:
+					// 0.  Subtrees aren't being requested; all contents will be in
+					//     mainDirectories and we copy up.
+					// 1.  The grandchild is cached, but small: all directories will be in
+					//     mainDirectories, and cachedSubtrees will be empty.  We copy its
+					//     contents to our response instead of sending it as a subtree.
+					// 2.  The grandchild is not cached, but some of its own children might
+					//     have been cached, so we will happily send those subtree RNs back
+					//     to the client--we copy those upward (recursively) in addition to
+					//     all of the uncached content in mainDirectories.
+					allDescendents = append(allDescendents, grandchild.mainDirectories...)
+					if len(grandchild.cachedSubtrees) > 0 {
+						allCachedSubtrees = append(allCachedSubtrees, grandchild.cachedSubtrees...)
+						allCachedSubtreeContents = append(allCachedSubtreeContents, grandchild.subtreeDirectories...)
+					}
+				}
 				return nil
 			})
 		}
@@ -809,33 +997,66 @@ func (s *ContentAddressableStorageServer) GetTree(req *repb.GetTreeRequest, stre
 			return nil, err
 		}
 
-		if *enableTreeCaching && level >= *minTreeCacheLevel && len(allDescendents) >= *minTreeCacheDescendents {
+		if *enableTreeCaching && level >= *minTreeCacheLevel && (len(allDescendents)+len(allCachedSubtreeContents)) >= *minTreeCacheDescendents {
 			if r := rand.Float64(); r <= *treeCacheWriteProbability {
 				treeCache := &capb.TreeCache{
 					Children: make([]*capb.DirectoryWithDigest, len(allDescendents)),
 				}
 				copy(treeCache.Children, allDescendents)
+				treeCache.Children = append(treeCache.Children, allCachedSubtreeContents...)
 				cacheEG.Go(func() error {
 					return s.cacheTreeNode(cacheEGCtx, dirWithDigest, treeCachePointer, treeCache)
 				})
 			}
 		}
-		return allDescendents, nil
+		return &fetchResult{
+			cachedRoot:         nil,
+			mainDirectories:    allDescendents,
+			cachedSubtrees:     allCachedSubtrees,
+			subtreeDirectories: allCachedSubtreeContents,
+		}, nil
 	}
 
-	allDirs, err := fetch(ctx, &capb.DirectoryWithDigest{
+	// We can't send back a "subtree" for the root element, so there's no use in
+	// checking if it was cached or not--and the tree is guaranteed to have all
+	// nodes in it in that case as well.  This is a bit of a weird edge: we
+	// don't optimize anything if the caller is requesting an identical tree to
+	// a previous run, which can actually happen in cases like
+	// `runs_per_test=100`.
+	// TODO(jdhollen): find a decent workaround for the above comment.
+	result, err := fetch(ctx, &capb.DirectoryWithDigest{
 		Directory:    rootDir,
 		ResourceName: rootDirRN.ToProto(),
 	}, 0)
 	if err != nil {
 		return err
 	}
-	for _, dir := range allDirs {
+	for _, dir := range result.mainDirectories {
 		if err := finishDir(dir); err != nil {
 			return err
 		}
 	}
-	log.Debugf("GetTree fetched %d dirs from cache across %d calls in cumulative %s (total time: %s)", dirCount, fetchCount, fetchDuration, time.Since(rpcStart))
+
+	if len(result.cachedSubtrees) > 0 {
+		// Sort and dedupe cached subtrees in case we ever want to cache this response somewhere.
+		slices.SortFunc(result.cachedSubtrees, compareSubtrees)
+		result.cachedSubtrees = slices.CompactFunc(result.cachedSubtrees, dedupeResources)
+		rsp.Subtrees = make([]*repb.SubtreeResourceName, 0, len(result.cachedSubtrees))
+		for _, st := range result.cachedSubtrees {
+			rsp.Subtrees = append(rsp.Subtrees, &repb.SubtreeResourceName{
+				Digest:         st.GetDigest(),
+				InstanceName:   st.GetInstanceName(),
+				DigestFunction: st.GetDigestFunction(),
+				Compressor:     st.GetCompressor(),
+			})
+		}
+		dirCount += len(result.subtreeDirectories)
+
+		// Make sure we send all subtree data below.
+		rspSizeBytes = 1
+	}
+
+	log.Debugf("GetTree fetched %d dirs from cache across %d calls (including %d cached subtrees) in cumulative %s (total time: %s)", dirCount, fetchCount, len(result.cachedSubtrees), fetchDuration, time.Since(rpcStart))
 	if rspSizeBytes > 0 {
 		return stream.Send(rsp)
 	}
@@ -976,8 +1197,7 @@ func isComplete(children []*capb.DirectoryWithDigest) bool {
 			return false
 		}
 		for _, dirNode := range child.GetDirectory().GetDirectories() {
-			grn := digest.NewResourceName(dirNode.GetDigest(), "", rspb.CacheType_CAS, rn.GetDigestFunction())
-			if grn.IsEmpty() {
+			if digest.IsEmptyHash(dirNode.GetDigest(), rn.GetDigestFunction()) {
 				continue
 			}
 			if _, ok := allDigests[dirNode.GetDigest().GetHash()]; !ok {
@@ -987,4 +1207,173 @@ func isComplete(children []*capb.DirectoryWithDigest) bool {
 		}
 	}
 	return true
+}
+
+// SpliceBlob is used to tell the server how it can assemble a blob from a list of CAS digests.
+// The server will verify the chunks assembled from the digests match the expected blob digest.
+func (s *ContentAddressableStorageServer) SpliceBlob(ctx context.Context, req *repb.SpliceBlobRequest) (*repb.SpliceBlobResponse, error) {
+	start := time.Now()
+	rsp, err := s.spliceBlob(ctx, req)
+	if err != nil {
+		log.CtxInfof(ctx, "SpliceBlob failed: %v", err)
+	}
+	metrics.SpliceBlobDurationUsec.With(prometheus.Labels{
+		metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
+	}).Observe(float64(time.Since(start).Microseconds()))
+	return rsp, err
+}
+
+func (s *ContentAddressableStorageServer) spliceBlob(ctx context.Context, req *repb.SpliceBlobRequest) (*repb.SpliceBlobResponse, error) {
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
+	if err != nil {
+		return nil, err
+	}
+
+	canWrite, err := capabilities.IsGranted(ctx, s.env.GetAuthenticator(), cappb.Capability_CACHE_WRITE|cappb.Capability_CAS_WRITE)
+	if err != nil {
+		return nil, err
+	}
+	if !canWrite {
+		// For read-only API keys, behave like a no-op success to be consistent with
+		// other write methods (e.g. UpdateActionResult, BatchUpdateBlobs) and avoid
+		// breaking builds that rely on read-only credentials.
+		return &repb.SpliceBlobResponse{
+			BlobDigest: req.GetBlobDigest(),
+		}, nil
+	}
+
+	if cf := req.GetChunkingFunction(); cf != repb.ChunkingFunction_UNKNOWN && cf != repb.ChunkingFunction_FAST_CDC_2020 {
+		return nil, status.InvalidArgumentErrorf("unsupported chunking function %v in request %s", cf, req)
+	}
+
+	if req.GetBlobDigest() == nil {
+		return nil, status.UnimplementedErrorf("SpliceBlob with no blob_digest is not supported. Request: %s", req)
+	}
+	if nDigests := len(req.GetChunkDigests()); nDigests == 0 {
+		return nil, status.InvalidArgumentErrorf("chunk_digests cannot be empty in request %s", req)
+	} else if nDigests == 1 {
+		return nil, status.UnimplementedErrorf("SpliceBlob with only one chunk is not supported. Request: %s", req)
+	}
+
+	manifest := &chunking.Manifest{
+		BlobDigest:     req.GetBlobDigest(),
+		ChunkDigests:   req.GetChunkDigests(),
+		InstanceName:   req.GetInstanceName(),
+		DigestFunction: req.GetDigestFunction(),
+	}
+
+	efp := s.env.GetExperimentFlagProvider()
+	skipValidation := cdc.IsSpliceWithoutValidation(ctx) &&
+		s.isTrustedSpliceClient(ctx) &&
+		efp != nil &&
+		efp.Boolean(ctx, cdc.SpliceWithoutValidationExperiment, false)
+
+	validation := spliceValidationFull
+	if skipValidation {
+		validation = spliceValidationSkipped
+	}
+	metrics.SpliceBlobCount.With(prometheus.Labels{
+		metrics.SpliceBlobValidation: validation,
+		metrics.GroupID:              s.groupIDForMetrics(ctx),
+	}).Inc()
+
+	if skipValidation {
+		err = manifest.StoreWithoutContentVerification(ctx, s.cache)
+	} else {
+		err = manifest.Store(ctx, s.cache)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &repb.SpliceBlobResponse{
+		BlobDigest: req.GetBlobDigest(),
+	}, nil
+}
+
+func (s *ContentAddressableStorageServer) groupIDForMetrics(ctx context.Context) string {
+	if a := s.env.GetAuthenticator(); a != nil {
+		if u, err := a.AuthenticatedUser(ctx); err == nil {
+			return u.GetGroupID()
+		}
+	}
+	return interfaces.AuthAnonymousUser
+}
+
+// isTrustedSpliceClient reports whether the caller presented a validated
+// executor or cache-proxy client identity.
+func (s *ContentAddressableStorageServer) isTrustedSpliceClient(ctx context.Context) bool {
+	cis := s.env.GetClientIdentityService()
+	if cis == nil {
+		return false
+	}
+	identity, err := cis.IdentityFromContext(ctx)
+	if err != nil || identity == nil {
+		return false
+	}
+	return identity.Client == interfaces.ClientIdentityExecutor ||
+		identity.Client == interfaces.ClientIdentityCacheProxy
+}
+
+func (s *ContentAddressableStorageServer) readChunkedBlob(ctx context.Context, blobDigest *repb.Digest, instanceName string, digestFunction repb.DigestFunction_Value, readZstd bool) ([]byte, error) {
+	if blobDigest.GetSizeBytes() > rpcutil.GRPCMaxSizeBytes {
+		return nil, status.NotFoundErrorf("blob %s not found", blobDigest.GetHash())
+	}
+	compressor := repb.Compressor_IDENTITY
+	if readZstd {
+		compressor = repb.Compressor_ZSTD
+	}
+	return chunking.GetBlob(ctx, s.cache, blobDigest, instanceName, digestFunction, compressor)
+}
+
+// SplitBlob is used to get the digests of the chunks that make up a blob. Clients can then see if
+// any chunks are available locally to reduce download from the remote CAS.
+func (s *ContentAddressableStorageServer) SplitBlob(ctx context.Context, req *repb.SplitBlobRequest) (*repb.SplitBlobResponse, error) {
+	resp, err := s.splitBlob(ctx, req)
+	if err != nil {
+		if status.IsNotFoundError(err) {
+			log.CtxDebugf(ctx, "SplitBlob failed: %v", err)
+		} else {
+			log.CtxWarningf(ctx, "SplitBlob failed: %v", err)
+		}
+	}
+	return resp, err
+}
+
+func (s *ContentAddressableStorageServer) GetChunkMapping(req *repb.GetChunkMappingRequest, stream repb.ContentAddressableStorage_GetChunkMappingServer) error {
+	return status.UnimplementedError("GetChunkMapping RPC is not currently implemented")
+}
+
+func (s *ContentAddressableStorageServer) RegisterChunkMapping(stream repb.ContentAddressableStorage_RegisterChunkMappingServer) error {
+	return status.UnimplementedError("RegisterChunkMapping RPC is not currently implemented")
+}
+
+func (s *ContentAddressableStorageServer) splitBlob(ctx context.Context, req *repb.SplitBlobRequest) (*repb.SplitBlobResponse, error) {
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
+	if err != nil {
+		return nil, err
+	}
+
+	cf := req.GetChunkingFunction()
+	if cf != repb.ChunkingFunction_UNKNOWN && cf != repb.ChunkingFunction_FAST_CDC_2020 {
+		return nil, status.InvalidArgumentErrorf("unsupported chunking function %v in request %s", cf, req)
+	}
+
+	if req.GetBlobDigest() == nil {
+		return nil, status.InvalidArgumentErrorf("blob_digest is required in request %s", req)
+	}
+
+	manifest, err := chunking.LoadManifest(ctx, s.cache, req.GetBlobDigest(), req.GetInstanceName(), req.GetDigestFunction())
+	if err != nil {
+		return nil, err
+	}
+
+	fmReq := manifest.ToFindMissingBlobsRequest()
+	fmReq.Purpose = repb.FindMissingBlobsRequest_CAS_SPLIT_BLOB
+	if resp, err := s.FindMissingBlobs(ctx, fmReq); err != nil {
+		return nil, err
+	} else if len(resp.GetMissingBlobDigests()) > 0 {
+		return nil, status.NotFoundErrorf("required chunks not found in CAS: %s", chunking.DigestsSummary(resp.GetMissingBlobDigests()))
+	}
+	return manifest.ToSplitBlobResponse(), nil
 }

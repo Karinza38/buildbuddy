@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	enableTargetTracking                   = flag.Bool("app.enable_target_tracking", false, "Cloud-Only")
+	enableTargetTracking                   = flag.Bool("app.enable_target_tracking", false, "If enabled, store test target statuses in the database. Note: it's highly recommended to also configure an OLAP database when using this flag.")
 	writeTestTargetStatusesToOLAPDBEnabled = flag.Bool("app.enable_write_test_target_statuses_to_olap_db", false, "If enabled, test target statuses will be flushed to OLAP DB")
 )
 
@@ -551,7 +551,7 @@ func insertTargets(ctx context.Context, env environment.Env, targets []*tables.T
 	chunkList := chunkTargetsBy(targets, 100)
 	for _, chunk := range chunkList {
 		valueStrings := []string{}
-		valueArgs := []interface{}{}
+		valueArgs := []any{}
 		for _, t := range chunk {
 			nowUsec := time.Now().UnixMicro()
 			valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -591,7 +591,7 @@ func insertOrUpdateTargetStatuses(ctx context.Context, env environment.Env, stat
 	chunkList := chunkStatusesBy(statuses, 100)
 	for _, chunk := range chunkList {
 		valueStrings := []string{}
-		valueArgs := []interface{}{}
+		valueArgs := []any{}
 		for _, t := range chunk {
 			nowUsec := time.Now().UnixMicro()
 			valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")

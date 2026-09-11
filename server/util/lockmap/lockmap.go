@@ -2,38 +2,13 @@ package lockmap
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-type refCount struct {
-	i *int64
-}
-
-func (c *refCount) Inc() int64 {
-	j := atomic.AddInt64(c.i, 1)
-	return j
-}
-func (c *refCount) Dec() int64 {
-	j := atomic.AddInt64(c.i, -1)
-	return j
-}
-func (c *refCount) Val() int64 {
-	j := atomic.LoadInt64(c.i)
-	return j
-}
-
-type refCountedMutex struct {
+type collectableMutex struct {
 	sync.RWMutex
-	count refCount
-}
-
-func newRefCountedMutex() *refCountedMutex {
-	var i int64
-	return &refCountedMutex{
-		RWMutex: sync.RWMutex{},
-		count:   refCount{&i},
-	}
+	// guarded by the mutex, this mutex is unusable if true
+	collected bool
 }
 
 // Locker implements a per-key mutex. This can be useful when protecting access
@@ -42,42 +17,41 @@ func newRefCountedMutex() *refCountedMutex {
 //
 // Ex.
 //
-//	l := lockmap.New()          <- this returns a Locker
+//	l := lockmap.New[string]()  <- this returns a Locker keyed by string
 //	unlockFn := l.Lock("key-1") <- this is like Lock()ing a RWMutex
 //	defer unlockFn()            <- this is like Unlock()ing a RWMutex
 //	// do work here.
 //
 // Ex 2.
 //
-//	l := lockmap.New()          <- this returns a Locker
-//	unlockFn := l.Lock("key-1") <- this is like RLock()ing a RWMutex
-//	defer unlockFn()            <- this is like RUnlock()ing a RWMutex
+//	l := lockmap.New[int64]() <- this returns a Locker keyed by int64
+//	unlockFn := l.RLock(42)   <- this is like RLock()ing a RWMutex
+//	defer unlockFn()          <- this is like RUnlock()ing a RWMutex
 //	// do work here.
 //
-// Locks are uniquely identified by string, so the same resource can be both
+// Locks are uniquely identified by key, so the same resource can be both
 // RLock()ed and Lock()ed by different threads, they will share the same
 // RWMutex. The lockmap will cull unused locks periodically to save memory.
-type Locker interface {
-	Lock(key string) func()
-	RLock(key string) func()
+type Locker[K comparable] interface {
+	Lock(key K) func()
+	RLock(key K) func()
 	Close() error
 }
 
-type perKeyMutex struct {
+type perKeyMutex[K comparable] struct {
 	mutexes sync.Map
-	bigLock sync.RWMutex
 	closed  chan struct{}
 }
 
-// New returns a new lock map.
+// New returns a new lock map keyed by K.
 // The caller must call Close() when the map is no longer needed.
-func New() *perKeyMutex {
-	pkm := &perKeyMutex{closed: make(chan struct{})}
+func New[K comparable]() *perKeyMutex[K] {
+	pkm := &perKeyMutex[K]{closed: make(chan struct{})}
 	go pkm.gc()
 	return pkm
 }
 
-func (p *perKeyMutex) gc() {
+func (p *perKeyMutex[K]) gc() {
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -87,46 +61,72 @@ func (p *perKeyMutex) gc() {
 		case <-t.C:
 		}
 		p.mutexes.Range(func(key, value any) bool {
-			p.bigLock.Lock()
-			rcm := value.(*refCountedMutex)
-			if rcm.count.Val() == 0 {
-				p.mutexes.Delete(key)
+			rcm := value.(*collectableMutex)
+			if !rcm.TryLock() {
+				// The mutex is in use and thus shouldn't be collected.
+				return true
 			}
-			p.bigLock.Unlock()
+			// At this point we hold the exclusive lock, so there are two cases:
+			// * There were no other goroutines waiting to acquire a lock, which
+			//   means that the mutex should be collected.
+			// * There were other goroutines waiting to acquire a lock, but they
+			//   failed to acquire it in the short period of time between it
+			//   becoming available and us acquiring it. As GC only rarely runs,
+			//   this case is expected to be very uncommon. All waiting
+			//   goroutines will need to refetch from the map.
+			//
+			// Mark the mutex as unusable before removing it from the map so
+			// that there are never two active mutexes for the same key.
+			rcm.collected = true
+			rcm.Unlock()
+			p.mutexes.Delete(key)
 			return true
 		})
 	}
 }
 
-func (p *perKeyMutex) Lock(key string) func() {
-	p.bigLock.Lock()
-	value, _ := p.mutexes.LoadOrStore(key, newRefCountedMutex())
-	rcm := value.(*refCountedMutex)
-	rcm.count.Inc()
-	p.bigLock.Unlock()
-
-	rcm.Lock()
-	return func() {
+func (p *perKeyMutex[K]) Lock(key K) func() {
+	var rcm *collectableMutex
+	for {
+		val, _ := p.mutexes.LoadOrStore(key, &collectableMutex{})
+		rcm = val.(*collectableMutex)
+		rcm.Lock()
+		if !rcm.collected {
+			break
+		}
+		// We hit the window between rcm.Unlock() and p.mutexes.Delete(key) in
+		// the gc() method. Busy wait for the map slot to be cleared.
 		rcm.Unlock()
-		rcm.count.Dec()
 	}
+	return func() { rcm.Unlock() }
 }
 
-func (p *perKeyMutex) RLock(key string) func() {
-	p.bigLock.Lock()
-	value, _ := p.mutexes.LoadOrStore(key, newRefCountedMutex())
-	rcm := value.(*refCountedMutex)
-	rcm.count.Inc()
-	p.bigLock.Unlock()
-
-	rcm.RLock()
-	return func() {
+func (p *perKeyMutex[K]) RLock(key K) func() {
+	var rcm *collectableMutex
+	for {
+		val, _ := p.mutexes.LoadOrStore(key, &collectableMutex{})
+		rcm = val.(*collectableMutex)
+		rcm.RLock()
+		if !rcm.collected {
+			break
+		}
+		// See comment in Lock().
 		rcm.RUnlock()
-		rcm.count.Dec()
 	}
+	return func() { rcm.RUnlock() }
 }
 
-func (p *perKeyMutex) Close() error {
+func (p *perKeyMutex[K]) Close() error {
 	close(p.closed)
 	return nil
+}
+
+// For testing only.
+func (p *perKeyMutex[K]) count() int {
+	count := 0
+	p.mutexes.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	return count
 }

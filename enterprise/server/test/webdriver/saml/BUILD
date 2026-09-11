@@ -6,6 +6,7 @@ go_web_test_suite(
     name = "saml_test",
     srcs = ["saml_test.go"],
     exec_properties = {
+        "test.EstimatedComputeUnits": "3",
         "test.workload-isolation-type": "firecracker",
         "test.recycle-runner": "true",
         "test.init-dockerd": "true",
@@ -17,6 +18,7 @@ go_web_test_suite(
         "//enterprise/server/testutil/buildbuddy_enterprise",
         "//enterprise/server/util/mocksaml",
         "//server/testutil/app",
+        "//server/testutil/testbazel",
         "//server/testutil/testfs",
         "//server/testutil/testport",
         "//server/testutil/webtester",

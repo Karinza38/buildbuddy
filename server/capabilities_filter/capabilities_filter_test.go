@@ -2,42 +2,47 @@ package capabilities_filter_test
 
 import (
 	"context"
-	"path"
 	"reflect"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/capabilities_filter"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	apipb "github.com/buildbuddy-io/buildbuddy/proto/api/v1"
-	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
 	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
+	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	ctxpb "github.com/buildbuddy-io/buildbuddy/proto/context"
+)
+
+var (
+	buildBuddyServicePrefix = "/" + bbspb.BuildBuddyService_ServiceDesc.ServiceName + "/"
+	apiServicePrefix        = "/" + apipb.ApiService_ServiceDesc.ServiceName + "/"
 )
 
 func TestAllRPCsHaveExplicitCapabilitiesSpecified(t *testing.T) {
 	serviceMethodNames := []string{}
-	buildbuddyServiceType := reflect.TypeOf((*bbspb.BuildBuddyServiceServer)(nil)).Elem()
-	for i := 0; i < buildbuddyServiceType.NumMethod(); i++ {
-		serviceMethodNames = append(serviceMethodNames, buildbuddyServiceType.Method(i).Name)
+	buildbuddyServiceType := reflect.TypeFor[bbspb.BuildBuddyServiceServer]()
+	for method := range buildbuddyServiceType.Methods() {
+		serviceMethodNames = append(serviceMethodNames, buildBuddyServicePrefix+method.Name)
 	}
-	apiServiceType := reflect.TypeOf((*apipb.ApiServiceServer)(nil)).Elem()
-	for i := 0; i < apiServiceType.NumMethod(); i++ {
-		serviceMethodNames = append(serviceMethodNames, apiServiceType.Method(i).Name)
+	apiServiceType := reflect.TypeFor[apipb.ApiServiceServer]()
+	for method := range apiServiceType.Methods() {
+		serviceMethodNames = append(serviceMethodNames, apiServicePrefix+method.Name)
 	}
 
 	allDefinedMethods := capabilities_filter.AllRPCsForTestOnly()
 
 	assert.Subset(
 		t, allDefinedMethods, serviceMethodNames,
-		"All BuildBuddyService RPCs should be added to one of the lists in capabilities_filter.go",
+		"All BuildBuddyService and ApiService RPCs should be added to one of the lists in capabilities_filter.go",
 	)
 	assert.Subset(
 		t, serviceMethodNames, allDefinedMethods,
-		"All BuildBuddyService RPCs listed in capabilities_filter.go should be valid BuildBuddy service RPCs. "+
+		"All RPCs listed in capabilities_filter.go should be valid BuildBuddyService or ApiService RPCs. "+
 			"(check for typos, or if you deleted an RPC, remove it from capabilities_filter.go)",
 	)
 }
@@ -45,22 +50,31 @@ func TestAllRPCsHaveExplicitCapabilitiesSpecified(t *testing.T) {
 func TestBuildBuddyServiceRPCsHaveRequestAndResponseContextFields(t *testing.T) {
 	type Req interface{ GetRequestContext() *ctxpb.RequestContext }
 	type Res interface{ GetResponseContext() *ctxpb.ResponseContext }
-	expectedReqType := reflect.TypeOf((*Req)(nil)).Elem()
-	expectedResType := reflect.TypeOf((*Res)(nil)).Elem()
-	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	expectedReqType := reflect.TypeFor[Req]()
+	expectedResType := reflect.TypeFor[Res]()
+	ctxType := reflect.TypeFor[context.Context]()
 
-	buildbuddyServiceType := reflect.TypeOf((*bbspb.BuildBuddyServiceServer)(nil)).Elem()
-	for i := 0; i < buildbuddyServiceType.NumMethod(); i++ {
-		methodFunc := buildbuddyServiceType.Method(i).Type
-		methodName := buildbuddyServiceType.Method(i).Name
+	buildbuddyServiceType := reflect.TypeFor[bbspb.BuildBuddyServiceServer]()
+	for method := range buildbuddyServiceType.Methods() {
+		methodFunc := method.Type
+		methodName := method.Name
 
 		var actualReqType, actualResType reflect.Type
 		if methodFunc.In(0).Implements(ctxType) {
 			// Unary RPC
 			actualReqType = methodFunc.In(1)
 			actualResType = methodFunc.Out(0)
+		} else if methodFunc.NumIn() == 1 {
+			// Client-streaming RPC: (stream) -> error
+			streamType := methodFunc.In(0)
+			recvMethod, ok := streamType.MethodByName("Recv")
+			require.True(t, ok)
+			actualReqType = recvMethod.Type.Out(0)
+			sendAndCloseMethod, ok := streamType.MethodByName("SendAndClose")
+			require.True(t, ok)
+			actualResType = sendAndCloseMethod.Type.In(0)
 		} else {
-			// Server-streaming RPC
+			// Server-streaming RPC: (req, stream) -> error
 			actualReqType = methodFunc.In(0)
 			streamType := methodFunc.In(1)
 			sendMethod, ok := streamType.MethodByName("Send")
@@ -82,73 +96,151 @@ func TestAllowedRPCs(t *testing.T) {
 		Name               string
 		RPC                string
 		Anonymous          bool
-		Capabilities       []akpb.ApiKey_Capability
+		Capabilities       []cappb.Capability
 		ServerAdminGroupID string
 		Allowed            bool
 	}{
 		{
 			Name:      "UnrestrictedRPC_Anonymous_Allowed",
-			RPC:       "/buildbuddy.service.BuildBuddyService/GetInvocation",
+			RPC:       buildBuddyServicePrefix + "GetInvocation",
+			Anonymous: true,
+			Allowed:   true,
+		},
+		{
+			Name:      "UnrestrictedRPC_ExecutionDownloads_Anonymous_Allowed",
+			RPC:       buildBuddyServicePrefix + "GetExecutionDownloads",
 			Anonymous: true,
 			Allowed:   true,
 		},
 		{
 			Name:         "UnrestrictedRPC_NonAdmin_Allowed",
-			RPC:          "/buildbuddy.service.BuildBuddyService/GetInvocation",
-			Capabilities: []akpb.ApiKey_Capability{},
+			RPC:          buildBuddyServicePrefix + "GetInvocation",
+			Capabilities: []cappb.Capability{},
 			Allowed:      true,
 		},
 		{
 			Name:         "UnrestrictedRPC_Admin_Allowed",
-			RPC:          "/buildbuddy.service.BuildBuddyService/GetInvocation",
-			Capabilities: []akpb.ApiKey_Capability{akpb.ApiKey_ORG_ADMIN_CAPABILITY},
+			RPC:          buildBuddyServicePrefix + "GetInvocation",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
 			Allowed:      true,
 		},
 		{
 			Name:      "OrgMemberRPC_Anonymous_NotAllowed",
-			RPC:       "/buildbuddy.service.BuildBuddyService/SearchInvocation",
+			RPC:       buildBuddyServicePrefix + "SearchInvocation",
 			Anonymous: true,
 			Allowed:   false,
 		},
 		{
 			Name:         "OrgMemberRPC_OrgMember_Allowed",
-			RPC:          "/buildbuddy.service.BuildBuddyService/SearchInvocation",
-			Capabilities: []akpb.ApiKey_Capability{},
+			RPC:          buildBuddyServicePrefix + "SearchInvocation",
+			Capabilities: []cappb.Capability{},
 			Allowed:      true,
 		},
 		{
 			Name:         "AdminOnlyRPC_NonAdmin_NotAllowed",
-			RPC:          "/buildbuddy.service.BuildBuddyService/UpdateGroup",
-			Capabilities: []akpb.ApiKey_Capability{},
+			RPC:          buildBuddyServicePrefix + "UpdateGroup",
+			Capabilities: []cappb.Capability{},
 			Allowed:      false,
 		},
 		{
 			Name:         "AdminOnlyRPC_Admin_Allowed",
-			RPC:          "/buildbuddy.service.BuildBuddyService/UpdateGroup",
-			Capabilities: []akpb.ApiKey_Capability{akpb.ApiKey_ORG_ADMIN_CAPABILITY},
+			RPC:          buildBuddyServicePrefix + "UpdateGroup",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
 			Allowed:      true,
 		},
 		{
+			Name:         "GetUsageAlertingRules_NonAdmin_NotAllowed",
+			RPC:          buildBuddyServicePrefix + "GetUsageAlertingRules",
+			Capabilities: []cappb.Capability{},
+			Allowed:      false,
+		},
+		{
+			Name:         "GetUsageAlertingRules_Admin_Allowed",
+			RPC:          buildBuddyServicePrefix + "GetUsageAlertingRules",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
+			Allowed:      true,
+		},
+		{
+			Name:         "CreateUsageAlertingRule_NonAdmin_NotAllowed",
+			RPC:          buildBuddyServicePrefix + "CreateUsageAlertingRule",
+			Capabilities: []cappb.Capability{},
+			Allowed:      false,
+		},
+		{
+			Name:         "CreateUsageAlertingRule_Admin_Allowed",
+			RPC:          buildBuddyServicePrefix + "CreateUsageAlertingRule",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
+			Allowed:      true,
+		},
+		{
+			Name:         "DeleteUsageAlertingRule_NonAdmin_NotAllowed",
+			RPC:          buildBuddyServicePrefix + "DeleteUsageAlertingRule",
+			Capabilities: []cappb.Capability{},
+			Allowed:      false,
+		},
+		{
+			Name:         "DeleteUsageAlertingRule_Admin_Allowed",
+			RPC:          buildBuddyServicePrefix + "DeleteUsageAlertingRule",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
+			Allowed:      true,
+		},
+		{
+			Name:         "SendNotification_Allowed_Unrestricted",
+			RPC:          buildBuddyServicePrefix + "SendNotification",
+			Capabilities: []cappb.Capability{},
+			Allowed:      true,
+		},
+		{
+			Name:         "SetSSOConfig_Admin_Allowed",
+			RPC:          buildBuddyServicePrefix + "SetSSOConfig",
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
+			Allowed:      true,
+		},
+		{
+			Name:         "SetSSOConfig_NonAdmin_NotAllowed",
+			RPC:          buildBuddyServicePrefix + "SetSSOConfig",
+			Capabilities: []cappb.Capability{},
+			Allowed:      false,
+		},
+		{
 			Name: "ServerAdminOnly_NonServerAdmin_NotAllowed",
-			RPC:  "/buildbuddy.service.BuildBuddyService/ApplyBucket",
+			RPC:  buildBuddyServicePrefix + "ApplyBucket",
 			// Note: this user is an org admin but not a server admin.
-			Capabilities: []akpb.ApiKey_Capability{akpb.ApiKey_ORG_ADMIN_CAPABILITY},
+			Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
 			Allowed:      false,
 		},
 		{
 			Name:               "ServerAdminOnly_ServerAdmin_Allowed",
-			RPC:                "/buildbuddy.service.BuildBuddyService/ApplyBucket",
+			RPC:                buildBuddyServicePrefix + "ApplyBucket",
 			ServerAdminGroupID: "GR1",
-			Capabilities:       []akpb.ApiKey_Capability{akpb.ApiKey_ORG_ADMIN_CAPABILITY},
+			Capabilities:       []cappb.Capability{cappb.Capability_ORG_ADMIN},
 			Allowed:            true,
+		},
+		{
+			Name:      "UnrestrictedRPC_API_Anonymous_Allowed",
+			RPC:       apiServicePrefix + "GetInvocation",
+			Anonymous: true,
+			Allowed:   true,
+		},
+		{
+			Name:         "OrgMemberRPC_API_OrgMember_Allowed",
+			RPC:          apiServicePrefix + "Run",
+			Capabilities: []cappb.Capability{},
+			Allowed:      true,
+		},
+		{
+			Name:      "OrgMemberRPC_API_Anonymous_NotAllowed",
+			RPC:       apiServicePrefix + "Run",
+			Anonymous: true,
+			Allowed:   false,
 		},
 	} {
 		t.Run(test.Name, func(t *testing.T) {
 			ctx := context.Background()
 			env := testenv.GetTestEnv(t)
 			users := testauth.TestUsers("US1", "GR1")
-			ta := testauth.NewTestAuthenticator(users)
-			ta.ServerAdminGroupID = test.ServerAdminGroupID
+			ta := testauth.NewTestAuthenticator(t, users)
+			flags.Set(t, "auth.admin_group_id", test.ServerAdminGroupID)
 			env.SetAuthenticator(ta)
 			u := users["US1"].(*testauth.TestUser)
 			u.Capabilities = test.Capabilities
@@ -162,10 +254,10 @@ func TestAllowedRPCs(t *testing.T) {
 
 			if test.Allowed {
 				assert.NoError(t, authErr)
-				assert.Contains(t, allowedRPCs, path.Base(test.RPC))
+				assert.Contains(t, allowedRPCs, test.RPC)
 			} else {
 				assert.Error(t, authErr)
-				assert.NotContains(t, allowedRPCs, path.Base(test.RPC))
+				assert.NotContains(t, allowedRPCs, test.RPC)
 			}
 		})
 	}

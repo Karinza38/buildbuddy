@@ -12,7 +12,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/background"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 )
 
 const (
@@ -94,6 +93,8 @@ func (c *Chunkstore) DeleteBlob(ctx context.Context, blobName string) error {
 }
 
 func ChunkIndexAsStringId(index uint16) string {
+	// NOTE: this 4-digit hex format is persisted both in Redis and GCS and
+	// cannot be changed without a careful migration.
 	return fmt.Sprintf("%04x", index)
 }
 
@@ -130,6 +131,9 @@ func (c *Chunkstore) getLastChunkIndex(ctx context.Context, blobName string, sta
 		}
 		if !exists {
 			if index == 0 || index == startingIndex {
+				// This is the first loop iteration; we never found any chunks. If there
+				// are any chunks for this blob, they are less than the starting index.
+				// Return an error.
 				return math.MaxUint16, status.NotFoundErrorf("No Chunk found at index %d", index)
 			}
 			break
@@ -401,8 +405,7 @@ type ChunkstoreWriter struct {
 
 func (w *ChunkstoreWriter) readFromWriteResultChannel() (int, error) {
 	delay := time.NewTimer(w.writeTimeoutDuration)
-	// don't leak the timer
-	defer timeutil.StopAndDrainTimer(delay)
+	defer delay.Stop()
 	select {
 	case result, open := <-w.writeResultChannel:
 		if !open || result.Close {
@@ -411,7 +414,8 @@ func (w *ChunkstoreWriter) readFromWriteResultChannel() (int, error) {
 			if result != nil && result.Err != nil {
 				return 0, result.Err
 			}
-			return 0, status.UnavailableErrorf("Error accessing %v: Already closed.", w.blobName)
+			// Return a nil error if already closed, but report 0 bytes written.
+			return 0, nil
 		}
 		w.lastChunkIndex = result.LastChunkIndex
 		if result.Timeout {
@@ -453,9 +457,6 @@ func (w *ChunkstoreWriter) Close(ctx context.Context) error {
 	}
 	w.writeChannel <- &WriteRequest{ctx: ctx, Close: true}
 	_, err := w.readFromWriteResultChannel()
-	if status.IsUnavailableError(err) {
-		return nil
-	}
 	return err
 }
 
@@ -471,6 +472,9 @@ type writeLoop struct {
 }
 
 func (l *writeLoop) write(ctx context.Context, chunk []byte, chunkIndex uint16, lastWriteSize int) (int, error) {
+	if chunkIndex == EmptyIndex {
+		return 0, status.ResourceExhaustedErrorf("Failed to write to chunkstore; index '%04x' is the invalid index.", chunkIndex)
+	}
 	size := l.writeBlockSize
 	if len(chunk) <= size {
 		size = len(chunk)
@@ -496,8 +500,7 @@ func (l *writeLoop) run(ctx context.Context) {
 		var req *WriteRequest
 
 		delay := time.NewTimer(time.Until(flushTime))
-		// don't leak the timer
-		defer timeutil.StopAndDrainTimer(delay)
+		defer delay.Stop()
 		// Get the write request for this iteration.
 		select {
 		case req, open = <-l.writeChannel:
@@ -585,11 +588,18 @@ func (l *writeLoop) run(ctx context.Context) {
 			//just wrote data to disk, reset the flushTime.
 			flushTime = time.Now().Add(l.writeTimeoutDuration)
 		}
-		// We report lastWriteSize as the number of bytes written because we may not
-		// flush all the bytes, but they will still be buffered to be written after
-		// we return. Thus, any and all write failures are instead reported in the
-		// error object as opposed to reflected in the number of bytes written.
+		// We normally report lastWriteSize as the number of bytes written because
+		// we may not flush all the bytes, but they will still be buffered to be
+		// written after we return unless we have exhausted the available indices.
+		// Thus, most write errors are instead reported in the error object as
+		// opposed to being reflected in the number of bytes written.
 		result := &WriteResult{Size: lastWriteSize, Err: err, LastChunkIndex: chunkIndex - 1, Timeout: timeout, BytesFlushed: bytesFlushed, Close: !open}
+		if status.IsResourceExhaustedError(err) {
+			// We ran out of indices for chunks, we can no longer write.
+			result.Size = bytesFlushed
+			result.Close = true
+			open = false
+		}
 		l.writeResultChannel <- result
 
 		if l.writeHook != nil {

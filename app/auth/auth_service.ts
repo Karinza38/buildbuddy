@@ -1,15 +1,14 @@
 import { Subject } from "rxjs";
+import { BuildBuddyError } from "../../app/util/errors";
+import popup from "../../app/util/popup";
 import { grp } from "../../proto/group_ts_proto";
 import { user_id } from "../../proto/user_id_ts_proto";
 import { user } from "../../proto/user_ts_proto";
 import capabilities from "../capabilities/capabilities";
-import rpcService, { BuildBuddyServiceRpcName } from "../service/rpc_service";
 import errorService from "../errors/error_service";
-import { BuildBuddyError } from "../../app/util/errors";
-import popup from "../../app/util/popup";
 import router from "../router/router";
+import { BuildBuddyServiceRpcName, default as rpcService } from "../service/rpc_service";
 import { User } from "./user";
-import rpc_service from "../service/rpc_service";
 
 export { User };
 
@@ -191,6 +190,7 @@ export class AuthService {
       ),
       isImpersonating: response.isImpersonating,
       subdomainGroupID: response.subdomainGroupId,
+      codesearchAllowed: response.experiments?.codesearchAllowed ?? false,
     });
   }
 
@@ -209,7 +209,9 @@ export class AuthService {
     let match = document.cookie.match("(^|[^;]+)\\s*" + cookieName + "\\s*=\\s*([^;]+)");
     let userIdFromCookie = match ? match.pop() : "";
     rpcService.requestContext.userId = new user_id.UserId({ id: userIdFromCookie });
-    rpcService.requestContext.groupId = this.user?.selectedGroup?.id || "";
+    let groupId = this.user?.selectedGroup?.id || "";
+    rpcService.requestContext.groupId = groupId;
+    this.setCookie(SELECTED_GROUP_ID_COOKIE, groupId);
   }
 
   async setSelectedGroupId(groupId: string, groupURL: string, { reload = false }: { reload?: boolean } = {}) {
@@ -237,7 +239,7 @@ export class AuthService {
   // Enters impersonation for the given group, which may either be a group ID or a URL identifier.
   async enterImpersonationMode(query: string, { redirectUrl = "" }: { redirectUrl?: string } = {}) {
     const request = grp.GetGroupRequest.create(query.startsWith("GR") ? { groupId: query } : { urlIdentifier: query });
-    const response = await rpc_service.service.getGroup(request);
+    const response = await rpcService.service.getGroup(request);
 
     if (!redirectUrl) {
       // If we don't have an explicit redirect URL, use the current URL but with

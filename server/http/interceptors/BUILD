@@ -6,7 +6,9 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/server/http/interceptors",
     visibility = ["//visibility:public"],
     deps = [
+        "//proto:buildbuddy_service_go_proto",
         "//proto:context_go_proto",
+        "//proto/api/v1:api_v1_go_proto",
         "//server/capabilities_filter",
         "//server/environment",
         "//server/features",
@@ -21,6 +23,7 @@ go_library(
         "//server/util/region",
         "//server/util/request_context",
         "//server/util/subdomain",
+        "//server/util/useragent",
         "//server/util/uuid",
         "@com_github_prometheus_client_golang//prometheus",
     ],
@@ -31,6 +34,10 @@ go_test(
     srcs = ["interceptors_test.go"],
     embed = [":interceptors"],
     deps = [
+        "//server/real_environment",
+        "//server/testutil/testauth",
+        "//server/util/authutil",
+        "//server/util/healthcheck",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",

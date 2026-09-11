@@ -1,20 +1,22 @@
-import React from "react";
-import rpcService from "../../../app/service/rpc_service";
-import { User } from "../../../app/auth/auth_service";
-import SidebarNodeComponentV2, { compareNodes } from "./code_sidebar_node_v2";
-import { Subscription } from "rxjs";
-import * as monaco from "monaco-editor";
 import * as diff from "diff";
-import { runner } from "../../../proto/runner_ts_proto";
+import { ArrowLeft, ChevronRight, Download, Key, Pencil, Send, XCircle } from "lucide-react";
+import * as monaco from "monaco-editor";
+import React from "react";
+import { Subscription } from "rxjs";
+import alert_service from "../../../app/alert/alert_service";
+import { User } from "../../../app/auth/auth_service";
+import { FilledButton, OutlinedButton } from "../../../app/components/button/button";
+import Spinner from "../../../app/components/spinner/spinner";
+import rpcService from "../../../app/service/rpc_service";
 import { git } from "../../../proto/git_ts_proto";
+import { runner } from "../../../proto/runner_ts_proto";
 import CodeBuildButton from "./code_build_button";
 import CodeEmptyStateComponent from "./code_empty";
-import { ArrowLeft, ChevronRight, Download, Key, Pencil, Send, XCircle } from "lucide-react";
-import Spinner from "../../../app/components/spinner/spinner";
-import { OutlinedButton, FilledButton } from "../../../app/components/button/button";
 import { createPullRequest, updatePullRequest } from "./code_pull_request";
-import alert_service from "../../../app/alert/alert_service";
+import SidebarNodeComponentV2, { compareNodes } from "./code_sidebar_node_v2";
 
+import Long from "long";
+import capabilities from "../../../app/capabilities/capabilities";
 import Dialog, {
   DialogBody,
   DialogFooter,
@@ -23,24 +25,23 @@ import Dialog, {
   DialogTitle,
 } from "../../../app/components/dialog/dialog";
 import Modal from "../../../app/components/modal/modal";
+import SearchBar from "../../../app/components/search_bar/search_bar";
+import error_service from "../../../app/errors/error_service";
+import { GithubIcon } from "../../../app/icons/github";
+import picker_service, { PickerModel } from "../../../app/picker/picker_service";
+import router from "../../../app/router/router";
 import { parseLcov } from "../../../app/util/lcov";
 import { github } from "../../../proto/github_ts_proto";
-import { workspace } from "../../../proto/workspace_ts_proto";
-import Long from "long";
-import ModuleSidekick from "../sidekick/module/module";
-import BazelVersionSidekick from "../sidekick/bazelversion/bazelversion";
-import BazelrcSidekick from "../sidekick/bazelrc/bazelrc";
-import BuildFileSidekick from "../sidekick/buildfile/buildfile";
-import error_service from "../../../app/errors/error_service";
 import { build } from "../../../proto/remote_execution_ts_proto";
 import { search } from "../../../proto/search_ts_proto";
-import OrgPicker from "../org_picker/org_picker";
-import capabilities from "../../../app/capabilities/capabilities";
-import router from "../../../app/router/router";
-import picker_service, { PickerModel } from "../../../app/picker/picker_service";
-import { GithubIcon } from "../../../app/icons/github";
+import { workspace } from "../../../proto/workspace_ts_proto";
 import { getLangHintFromFilePath } from "../monaco/monaco";
-import SearchBar from "../../../app/components/search_bar/search_bar";
+import OrgPicker from "../org_picker/org_picker";
+import BazelrcSidekick from "../sidekick/bazelrc/bazelrc";
+import BazelVersionSidekick from "../sidekick/bazelversion/bazelversion";
+import BuildFileSidekick from "../sidekick/buildfile/buildfile";
+import ModuleSidekick from "../sidekick/module/module";
+import { KythePanel, fetchDecorations } from "./kythe";
 
 interface Props {
   user: User;
@@ -61,6 +62,7 @@ interface State {
 
   fullPathToNodeMap: Map<string, workspace.Node>;
   fullPathToModelMap: Map<string, monaco.editor.ITextModel>;
+  fullPathToDecorationsMap: Map<string, string[]>;
   fullPathToDiffModelMap: Map<string, monaco.editor.IDiffEditorModel>;
 
   originalFileContents: Map<string, string>;
@@ -111,6 +113,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
     fullPathToChildrenMap: new Map<string, Array<workspace.Node>>(),
     fullPathToNodeMap: new Map<string, workspace.Node>(),
     fullPathToModelMap: new Map<string, monaco.editor.ITextModel>(),
+    fullPathToDecorationsMap: new Map<string, string[]>(),
     fullPathToDiffModelMap: new Map<string, monaco.editor.IDiffEditorModel>(),
     originalFileContents: new Map<string, string>(),
     tabs: new Map<string, string>(),
@@ -138,6 +141,12 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
 
   editor: monaco.editor.IStandaloneCodeEditor | undefined;
   diffEditor: monaco.editor.IDiffEditor | undefined;
+
+  // Note that these decoration collections are automatically cleared when the model is changed.
+  searchDecorations: monaco.editor.IEditorDecorationsCollection | undefined;
+  lcovDecorations: monaco.editor.IEditorDecorationsCollection | undefined;
+
+  mousedownTarget?: monaco.Position;
 
   codeViewer = React.createRef<HTMLDivElement>();
   diffViewer = React.createRef<HTMLDivElement>();
@@ -231,20 +240,24 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
     return this.state.changes.get(path);
   }
 
-  fetchIfNeededAndNavigate(path: string, additionalParams = "") {
-    this.navigateToPath(path + additionalParams);
+  fetchIfNeededAndNavigate(path: string, additionalParams = "", line = 0): Promise<boolean> {
+    if (line > 0) {
+      this.navigateToPathWithLine(path, line);
+    } else {
+      this.navigateToPath(path + additionalParams);
+    }
 
     if (this.state.mergeConflicts.has(path)) {
       this.handleViewConflictClicked(path, this.state.mergeConflicts.get(path)!, undefined);
-      return;
+      return Promise.resolve(true);
     } else if (this.isDiffView()) {
       this.handleViewDiffClicked(path);
-      return;
+      return Promise.resolve(true);
     }
 
-    this.getModel(path).then((model) => {
+    return this.getModel(path).then((model) => {
       this.setModel(path, model);
-      this.focusLineNumberAndHighlightQuery();
+      return true;
     });
   }
 
@@ -342,9 +355,11 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
 
     this.editor = monaco.editor.create(this.codeViewer.current!, {
       value: "",
-      theme: "vs",
+      theme: document.documentElement.classList.contains("dark") ? "vs-dark" : "vs",
       readOnly: this.isSingleFile() || Boolean(this.getQuery()),
     });
+    this.searchDecorations = this.editor.createDecorationsCollection();
+    this.lcovDecorations = this.editor.createDecorationsCollection();
 
     this.forceUpdate();
 
@@ -363,7 +378,8 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
     }
 
     if (this.currentPath()) {
-      this.fetchIfNeededAndNavigate(this.currentPath());
+      const url = new URL(window.location.href);
+      this.fetchIfNeededAndNavigate(this.currentPath(), "?" + url.searchParams.toString());
     } else {
       this.editor.setValue(
         ["// Welcome to BuildBuddy Code!", "", "// Click on a file to the left to get start editing."].join("\n")
@@ -388,13 +404,12 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
           /* wordSeparators= */ null,
           /* captureMatches= */ false
         );
-      this.editor?.removeDecorations(
-        this.editor
-          ?.getModel()
-          ?.getAllDecorations()
-          .map((d) => d.id) || []
-      );
-      this.editor?.createDecorationsCollection(
+      if (!ranges || ranges.length == 0) {
+        this.searchDecorations?.clear();
+        return;
+      }
+
+      this.searchDecorations?.set(
         ranges?.map((r) => {
           return { range: r.range, options: { inlineClassName: "code-query-highlight" } };
         })
@@ -531,6 +546,18 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
 
   componentDidUpdate(prevProps: Props, prevState: State) {
     this.fetchInitialContent();
+
+    // If path or line number hasn't change, we don't need to do anything.
+    if (prevProps.tab == this.props.tab && prevProps.path == this.props.path) {
+      return;
+    }
+
+    const path = this.currentPath();
+    this.getModel(path).then((model) => {
+      this.setModel(path, model);
+      return true;
+    });
+    this.focusLineNumberAndHighlightQuery();
   }
 
   parsePath() {
@@ -579,10 +606,14 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
       return;
     }
 
-    let repoResponse = await rpcService.service.getGithubRepo(
-      new github.GetGithubRepoRequest({ owner: this.currentOwner(), repo: this.currentRepo() })
-    );
+    let repoResponse = await rpcService.service
+      .getGithubRepo(new github.GetGithubRepoRequest({ owner: this.currentOwner(), repo: this.currentRepo() }))
+      .catch((e) => error_service.handleError(e));
     console.log(repoResponse);
+
+    if (!repoResponse) {
+      return;
+    }
 
     let repo = this.getRepo();
     repo.branch = repo.branch || repoResponse.defaultBranch;
@@ -603,7 +634,8 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
           repoResponse: repoResponse,
           directoryResponse: response,
         });
-      });
+      })
+      .catch((e) => error_service.handleError(e));
   }
 
   isNewFile(node: workspace.Node) {
@@ -687,12 +719,11 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
           let records = parseLcov(result);
           for (let record of records) {
             if (record.sourceFile == this.currentPath()) {
-              this.editor?.deltaDecorations(
-                [],
+              this.lcovDecorations?.set(
                 record.data.map((r) => {
                   const parts = r.split(",");
                   const lineNum = parseInt(parts[0]);
-                  const hit = parts[1] == "1";
+                  const hit = parseInt(parts[1]) > 0;
                   return {
                     range: new monaco.Range(lineNum, 0, lineNum, 0),
                     options: {
@@ -834,6 +865,15 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
       model = monaco.editor.createModel(fileContents, getLangHintFromFilePath(fullPath), monaco.Uri.file(fullPath));
       this.state.fullPathToModelMap.set(fullPath, model);
       this.state.fullPathToNodeMap.set(fullPath, node);
+
+      fetchDecorations(this.currentOwner(), this.currentRepo(), fullPath).then((newDecs) => {
+        if (!newDecs) {
+          return;
+        }
+        let oldDecs = this.state.fullPathToDecorationsMap.get(fullPath) || [];
+        let newDecIds = model!.deltaDecorations(oldDecs, newDecs);
+        this.state.fullPathToDecorationsMap.set(fullPath, newDecIds);
+      });
       this.updateState({ fullPathToModelMap: this.state.fullPathToModelMap });
     }
     return model;
@@ -848,9 +888,11 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
   }
 
   setModel(fullPath: string, model: monaco.editor.ITextModel | undefined) {
-    this.state.tabs.set(fullPath, fullPath);
+    if (!this.state.tabs.has(fullPath)) {
+      this.state.tabs.set(fullPath, fullPath);
+      this.updateState({ tabs: this.state.tabs }, () => this.focusLineNumberAndHighlightQuery());
+    }
     this.editor?.setModel(model || null);
-    this.updateState({ tabs: this.state.tabs }, () => this.focusLineNumberAndHighlightQuery());
   }
 
   navigateToPath(path: string) {
@@ -859,6 +901,10 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
       "",
       `/code/${this.currentOwner()}/${this.currentRepo()}/${path}${window.location.hash}`
     );
+  }
+
+  navigateToPathWithLine(path: string, line: number) {
+    window.history.pushState(undefined, "", `/code/${this.currentOwner()}/${this.currentRepo()}/${path}#L${line}`);
   }
 
   async handleBuildClicked(args: string) {
@@ -1091,11 +1137,17 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
   }
 
   handleGitHubClicked() {
-    const params = new URLSearchParams({
-      redirect_url: window.location.href,
-      ...(this.props.user.displayUser.userId && { user_id: this.props.user.displayUser.userId.id }),
-    });
-    window.location.href = `/auth/github/app/link/?${params}`;
+    rpcService.service
+      .getGitHubAppInstallPath(new github.GetGithubAppInstallPathRequest())
+      .then((response) => {
+        const userID = this.props.user.displayUser.userId?.id || "";
+        const path = `${response.installPath}?${new URLSearchParams({
+          user_id: userID,
+          redirect_url: window.location.href,
+        })}`;
+        window.location.href = path;
+      })
+      .catch((e) => error_service.handleError(e));
   }
 
   handleUpdatePR() {
@@ -1477,7 +1529,10 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
         <div className="code-menu">
           <div className="code-menu-logo">
             {this.isSingleFile() && (
-              <a href="javascript:history.back()">
+              <a
+                onClick={() => {
+                  window.history.back();
+                }}>
                 <ArrowLeft className="code-menu-back" />
               </a>
             )}
@@ -1497,44 +1552,62 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
               </svg>
             </a>
           </div>
-          <SearchBar<search.Result>
-            placeholder="Search..."
-            title="Results"
-            fetchResults={async (query) => {
-              return (
-                await rpcService.service.search(new search.SearchRequest({ query: new search.Query({ term: query }) }))
-              ).results;
-            }}
-            onResultPicked={(result: any, query: string) => {
-              this.fetchIfNeededAndNavigate(result.filename, `?pq=${query}&commit=${result.sha}`);
-            }}
-            emptyState={
-              <div className="code-editor-search-bar-empty-state">
-                <div className="code-editor-search-bar-empty-state-description">Search for files and code.</div>
-                <div className="code-editor-search-bar-empty-state-examples">Examples</div>
-                <ul>
-                  <li>
-                    <code>case:yes Hello World</code>
-                  </li>
-                  <li>
-                    <code>lang:css padding-(left|right)</code>
-                  </li>
-                  <li>
-                    <code>lang:go flag.String</code>
-                  </li>
-                  <li>
-                    <code>filepath:package.json</code>
-                  </li>
-                </ul>
+          {!this.isSingleFile() && (
+            <SearchBar<search.Result>
+              placeholder="Search..."
+              title="Results"
+              fetchResults={async (query) => {
+                return (
+                  await rpcService.service.search(
+                    new search.SearchRequest({ query: new search.Query({ term: query }) })
+                  )
+                ).results;
+              }}
+              onResultPicked={(result: any, query: string) => {
+                this.fetchIfNeededAndNavigate(result.filename, `?pq=${query}&commit=${result.sha}`);
+              }}
+              emptyState={
+                <div className="code-editor-search-bar-empty-state">
+                  <div className="code-editor-search-bar-empty-state-description">Search for files and code.</div>
+                  <div className="code-editor-search-bar-empty-state-examples">Examples</div>
+                  <ul>
+                    <li>
+                      <code>case:yes Hello World</code>
+                    </li>
+                    <li>
+                      <code>lang:css padding-(left|right)</code>
+                    </li>
+                    <li>
+                      <code>lang:go flag.String</code>
+                    </li>
+                    <li>
+                      <code>filepath:package.json</code>
+                    </li>
+                  </ul>
+                </div>
+              }
+              renderResult={(r) => (
+                <div className="code-editor-search-bar-result">
+                  <div>{r.filename}</div>
+                  <pre>{r.snippets.map((s) => s.lines).pop()}</pre>
+                </div>
+              )}
+            />
+          )}
+          {this.isSingleFile() && (
+            <>
+              <div className="code-editor-filename">
+                {this.props.search.get("filename") || this.currentPath()}
+                {this.props.search.get("compare_filename") &&
+                  this.props.search.get("compare_filename") != this.props.search.get("filename") && (
+                    <>
+                      <ChevronRight />
+                      {this.props.search.get("compare_filename")}
+                    </>
+                  )}
               </div>
-            }
-            renderResult={(r) => (
-              <div className="code-editor-search-bar-result">
-                <div>{r.filename}</div>
-                <pre>{r.snippets.map((s) => s.lines).pop()}</pre>
-              </div>
-            )}
-          />
+            </>
+          )}
 
           <OrgPicker user={this.props.user} floating={true} inline={true} />
           {this.isSingleFile() && (
@@ -1544,29 +1617,43 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                 onClick={() => {
                   const bsUrl = this.props.search.get("bytestream_url");
                   const invocationId = this.props.search.get("invocation_id");
+                  const filename = this.props.search.get("filename") || "";
                   if (!bsUrl || !invocationId) {
                     return;
                   }
                   const zip = this.props.search.get("z");
                   if (zip) {
-                    rpcService.downloadBytestreamZipFile(
-                      this.props.search.get("filename") || "",
-                      bsUrl,
-                      zip,
-                      invocationId
-                    );
+                    rpcService.downloadBytestreamZipFile(filename, bsUrl, zip, invocationId);
                   } else {
-                    rpcService.downloadBytestreamFile(this.props.search.get("filename") || "", bsUrl, invocationId);
+                    rpcService.downloadBytestreamFile(filename, bsUrl, invocationId);
                   }
                 }}>
-                <Download /> Download File
+                <Download /> Download File {this.props.search.get("compare_filename") ? "A" : ""}
               </OutlinedButton>
+              {this.props.search.get("compare_bytestream_url") && (
+                <OutlinedButton
+                  className="code-menu-download-button"
+                  onClick={() => {
+                    const filename = this.props.search.get("filename") || "";
+                    const invocationId = this.props.search.get("invocation_id") || "";
+                    const compareUrl = this.props.search.get("compare_bytestream_url") || "";
+                    const compareInvocationID = this.props.search.get("compare_invocation_id") || "";
+                    const compareFilename = this.props.search.get("compare_filename") || "";
+                    rpcService.downloadBytestreamFile(
+                      filename == compareFilename ? filename + ".modified" : compareFilename,
+                      compareUrl,
+                      compareInvocationID || invocationId
+                    );
+                  }}>
+                  <Download /> Download File B
+                </OutlinedButton>
+              )}
             </div>
           )}
           {Boolean(this.getQuery()) && (
             <div className="code-menu-actions">
               <OutlinedButton className="request-review-button" onClick={this.handleEditClicked.bind(this)}>
-                <Pencil className="icon green" /> Edit
+                <Pencil className="green" /> Edit
               </OutlinedButton>
             </div>
           )}
@@ -1583,7 +1670,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon blue" /> Request Review
+                      <Send className="blue" /> Request Review
                     </>
                   )}
                 </OutlinedButton>
@@ -1599,7 +1686,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon blue" /> Update PR
+                      <Send className="blue" /> Update PR
                     </>
                   )}
                 </OutlinedButton>
@@ -1692,6 +1779,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                 ref={this.diffViewer}
               />
             </div>
+            {this.editor && <KythePanel editor={this.editor} navigate={this.fetchIfNeededAndNavigate.bind(this)} />}
             {this.state.changes.size > 0 && !this.getQuery() && (
               <div className="code-diff-viewer">
                 <div className="code-diff-viewer-title">
@@ -1822,7 +1910,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                       window.open(applicableInstallation?.url + `/permissions/update`, "_blank") &&
                       this.updateState({ installationsResponse: undefined })
                     }>
-                    <Key className="icon white" /> Permissions
+                    <Key className="white" /> Permissions
                   </FilledButton>
                 )}
                 <FilledButton
@@ -1835,7 +1923,7 @@ export default class CodeComponentV2 extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon white" /> Send
+                      <Send className="white" /> Send
                     </>
                   )}
                 </FilledButton>
@@ -1871,7 +1959,7 @@ function getOrCreateModel(url: string, value: string) {
 }
 
 async function sha1(content: Uint8Array) {
-  const hash = await crypto.subtle.digest("SHA-1", content);
+  const hash = await crypto.subtle.digest("SHA-1", content as Uint8Array<ArrayBuffer>);
   return Array.from(new Uint8Array(hash))
     .map((v) => v.toString(16).padStart(2, "0"))
     .join("");

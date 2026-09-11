@@ -1,9 +1,9 @@
-import React, { useState } from "react";
-import styles from "./hero.module.css";
-import common from "../../css/common.module.css";
 import Image from "@theme/IdealImage";
+import { CalendarDays, Copy } from "lucide-react";
+import React, { useState } from "react";
+import common from "../../css/common.module.css";
 import { copyToClipboard } from "../../util/clipboard";
-import { Copy } from "lucide-react";
+import styles from "./hero.module.css";
 
 function Component(props) {
   let [copied, setCopied] = useState(0);
@@ -26,8 +26,8 @@ function Component(props) {
           <div className={common.subtitle}>
             {props.subtitle || (
               <>
-                BuildBuddy provides enterprise features for Bazel — the open source build system that allows you to
-                build and test software 10x faster.
+                BuildBuddy is the developer productivity platform built for Bazel — the open source build system that
+                allows you to build and test software 10x faster.
               </>
             )}
           </div>
@@ -47,15 +47,19 @@ function Component(props) {
             {props.primaryButtonText !== "" && (
               <a
                 href={props.primaryButtonHref || "https://app.buildbuddy.io"}
-                className={`${common.button} ${common.buttonPrimary}`}>
+                className={`${common.button} ${common.buttonPrimary} ${styles.heroButton}`}>
                 {props.primaryButtonText || <>Get Started for Free</>}
               </a>
             )}
             {props.secondaryButtonText !== "" && (
               <a
                 href={props.secondaryButtonHref || "/request-demo"}
-                className={`${common.button} ${props.gradientButton ? common.buttonGradient : ""}`}>
-                {props.secondaryButtonText || <>Request a Demo</>}
+                className={`${common.button} ${props.gradientButton ? common.buttonGradient : ""} ${styles.heroButton}`}>
+                {props.secondaryButtonText || (
+                  <>
+                    <CalendarDays aria-hidden="true" /> Request a Demo
+                  </>
+                )}
               </a>
             )}
           </div>

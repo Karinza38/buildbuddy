@@ -7,25 +7,37 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/action_cache_server_proxy"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/byte_stream_server_proxy"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/clientidentity"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/oci/ociregistry"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/firecracker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/copy_on_write"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/snaploader"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/snaputil"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/vbd"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testcontainer"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testregistry"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/cpuset"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/ext4"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/disk_cache"
@@ -35,18 +47,24 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/content_addressable_storage_server"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
+	"github.com/buildbuddy-io/buildbuddy/server/rpc/interceptors"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testnetworking"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testport"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
+	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/google/go-cmp/cmp"
+	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,12 +81,14 @@ const (
 	// Alternate image to use if getting rate-limited by docker hub
 	// busyboxImage = "gcr.io/google-containers/busybox:latest"
 
-	ubuntuImage              = "mirror.gcr.io/library/ubuntu:20.04"
-	imageWithDockerInstalled = "gcr.io/flame-public/executor-docker-default:enterprise-v1.6.0"
+	ubuntuImage                 = "mirror.gcr.io/library/ubuntu:20.04"
+	imageWithDockerInstalled    = "gcr.io/flame-public/executor-docker-default:enterprise-v1.6.0"
+	imageWithDockerV28Installed = platform.Ubuntu24_04Image
+	dockerDindImage             = "gcr.io/flame-public/test-docker-dind@sha256:68f6d9ab84623d1116c5432a3b924a07ee09960e6129ca1cb03ef14010588cb4"
 
-	// Minimum memory needed for a firecracker VM. This may need to be increased
-	// if the size of initrd.cpio increases.
-	minMemSizeMB = 200
+	// Minimum memory needed for a firecracker VM.
+	// The tasksize constant may need to be increased if the size of initrd.cpio increases.
+	minMemSizeMB = tasksize.FirecrackerAdditionalMemEstimateBytes / 1e6
 
 	diskCacheSize = 10_000_000_000  // 10GB
 	fileCacheSize = 100_000_000_000 // 100GB
@@ -138,8 +158,8 @@ func TestGuestAPIVersion(t *testing.T) {
 	// Note that if you go with option 1, ALL VM snapshots will be invalidated
 	// which will negatively affect customer experience. Be careful!
 	const (
-		expectedHash    = "d9644bd5f756f270b44cba7fef86476de294590c6ffaca232cd32e9bef80a477"
-		expectedVersion = "13"
+		expectedHash    = "9e5bc31e4def169b7182943baf8cbda84da1d7ef5cd5c407cd0d2bda901943e4"
+		expectedVersion = "20"
 	)
 	assert.Equal(t, expectedHash, firecracker.GuestAPIHash)
 	assert.Equal(t, expectedVersion, firecracker.GuestAPIVersion)
@@ -148,46 +168,23 @@ func TestGuestAPIVersion(t *testing.T) {
 	}
 }
 
-// cleanExecutorRoot cleans all entries in the test root dir *except* for cached
-// ext4 images. Converting docker images to ext4 images takes a long time and
-// it would slow down testing to build these images from scratch every time.
-// So we instead keep the same directory around and clean it between tests.
-//
-// See README.md for more details on the filesystem layout.
-func cleanExecutorRoot(t *testing.T, path string) {
-	if os.Getuid() == 0 {
-		// Clean up VBD mounts that might've been left around from previous
-		// tests that were interrupted. Otherwise we won't be able to clean up
-		// old firecracker workspaces.
-		err := vbd.CleanStaleMounts()
-		require.NoError(t, err)
-	}
-
-	err := os.MkdirAll(path, 0755)
-	require.NoError(t, err)
-	entries, err := os.ReadDir(path)
-	require.NoError(t, err)
-	for _, entry := range entries {
-		// The "/executor" subdir contains the cached images.
-		// Delete all other content.
-		if entry.Name() == "executor" {
-			continue
-		}
-		err := os.RemoveAll(filepath.Join(path, entry.Name()))
-		require.NoError(t, err)
-	}
-}
-
 type envOpts struct {
 	cacheRootDir     string
 	cacheSize        int64
 	filecacheRootDir string
+	runProxy         bool
 }
 
-func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEnv {
-	testnetworking.Setup(t)
-	err := networking.EnableMasquerading(ctx)
+func getTestEnv(ctx context.Context, t testing.TB, opts envOpts) *testenv.TestEnv {
+	// Clean up stale veth devices from previous test runs that were killed
+	// without cleanup (e.g. SIGKILL from the test runner).
+	flags.Set(t, "executor.cleanup_stale_veth_devices", true)
+	err := networking.Configure(ctx)
 	require.NoError(t, err)
+	testnetworking.Setup(t)
+	err = networking.EnableMasquerading(ctx)
+	require.NoError(t, err)
+
 	// Set up a lockfile directory to coordinate network locking across sharded
 	// test processes on the host.
 	flags.Set(t, "executor.network_lock_directory", "/tmp/buildbuddy/networking/locks")
@@ -216,6 +213,7 @@ func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEn
 		t.Error(err)
 	}
 	env.SetCache(dc)
+
 	casServer, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
 	if err != nil {
 		t.Error(err)
@@ -234,14 +232,48 @@ func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEn
 	bspb.RegisterByteStreamServer(grpcServer, byteStreamServer)
 	go runFunc()
 
-	conn, err := testenv.LocalGRPCConn(ctx, lis)
+	conn, err := testenv.LocalGRPCConn(
+		env.GetServerContext(),
+		lis,
+		interceptors.GetUnaryClientIdentityInterceptor(env),
+		interceptors.GetStreamClientIdentityInterceptor(env),
+	)
 	if err != nil {
 		t.Error(err)
 	}
+	t.Cleanup(func() { conn.Close() })
 
-	env.SetByteStreamClient(bspb.NewByteStreamClient(conn))
-	env.SetActionCacheClient(repb.NewActionCacheClient(conn))
+	bsClient := bspb.NewByteStreamClient(conn)
+	env.SetByteStreamClient(bsClient)
+	acClient := repb.NewActionCacheClient(conn)
+	env.SetActionCacheClient(acClient)
 	env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+
+	if opts.runProxy {
+		// Initialize proxies in their own env.
+		proxyEnv := testenv.GetTestEnv(t)
+		proxyEnv.SetActionCacheClient(acClient)
+		proxyEnv.SetByteStreamClient(bsClient)
+		runProxyServers(ctx, proxyEnv, t)
+
+		acProxy, err := action_cache_server_proxy.NewActionCacheServerProxy(proxyEnv)
+		require.NoError(t, err)
+		bsProxy, err := byte_stream_server_proxy.New(proxyEnv)
+		require.NoError(t, err)
+
+		proxyGrpcServer, proxyRunFunc, proxyLis := testenv.RegisterLocalGRPCServer(t, proxyEnv)
+		repb.RegisterActionCacheServer(proxyGrpcServer, acProxy)
+		bspb.RegisterByteStreamServer(proxyGrpcServer, bsProxy)
+		go proxyRunFunc()
+
+		proxyConn, err := testenv.LocalGRPCConn(ctx, proxyLis)
+		require.NoError(t, err)
+		t.Cleanup(func() { proxyConn.Close() })
+
+		// Point cache clients on primary env towards proxies.
+		env.SetActionCacheClient(repb.NewActionCacheClient(proxyConn))
+		env.SetByteStreamClient(bspb.NewByteStreamClient(proxyConn))
+	}
 
 	fcDir := opts.filecacheRootDir
 	if *filecacheDir != "" {
@@ -254,13 +286,33 @@ func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEn
 	fc.WaitForDirectoryScanToComplete()
 	env.SetFileCache(fc)
 
+	leaser, err := cpuset.NewLeaser(cpuset.LeaserOpts{})
+	require.NoError(t, err)
+	env.SetCPULeaser(leaser)
+	flags.Set(t, "executor.cpu_leaser.enable", true)
+	t.Cleanup(func() {
+		orphanedLeases := leaser.TestOnlyGetOpenLeases()
+		require.Equal(t, 0, len(orphanedLeases))
+	})
+
 	return env
 }
 
-func executorRootDir(t *testing.T) string {
+func runProxyServers(ctx context.Context, proxyEnv *testenv.TestEnv, t testing.TB) {
+	server, err := byte_stream_server.NewByteStreamServer(proxyEnv)
+	require.NoError(t, err)
+	acServer, err := action_cache_server.NewActionCacheServer(proxyEnv)
+	require.NoError(t, err)
+	proxyEnv.SetLocalByteStreamServer(server)
+	proxyEnv.SetLocalActionCacheServer(acServer)
+}
+
+func executorRootDir(t testing.TB) string {
 	// When running this test on the bare executor pool, ensure the jailer root
 	// is under /buildbuddy so that it's on the same device as the executor data
 	// dir (with action workspaces and filecache).
+	// Using a fixed directory also means that separate runs can share the image
+	// cache instead of each having to pull their own images.
 	if testfs.Exists(t, "/buildbuddy", "") {
 		*testExecutorRoot = "/buildbuddy/test-executor-root"
 	}
@@ -274,7 +326,7 @@ func executorRootDir(t *testing.T) string {
 	return testfs.MakeTempSymlink(t, "/tmp", "buildbuddy-*-jailer", testfs.MakeTempDir(t))
 }
 
-func getExecutorConfig(t *testing.T) *firecracker.ExecutorConfig {
+func getExecutorConfig(t testing.TB) *firecracker.ExecutorConfig {
 	root := executorRootDir(t)
 	buildRoot := filepath.Join(root, "build")
 	cacheRoot := filepath.Join(root, "cache")
@@ -315,7 +367,7 @@ func TestFirecrackerRunSimple(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -332,6 +384,55 @@ func TestFirecrackerRunSimple(t *testing.T) {
 	}
 
 	assertCommandResult(t, expectedResult, res)
+}
+
+func TestFirecrackerRunVFS(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	authenticator := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1"))
+	env.SetAuthenticator(authenticator)
+	ctx, err := authenticator.WithAuthenticatedUser(ctx, "US1")
+	require.NoError(t, err)
+	ctx, err = prefix.AttachUserPrefixToContext(ctx, authenticator)
+	require.NoError(t, err)
+	workDir := testfs.MakeTempDir(t)
+
+	inputResource, inputContents := testdigest.RandomCASResourceBuf(t, 32)
+	require.NoError(t, env.GetCache().Set(ctx, inputResource, inputContents))
+	cmd := &repb.Command{
+		Arguments:   []string{"sh", "-c", "cat input.txt; printf result > out/result.txt; printf ignored > ignored.txt"},
+		OutputFiles: []string{"out/result.txt"},
+	}
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         2500,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
+			EnableVfs:         true,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{Command: cmd}, opts)
+	require.NoError(t, err)
+	c.SetTaskFileSystemLayout(&container.FileSystemLayout{
+		DigestFunction: repb.DigestFunction_SHA256,
+		Inputs: &repb.Tree{Root: &repb.Directory{Files: []*repb.FileNode{
+			{Name: "input.txt", Digest: inputResource.GetDigest()},
+		}}},
+		OutputFiles: cmd.GetOutputFiles(),
+	})
+
+	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
+	require.Equal(t, inputContents, res.Stdout)
+	require.True(t, res.DoNotRecycle)
+	require.Equal(t, "result", testfs.ReadFileAsString(t, workDir, "out/result.txt"))
+	_, err = os.Stat(filepath.Join(workDir, "ignored.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestFirecrackerLifecycle(t *testing.T) {
@@ -362,7 +463,7 @@ func TestFirecrackerLifecycle(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -397,12 +498,258 @@ func TestFirecrackerLifecycle(t *testing.T) {
 	assertCommandResult(t, expectedResult, res)
 }
 
+func TestFirecrackerPullImageIfNecessary_CachedImageRequiresReauth(t *testing.T) {
+	ctx := context.Background()
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+	flags.Set(t, "executor.local_cache_store_ext4_images", true)
+
+	env := getTestEnv(ctx, t, envOpts{})
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	env.SetAuthenticator(ta)
+	env.SetImageCacheAuthenticator(container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{}))
+
+	registryCreds := &testregistry.BasicAuthCreds{
+		Username: "test",
+		Password: "test",
+	}
+	reg := testregistry.Run(t, testregistry.Opts{Creds: registryCreds})
+	t.Cleanup(func() {
+		require.NoError(t, reg.Shutdown())
+	})
+	imageRef, _ := reg.PushNamedImage(t, "firecracker-private-image:latest", registryCreds)
+
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         imageRef,
+		ActionWorkingDirectory: testfs.MakeTempDir(t),
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	newContainer := func(ctx context.Context) *firecracker.FirecrackerContainer {
+		containerOpts := opts
+		containerOpts.ActionWorkingDirectory = testfs.MakeTempDir(t)
+		c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, containerOpts)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, c.Remove(context.Background()))
+		})
+		return c
+	}
+	requireCached := func(ctx context.Context, c *firecracker.FirecrackerContainer) {
+		cached, err := c.IsImageCached(ctx)
+		require.NoError(t, err)
+		require.True(t, cached, "sanity check: image should already be cached")
+	}
+
+	authedCtx, err := ta.WithAuthenticatedUser(ctx, "US1")
+	require.NoError(t, err)
+
+	// Do an authorized pull as GR1.
+	gr1Container := newContainer(authedCtx)
+	require.NoError(t, container.PullImageIfNecessary(
+		authedCtx, env, gr1Container,
+		oci.Credentials{Username: registryCreds.Username, Password: registryCreds.Password},
+		opts.ContainerImage, opts.UseOCIFetcher,
+	))
+	requireCached(ctx, gr1Container)
+
+	// Try an unauthorized pull as GR1 (with wrong creds). Should fail
+	gr1WrongCredsContainer := newContainer(authedCtx)
+	requireCached(ctx, gr1WrongCredsContainer)
+	err = gr1WrongCredsContainer.PullImage(
+		authedCtx,
+		oci.Credentials{Username: registryCreds.Username, Password: "wrong"},
+	)
+	require.Error(t, err)
+	require.True(
+		t,
+		status.IsPermissionDeniedError(err) || status.IsUnauthenticatedError(err),
+		"expected auth error for cached image access with wrong creds, got %s",
+		err,
+	)
+
+	// Try to do an unauthorized pull as ANON (should fail)
+	anonymousContainer := newContainer(ctx)
+	requireCached(ctx, anonymousContainer)
+	err = container.PullImageIfNecessary(ctx, env, anonymousContainer, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+	require.Error(t, err)
+	require.True(
+		t,
+		status.IsPermissionDeniedError(err) || status.IsUnauthenticatedError(err),
+		"expected auth error for cached image access without re-auth, got %s",
+		err,
+	)
+
+	// Try to do an unauthorized pull as GR2 (should fail)
+	gr2Ctx, err := ta.WithAuthenticatedUser(ctx, "US2")
+	require.NoError(t, err)
+	gr2Container := newContainer(gr2Ctx)
+	requireCached(ctx, gr2Container)
+	err = container.PullImageIfNecessary(gr2Ctx, env, gr2Container, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+	require.Error(t, err)
+	require.True(
+		t,
+		status.IsPermissionDeniedError(err) || status.IsUnauthenticatedError(err),
+		"expected auth error for cached image access from another group without re-auth, got %s",
+		err,
+	)
+}
+
+func TestFirecrackerPullImage_SkipsPullWhenContainerfsCached(t *testing.T) {
+	ctx := context.Background()
+	flags.Set(t, "executor.container_registry_allowed_private_ips", []string{"127.0.0.1/32"})
+
+	// Mock requests to the container registry.
+	var manifestRequests, blobRequests atomic.Int32
+	reg := testregistry.Run(t, testregistry.Opts{
+		HttpInterceptor: func(w http.ResponseWriter, r *http.Request) bool {
+			if strings.Contains(r.URL.Path, "/blobs/") {
+				blobRequests.Add(1)
+			} else if strings.Contains(r.URL.Path, "/manifests/") {
+				manifestRequests.Add(1)
+			}
+			return true
+		},
+	})
+	t.Cleanup(func() {
+		require.NoError(t, reg.Shutdown())
+	})
+
+	// The test registry listens on a random port, so this image ref is unique
+	// to this test run and is guaranteed not to be present in the executor
+	// image cache, which may be shared across runs.
+	imageRef, _ := reg.PushNamedImage(t, "firecracker-skip-redundant-pull:latest", nil)
+
+	// Reset the registry counters so they only reflect requests made by following code.
+	manifestRequests.Store(0)
+	blobRequests.Store(0)
+
+	env := getTestEnv(ctx, t, envOpts{})
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         imageRef,
+		ActionWorkingDirectory: testfs.MakeTempDir(t),
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	instanceName := snaputil.SnapshotPartitionPrefix + "/instance"
+	newContainer := func() *firecracker.FirecrackerContainer {
+		containerOpts := opts
+		containerOpts.ActionWorkingDirectory = testfs.MakeTempDir(t)
+		c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+			ExecuteRequest: &repb.ExecuteRequest{InstanceName: instanceName},
+		}, containerOpts)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, c.Remove(context.Background()))
+		})
+		return c
+	}
+
+	// Sanity check: the image should not be cached yet.
+	coldContainer := newContainer()
+	cached, err := coldContainer.IsImageCached(ctx)
+	require.NoError(t, err)
+	require.False(t, cached)
+	require.Equal(t, int32(0), blobRequests.Load())
+
+	// Cache a chunked containerfs for the image, as a previous VM run would've.
+	loader, err := snaploader.New(env)
+	require.NoError(t, err)
+	const chunkSize = 512 * 1024
+	workDir := testfs.MakeTempDir(t)
+	// The chunk contents are arbitrary: no VM is booted here, so only the presence
+	// of the cache entry matters.
+	testfs.WriteRandomString(t, workDir, "containerfs.ext4", 4*chunkSize)
+	ext4Path := filepath.Join(workDir, "containerfs.ext4")
+	cow, err := snaploader.UnpackContainerImage(
+		ctx, loader, instanceName, imageRef, ext4Path,
+		testfs.MakeDirAll(t, workDir, "chunks"), chunkSize,
+		snaploader.RemoteContainerImageAccessOptions{RemoteReadsEnabled: true, RemoteWritesEnabled: true})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cow.Close()
+	})
+
+	// A container for a subsequent task should now see the cached containerfs.
+	c := newContainer()
+	cached, err = c.IsImageCached(ctx)
+	require.NoError(t, err)
+	require.True(t, cached)
+
+	// Call PullImage, as a clean VM run would.
+	require.NoError(t, c.PullImage(ctx, oci.Credentials{}))
+
+	// Because the chunked containerfs is already cached, PullImage should not download the image layers
+	// from the registry.
+	require.Equal(t, int32(0), blobRequests.Load())
+	// The manifest should still have been fetched, in order to authenticate with the registry.
+	require.Greater(t, manifestRequests.Load(), int32(0))
+}
+
+func TestFirecrackerVMExecReadySignalAfterSnapshotResume(t *testing.T) {
+	flags.Set(t, "executor.firecracker_vmexec_ready_signal", true)
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	workDir := testfs.MakeDirAll(t, testfs.MakeTempDir(t), "work")
+	cfg := getExecutorConfig(t)
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			Arguments: []string{"true"},
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+				{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.AlwaysSaveSnapshot},
+			}},
+		},
+	}
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:            1,
+			MemSizeMb:          minMemSizeMB,
+			NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb:  100,
+			GuestKernelVersion: cfg.GuestKernelVersion,
+			FirecrackerVersion: cfg.FirecrackerVersion,
+			GuestApiVersion:    cfg.GuestAPIVersion,
+		},
+		ExecutorConfig: cfg,
+	}
+	c, err := firecracker.NewContainer(ctx, env, task, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
+	require.NoError(t, container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+	require.NoError(t, c.Create(ctx, workDir))
+
+	res := c.Exec(ctx, task.Command, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	require.NoError(t, c.Pause(ctx))
+	require.NoError(t, c.Unpause(ctx))
+
+	res = c.Exec(ctx, task.Command, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	require.True(t, res.VMMetrics.GetVmExecReadySignalReceived())
+	require.EqualValues(t, 1, res.VMMetrics.GetVmExecDialAttempts())
+}
+
 func TestFirecrackerSnapshotAndResume(t *testing.T) {
 	// Test for both small and large memory sizes
 	for _, memorySize := range []int64{minMemSizeMB, 4000} {
 		ctx := context.Background()
 		env := getTestEnv(ctx, t, envOpts{})
-		env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+		env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 		rootDir := testfs.MakeTempDir(t)
 		workDir := testfs.MakeDirAll(t, rootDir, "work")
 
@@ -413,9 +760,9 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 			VMConfiguration: &fcpb.VMConfiguration{
 				NumCpus:            1,
 				MemSizeMb:          memorySize,
-				EnableNetworking:   false,
+				NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_OFF,
 				ScratchDiskSizeMb:  100,
-				KernelVersion:      cfg.KernelVersion,
+				GuestKernelVersion: cfg.GuestKernelVersion,
 				FirecrackerVersion: cfg.FirecrackerVersion,
 				GuestApiVersion:    cfg.GuestAPIVersion,
 			},
@@ -426,6 +773,7 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 				// Note: platform must match in order to share snapshots
 				Platform: &repb.Platform{Properties: []*repb.Platform_Property{
 					{Name: "recycle-runner", Value: "true"},
+					{Name: platform.MinTimeBetweenSnapshotWritesPropertyName, Value: "0s"},
 				}},
 				Arguments: []string{"./buildbuddy_ci_runner"},
 			},
@@ -436,7 +784,7 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher); err != nil {
 			t.Fatalf("unable to pull image: %s", err)
 		}
 
@@ -475,9 +823,16 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 
 		res := c.Exec(ctx, cmd, nil /*=stdio*/)
 		require.NoError(t, res.Error)
-
+		assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 		require.Equal(t, "/workspace/count: 0\n/root/count: 0\n", string(res.Stdout))
 		require.NotContains(t, string(res.AuxiliaryLogs["vm_log_tail.txt"]), "is not a multiple of sector size")
+		// The first task on the VM paid the boot cost, so it should report the
+		// vmexec init duration. The dockerd/DNS waits should be zero since
+		// neither is enabled for this VM.
+		assert.Greater(t, res.VMMetrics.GetVmExecInitDurationUsec(), int64(0))
+		assert.Zero(t, res.VMMetrics.GetDockerdWaitDurationUsec())
+		assert.Zero(t, res.VMMetrics.GetVmDnsWaitDurationUsec())
+		assert.Greater(t, res.VMMetrics.GetVmExecDialDurationUsec(), int64(0))
 
 		// Try pause, unpause, exec several times.
 		var cpuMillisObservations []float64
@@ -496,7 +851,13 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 
 			res := c.Exec(ctx, cmd, nil /*=stdio*/)
 			require.NoError(t, res.Error)
-
+			assert.Equal(t, int64(i), res.VMMetadata.GetSavedSnapshotVersionNumber())
+			// Tasks on a VM resumed from a snapshot did not pay the boot cost,
+			// so boot timings should be cleared.
+			assert.Zero(t, res.VMMetrics.GetVmExecInitDurationUsec())
+			// The vmexec connection is re-established for each task, so the
+			// dial duration should be reported even on resumed VMs.
+			assert.Greater(t, res.VMMetrics.GetVmExecDialDurationUsec(), int64(0))
 			assert.Equal(t, fmt.Sprintf("/workspace/count: %d\n/root/count: %d\n", countBefore+1, i), string(res.Stdout))
 			require.NotContains(t, string(res.AuxiliaryLogs["vm_log_tail.txt"]), "is not a multiple of sector size")
 			cpuMillisObservations = append(cpuMillisObservations, float64(res.UsageStats.GetCpuNanos())/1e6)
@@ -513,13 +874,9 @@ func TestFirecrackerSnapshotAndResume(t *testing.T) {
 }
 
 func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
-	if !*snaputil.EnableLocalSnapshotSharing {
-		t.Skip("Snapshot sharing is not enabled")
-	}
-
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	rootDir := testfs.MakeTempDir(t)
 	cfg := getExecutorConfig(t)
 
@@ -538,7 +895,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: cfg,
@@ -548,13 +905,16 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 			// Note: platform must match in order to share snapshots
 			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
 				{Name: "recycle-runner", Value: "true"},
+				// Save a snapshot for every run.
+				{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.AlwaysSaveSnapshot},
 			}},
+			Arguments: []string{"./buildbuddy_ci_runner"},
 		},
 	}
 	baseVM, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
 	containersToCleanup = append(containersToCleanup, baseVM)
-	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = baseVM.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -564,6 +924,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 	cmd := appendToLog("Base")
 	res := baseVM.Exec(ctx, cmd, nil /*=stdio*/)
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "Base\n", string(res.Stdout))
 	err = baseVM.Pause(ctx)
 	require.NoError(t, err)
@@ -571,7 +932,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 	containers := make([]*firecracker.FirecrackerContainer, 0, 4)
 	// Load the same base snapshot from multiple VMs - there should be no
 	// corruption or data transfer from snapshot sharing
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		workDir = testfs.MakeDirAll(t, rootDir, fmt.Sprintf("work-%d", i))
 		opts = firecracker.ContainerOpts{
 			ContainerImage:         busyboxImage,
@@ -579,7 +940,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 			VMConfiguration: &fcpb.VMConfiguration{
 				NumCpus:           1,
 				MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-				EnableNetworking:  false,
+				NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 				ScratchDiskSizeMb: 100,
 			},
 			ExecutorConfig: cfg,
@@ -603,6 +964,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 		cmd = appendToLog(fmt.Sprintf("Fork-%d", i))
 		res = forkedVM.Exec(ctx, cmd, nil /*=stdio*/)
 		require.NoError(t, res.Error)
+		assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 		// The log should contain data written to the original snapshot
 		// and the current VM, but not from any of the other VMs sharing
 		// the same original snapshot
@@ -617,16 +979,13 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 	// Pause multiple VMs simultaneously to test no race conditions / corruption
 	// when writing sharable snapshots
 	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		i := i
-		go func() {
-			defer wg.Done()
+	for i := range 3 {
+		wg.Go(func() {
 			c := containers[i]
 			// Each new VM shouldn't have trouble saving snapshots themselves
 			err := c.Pause(ctx)
 			require.NoError(t, err)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -645,7 +1004,7 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: cfg,
@@ -660,28 +1019,19 @@ func TestFirecracker_LocalSnapshotSharing(t *testing.T) {
 	cmd = appendToLog("Last")
 	res = c.Exec(ctx, cmd, nil /*=stdio*/)
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(2), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "Base\nFork-3\nLast\n", string(res.Stdout))
 
 	err = c.Pause(ctx)
 	require.NoError(t, err)
 }
 
-func TestFirecracker_RemoteSnapshotSharing(t *testing.T) {
-	if !*snaputil.EnableRemoteSnapshotSharing {
-		t.Skip("Snapshot sharing is not enabled")
-	}
-
+func TestFirecracker_LocalSnapshotSharing_DontResave(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	rootDir := testfs.MakeTempDir(t)
 	cfg := getExecutorConfig(t)
-
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
-	filecacheRoot := testfs.MakeDirAll(t, cfg.JailerRoot, "filecache")
-	fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
-	require.NoError(t, err)
-	fc.WaitForDirectoryScanToComplete()
-	env.SetFileCache(fc)
 
 	var containersToCleanup []*firecracker.FirecrackerContainer
 	t.Cleanup(func() {
@@ -696,156 +1046,1032 @@ func TestFirecracker_RemoteSnapshotSharing(t *testing.T) {
 		ContainerImage:         busyboxImage,
 		ActionWorkingDirectory: workDir,
 		VMConfiguration: &fcpb.VMConfiguration{
-			NumCpus:            1,
-			MemSizeMb:          minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:   false,
-			ScratchDiskSizeMb:  100,
-			KernelVersion:      cfg.KernelVersion,
-			FirecrackerVersion: cfg.FirecrackerVersion,
-			GuestApiVersion:    cfg.GuestAPIVersion,
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: cfg,
 	}
-	instanceName := "test-instance-name"
 	task := &repb.ExecutionTask{
 		Command: &repb.Command{
-			// Note: platform must match in order to share snapshots
 			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
 				{Name: "recycle-runner", Value: "true"},
 			}},
-			Arguments: []string{"./buildbuddy_ci_runner"},
-		},
-		ExecuteRequest: &repb.ExecuteRequest{
-			InstanceName: instanceName,
+			// Not a .buildbuddy_ci_runner command, so we shouldn't save multiple snapshots
 		},
 	}
 	baseVM, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
 	containersToCleanup = append(containersToCleanup, baseVM)
-	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = baseVM.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
-	baseSnapshotId := baseVM.SnapshotID()
 
 	// Create a snapshot. Data written to this snapshot should persist
 	// when other VMs reuse the snapshot
 	cmd := appendToLog("Base")
 	res := baseVM.Exec(ctx, cmd, nil /*=stdio*/)
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "Base\n", string(res.Stdout))
-	require.NotEmpty(t, res.VMMetadata.GetSnapshotId())
 	err = baseVM.Pause(ctx)
 	require.NoError(t, err)
 
-	// Start a VM from the snapshot. Artifacts should be stored locally in the filecache
-	workDirForkLocalFetch := testfs.MakeDirAll(t, rootDir, "work-fork-local-fetch")
-	opts = firecracker.ContainerOpts{
+	// Load the same base snapshot from multiple VMs - there should be no
+	// corruption or data transfer from snapshot sharing
+	for i := range 4 {
+		workDir = testfs.MakeDirAll(t, rootDir, fmt.Sprintf("work-%d", i))
+		opts = firecracker.ContainerOpts{
+			ContainerImage:         busyboxImage,
+			ActionWorkingDirectory: workDir,
+			VMConfiguration: &fcpb.VMConfiguration{
+				NumCpus:           1,
+				MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+				NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+				ScratchDiskSizeMb: 100,
+			},
+			ExecutorConfig: cfg,
+		}
+		forkedVM, err := firecracker.NewContainer(ctx, env, task, opts)
+		require.NoError(t, err)
+		containersToCleanup = append(containersToCleanup, forkedVM)
+
+		// The new VM should reuse the Base VM's snapshot, whether we call
+		// Create() or Unpause()
+		if i%2 == 0 {
+			err = forkedVM.Unpause(ctx)
+			require.NoError(t, err)
+		} else {
+			err = forkedVM.Create(ctx, workDir)
+			require.NoError(t, err)
+		}
+
+		// Write VM-specific data to the log
+		cmd = appendToLog(fmt.Sprintf("Fork-%d", i))
+		res = forkedVM.Exec(ctx, cmd, nil /*=stdio*/)
+		require.NoError(t, res.Error)
+		assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
+		// The log should contain data written to the original snapshot
+		// and the current VM, but not from any of the other VMs sharing
+		// the same original snapshot
+		require.Equal(t, fmt.Sprintf("Base\nFork-%d\n", i), string(res.Stdout))
+		// This shouldn't save a snapshot
+		err = forkedVM.Pause(ctx)
+		require.NoError(t, err)
+	}
+}
+
+func TestFirecracker_LocalSnapshotSharing_DontResave_RemoteChunkFallback(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+	filecacheRoot := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+	env.SetFileCache(fc)
+
+	rootDir := testfs.MakeTempDir(t)
+	cfg := getExecutorConfig(t)
+
+	var containersToCleanup []*firecracker.FirecrackerContainer
+	t.Cleanup(func() {
+		for _, vm := range containersToCleanup {
+			err := vm.Remove(ctx)
+			assert.NoError(t, err)
+		}
+	})
+
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+				// Only a snapshot it none exists
+				{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.OnlySaveNonDefaultSnapshotIfNoneAvailable},
+			}},
+			// Use ci_runner so it supports remote snapshots
+			Arguments: []string{"./buildbuddy_ci_runner"},
+			EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+				{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+				{Name: "GIT_BRANCH", Value: "pr"},
+			},
+		},
+	}
+
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	opts := firecracker.ContainerOpts{
 		ContainerImage:         busyboxImage,
-		ActionWorkingDirectory: workDirForkLocalFetch,
+		ActionWorkingDirectory: workDir,
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
-			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:  false,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: cfg,
 	}
-	forkedVM, err := firecracker.NewContainer(ctx, env, task, opts)
+	baseVM, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
-	containersToCleanup = append(containersToCleanup, forkedVM)
-	err = forkedVM.Unpause(ctx)
+	containersToCleanup = append(containersToCleanup, baseVM)
+	err = container.PullImageIfNecessary(ctx, env, baseVM, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
-	cmd = appendToLog("Fork local fetch")
-	res = forkedVM.Exec(ctx, cmd, nil /*=stdio*/)
+	err = baseVM.Create(ctx, opts.ActionWorkingDirectory)
+	require.NoError(t, err)
+
+	// Create an initial snapshot. Data written to this snapshot should persist
+	// when other VMs reuse the snapshot
+	cmd := appendToLog("Base")
+	res := baseVM.Exec(ctx, cmd, nil /*=stdio*/)
 	require.NoError(t, res.Error)
-	// The log should contain data written to the original snapshot
-	// and the current VM
-	require.Equal(t, "Base\nFork local fetch\n", string(res.Stdout))
-	require.NotEmpty(t, res.VMMetadata.GetSnapshotId())
-	err = forkedVM.Pause(ctx)
+	require.Equal(t, "Base\n", string(res.Stdout))
+	assert.True(t, res.VMMetadata.GetSavedLocalSnapshot())
+	err = baseVM.Pause(ctx)
 	require.NoError(t, err)
 
-	// Clear the local filecache. Vms should still be able to unpause the snapshot
-	// by pulling artifacts from the remote cache
-	err = os.RemoveAll(filecacheRoot)
+	// Delete some chunks from the local filecache. The chunks should still
+	// exist in the remote cache, so the local manifest should still be valid.
+	loader, err := snaploader.New(env)
 	require.NoError(t, err)
-	filecacheRoot2 := testfs.MakeDirAll(t, cfg.JailerRoot, "filecache2")
-	fc2, err := filecache.NewFileCache(filecacheRoot2, fileCacheSize, false)
+	snapshotKeys := baseVM.SnapshotKeySet()
+	snap, err := loader.GetSnapshot(ctx, snapshotKeys, &snaploader.GetSnapshotOptions{
+		SupportsRemoteChunks:   true,
+		SupportsRemoteManifest: true,
+		ReadPolicy:             platform.AlwaysReadNewestSnapshot,
+	})
 	require.NoError(t, err)
-	fc2.WaitForDirectoryScanToComplete()
-	env.SetFileCache(fc2)
 
-	// Start a VM from the snapshot.
-	workDirForkRemoteFetch := testfs.MakeDirAll(t, rootDir, "work-fork-remote-fetch")
-	opts = firecracker.ContainerOpts{
-		ContainerImage:         busyboxImage,
-		ActionWorkingDirectory: workDirForkRemoteFetch,
-		VMConfiguration: &fcpb.VMConfiguration{
-			NumCpus:           1,
-			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:  false,
-			ScratchDiskSizeMb: 100,
+	deletedCount := 0
+	for _, cf := range snap.GetChunkedFiles() {
+		for i, c := range cf.GetChunks() {
+			// Delete every other chunk
+			if i%2 == 0 {
+				deleted := fc.DeleteFile(ctx, &repb.FileNode{Digest: c.GetDigest()})
+				if deleted {
+					deletedCount++
+				}
+			}
+		}
+	}
+	require.Greater(t, deletedCount, 0, "should have deleted at least one chunk")
+
+	// Create a new VM that loads from the snapshot. Even though some chunks
+	// are missing locally, they should be fetched from the remote cache.
+	workDir2 := testfs.MakeDirAll(t, rootDir, "fork")
+	opts.ActionWorkingDirectory = workDir2
+	forkVM, err := firecracker.NewContainer(ctx, env, task, opts)
+	require.NoError(t, err)
+	containersToCleanup = append(containersToCleanup, forkVM)
+
+	err = forkVM.Unpause(ctx)
+	require.NoError(t, err)
+
+	cmd = appendToLog("Fork")
+	res = forkVM.Exec(ctx, cmd, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	require.Equal(t, "Base\nFork\n", string(res.Stdout))
+
+	// The fork should not save a new local snapshot because the local manifest
+	// exists and all chunks are available (locally or remotely).
+	assert.False(t, res.VMMetadata.GetSavedLocalSnapshot())
+}
+
+func TestFirecracker_RemoteSnapshotSharing_SavePolicy(t *testing.T) {
+	tests := []struct {
+		name               string
+		branch             string
+		snapshotSavePolicy string
+	}{
+		{
+			name:               "Always save - on main",
+			branch:             "main",
+			snapshotSavePolicy: platform.AlwaysSaveSnapshot,
 		},
-		ExecutorConfig: cfg,
-	}
-	forkedVM2, err := firecracker.NewContainer(ctx, env, task, opts)
-	require.NoError(t, err)
-	containersToCleanup = append(containersToCleanup, forkedVM2)
-	err = forkedVM2.Unpause(ctx)
-	require.NoError(t, err)
-	cmd = appendToLog("Fork remote fetch")
-	res = forkedVM2.Exec(ctx, cmd, nil /*=stdio*/)
-	require.NoError(t, res.Error)
-	// The log should contain data written to the most recent snapshot
-	require.Equal(t, "Base\nFork local fetch\nFork remote fetch\n", string(res.Stdout))
-	require.NotEmpty(t, res.VMMetadata.GetSnapshotId())
-
-	// Should still be able to start from the original snapshot if we use
-	// a snapshot key containing the original VM's snapshot ID.
-	// Note that when using a snapshot ID as the key, we only include the
-	// snapshot_id and instance_name fields.
-	workDirForkOriginalSnapshot := testfs.MakeDirAll(t, rootDir, "work-fork-og-snapshot")
-	originalSnapshotKey := &fcpb.SnapshotKey{
-		InstanceName: instanceName,
-		SnapshotId:   baseSnapshotId,
-	}
-	opts = firecracker.ContainerOpts{
-		ContainerImage:         busyboxImage,
-		ActionWorkingDirectory: workDirForkOriginalSnapshot,
-		VMConfiguration: &fcpb.VMConfiguration{
-			NumCpus:           1,
-			MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
-			EnableNetworking:  false,
-			ScratchDiskSizeMb: 100,
+		{
+			name:               "Always save - on feature branch",
+			branch:             "pr-branch",
+			snapshotSavePolicy: platform.AlwaysSaveSnapshot,
 		},
-		ExecutorConfig:      cfg,
-		OverrideSnapshotKey: originalSnapshotKey,
+		{
+			name:               "Only save first non-default snapshot - on main",
+			branch:             "main",
+			snapshotSavePolicy: platform.OnlySaveFirstNonDefaultSnapshot,
+		},
+		{
+			name:               "Only save first non-default snapshot - on feature branch",
+			branch:             "pr-branch",
+			snapshotSavePolicy: platform.OnlySaveFirstNonDefaultSnapshot,
+		},
+		{
+			name:               "Only save non-default snapshot if no snapshots available - on main",
+			branch:             "main",
+			snapshotSavePolicy: platform.OnlySaveNonDefaultSnapshotIfNoneAvailable,
+		},
+		{
+			name:               "Only save non-default snapshot if no snapshots available - on feature branch",
+			branch:             "pr-branch",
+			snapshotSavePolicy: platform.OnlySaveNonDefaultSnapshotIfNoneAvailable,
+		},
 	}
-	ogFork, err := firecracker.NewContainer(ctx, env, task, opts)
-	require.NoError(t, err)
-	containersToCleanup = append(containersToCleanup, ogFork)
-	err = ogFork.Unpause(ctx)
-	require.NoError(t, err)
-	cmd = appendToLog("Fork from original vm")
-	res = ogFork.Exec(ctx, cmd, nil /*=stdio*/)
-	require.NoError(t, res.Error)
-	// The log should contain data written to the original snapshot
-	// and the current VM, but not from any of the other VMs, including the master
-	// snapshot
-	require.Equal(t, "Base\nFork from original vm\n", string(res.Stdout))
-	require.NotEmpty(t, res.VMMetadata.GetSnapshotId())
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			env := getTestEnv(ctx, t, envOpts{})
+			rootDir := testfs.MakeTempDir(t)
+			cfg := getExecutorConfig(t)
+
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			filecacheRoot := testfs.MakeTempDir(t)
+			fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
+			require.NoError(t, err)
+			fc.WaitForDirectoryScanToComplete()
+			env.SetFileCache(fc)
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					assert.NoError(t, err)
+				}
+			})
+
+			instanceName := "test-instance-name"
+			task := &repb.ExecutionTask{
+				Command: &repb.Command{
+					// Note: platform must match in order to share snapshots
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+						{Name: platform.SnapshotSavePolicyPropertyName, Value: tc.snapshotSavePolicy},
+						{Name: platform.MinTimeBetweenSnapshotWritesPropertyName, Value: "0s"},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+					EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+						{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+						{Name: "GIT_BRANCH", Value: tc.branch},
+					},
+				},
+				ExecuteRequest: &repb.ExecuteRequest{
+					InstanceName: instanceName,
+				},
+			}
+
+			runAndSnapshotVM := func(workDir string, stringToLog string, expectedOutput string, snapshotKeyOverride *fcpb.SnapshotKey, task *repb.ExecutionTask) *interfaces.CommandResult {
+				opts := firecracker.ContainerOpts{
+					ContainerImage:         busyboxImage,
+					ActionWorkingDirectory: workDir,
+					VMConfiguration: &fcpb.VMConfiguration{
+						NumCpus:           1,
+						MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+						NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+						ScratchDiskSizeMb: 100,
+					},
+					ExecutorConfig:      cfg,
+					OverrideSnapshotKey: snapshotKeyOverride,
+				}
+				vm, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+				err = vm.Create(ctx, workDir)
+				require.NoError(t, err)
+				cmd := appendToLog(stringToLog)
+				res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, expectedOutput, string(res.Stdout))
+				require.NotEmpty(t, res.VMMetadata.GetSnapshotId())
+				err = vm.Pause(ctx)
+				require.NoError(t, err)
+
+				return res
+			}
+
+			// Create a snapshot for the default branch.
+			mainTask := task.CloneVT()
+			mainTask.Command.EnvironmentVariables = []*repb.Command_EnvironmentVariable{
+				{
+					Name:  "GIT_BRANCH",
+					Value: "main",
+				},
+			}
+			mainWorkDir := testfs.MakeDirAll(t, rootDir, "work")
+			res := runAndSnapshotVM(mainWorkDir, "Main", "Main\n", nil, mainTask)
+			assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
+
+			// Create a snapshot on the branch specified by the test case.
+			workDir := testfs.MakeDirAll(t, rootDir, "work")
+			res = runAndSnapshotVM(workDir, "Test Branch 1", "Main\nTest Branch 1\n", nil, task)
+			baseSnapshotId := res.VMMetadata.GetSnapshotId()
+			assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
+
+			// Start a VM from the snapshot. Artifacts should be stored locally in the filecache.
+			// The log should contain data written to the original snapshot
+			// and the current VM.
+			workDirForkLocalFetch := testfs.MakeDirAll(t, rootDir, "work-fork-local-fetch")
+			res = runAndSnapshotVM(workDirForkLocalFetch, "Test Branch 2", "Main\nTest Branch 1\nTest Branch 2\n", nil, task)
+			assert.Equal(t, int64(2), res.VMMetadata.GetSavedSnapshotVersionNumber())
+
+			// Clear the local filecache. Vms should still be able to unpause the snapshot
+			// by pulling artifacts from the remote cache
+			err = os.RemoveAll(filecacheRoot)
+			require.NoError(t, err)
+			filecacheRoot2 := testfs.MakeTempDir(t)
+			fc2, err := filecache.NewFileCache(filecacheRoot2, fileCacheSize, false)
+			require.NoError(t, err)
+			fc2.WaitForDirectoryScanToComplete()
+			env.SetFileCache(fc2)
+
+			// Start a VM from the remote snapshot.
+			var expectedOutput string
+			var expectedVersionNumber int64
+			if tc.branch == "main" || tc.snapshotSavePolicy == platform.AlwaysSaveSnapshot {
+				expectedOutput = "Main\nTest Branch 1\nTest Branch 2\nTest Branch 3\n"
+				expectedVersionNumber = 3
+			} else if tc.snapshotSavePolicy == platform.OnlySaveFirstNonDefaultSnapshot {
+				expectedOutput = "Main\nTest Branch 1\nTest Branch 3\n"
+				expectedVersionNumber = 2
+			} else if tc.snapshotSavePolicy == platform.OnlySaveNonDefaultSnapshotIfNoneAvailable {
+				expectedOutput = "Main\nTest Branch 3\n"
+				expectedVersionNumber = 1
+			}
+			workDirForkRemoteFetch := testfs.MakeDirAll(t, rootDir, "work-fork-remote-fetch")
+			res = runAndSnapshotVM(workDirForkRemoteFetch, "Test Branch 3", expectedOutput, nil, task)
+			assert.Equal(t, expectedVersionNumber, res.VMMetadata.GetSavedSnapshotVersionNumber())
+
+			if tc.snapshotSavePolicy != platform.OnlySaveNonDefaultSnapshotIfNoneAvailable {
+				// Should still be able to start from the original snapshot if we use
+				// a snapshot key containing the original VM's snapshot ID.
+				// Note that when using a snapshot ID as the key, we only include the
+				// snapshot_id and instance_name fields.
+				// The log should contain data written to the original snapshot
+				// and the current VM, but not from any of the other VMs, including the master
+				// snapshot
+				workDirForkOriginalSnapshot := testfs.MakeDirAll(t, rootDir, "work-fork-og-snapshot")
+				originalSnapshotKey := &fcpb.SnapshotKey{
+					InstanceName: instanceName,
+					SnapshotId:   baseSnapshotId,
+				}
+				res = runAndSnapshotVM(workDirForkOriginalSnapshot, "Fork from original vm", "Main\nTest Branch 1\nFork from original vm\n", originalSnapshotKey, task)
+				assert.Equal(t, int64(2), res.VMMetadata.GetSavedSnapshotVersionNumber())
+			}
+		})
+	}
+}
+
+func TestFirecracker_SnapshotSharing_ReadPolicy(t *testing.T) {
+	tests := []struct {
+		name                      string
+		snapshotReadPolicy        string
+		expectedOutputAfterResume string
+	}{
+		{
+			name:               "By default, apply local first policy",
+			snapshotReadPolicy: platform.ReadLocalSnapshotFirst,
+			// Even though a newer remote snapshot was written by executor 2, expect to
+			// start from the local snapshot written by executor 1.
+			expectedOutputAfterResume: "Executor1\nResume\n",
+		},
+		{
+			name:               "Always read newest",
+			snapshotReadPolicy: platform.AlwaysReadNewestSnapshot,
+			// Even though a local snapshot exists on executor 1, expect to
+			// start from the remote snapshot written from executor 2 because
+			// it is newer.
+			expectedOutputAfterResume: "Executor1\nExecutor2\nResume\n",
+		},
+		{
+			name:               "Local first",
+			snapshotReadPolicy: platform.ReadLocalSnapshotFirst,
+			// Even though a newer remote snapshot was written by executor 2, expect to
+			// start from the local snapshot written by executor 1.
+			expectedOutputAfterResume: "Executor1\nResume\n",
+		},
+		{
+			name:               "Local only",
+			snapshotReadPolicy: platform.ReadLocalSnapshotOnly,
+			// Even though a newer remote snapshot was written by executor 2, expect to
+			// start from the local snapshot written by executor 1.
+			expectedOutputAfterResume: "Executor1\nResume\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := getExecutorConfig(t)
+			rootDir1 := testfs.MakeTempDir(t)
+			rootDir2 := testfs.MakeTempDir(t)
+
+			// Both "executors" should use the same remote cache, but have different
+			// local filecaches.
+			env := getTestEnv(ctx, t, envOpts{})
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+			filecacheRoot1 := testfs.MakeTempDir(t)
+			fc, err := filecache.NewFileCache(filecacheRoot1, fileCacheSize/2, false)
+			require.NoError(t, err)
+			fc.WaitForDirectoryScanToComplete()
+			filecacheRoot2 := testfs.MakeTempDir(t)
+			fc2, err := filecache.NewFileCache(filecacheRoot2, fileCacheSize/2, false)
+			require.NoError(t, err)
+			fc2.WaitForDirectoryScanToComplete()
+
+			getEnvWithFC := func(fc interfaces.FileCache) *testenv.TestEnv {
+				env.SetFileCache(fc)
+				return env
+			}
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					assert.NoError(t, err)
+				}
+			})
+
+			instanceName := "test-instance-name"
+			task := &repb.ExecutionTask{
+				Command: &repb.Command{
+					// Note: platform must match in order to share snapshots
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+						{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.AlwaysSaveSnapshot},
+						{Name: platform.SnapshotReadPolicyPropertyName, Value: tc.snapshotReadPolicy},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+					EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+						{Name: "GIT_BRANCH", Value: "pr-branch"},
+					},
+				},
+				ExecuteRequest: &repb.ExecuteRequest{
+					InstanceName: instanceName,
+				},
+			}
+			opts := firecracker.ContainerOpts{
+				ContainerImage: busyboxImage,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:           1,
+					MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+					NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+					ScratchDiskSizeMb: 100,
+				},
+				ExecutorConfig: cfg,
+			}
+
+			runAndSnapshotVM := func(env *testenv.TestEnv, workDir string, stringToLog string) {
+				opts.ActionWorkingDirectory = workDir
+				vm, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+				err = vm.Create(ctx, workDir)
+				require.NoError(t, err)
+				cmd := appendToLog(stringToLog)
+				res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				err = vm.Pause(ctx)
+				require.NoError(t, err)
+			}
+
+			resumeFromSnapshot := func(env *testenv.TestEnv, workDir string, stringToLog string, expectedOutput string) {
+				opts.ActionWorkingDirectory = workDir
+				vm, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				err = vm.Unpause(ctx)
+				require.NoError(t, err)
+				cmd := appendToLog(stringToLog)
+				res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, expectedOutput, string(res.Stdout))
+			}
+
+			if tc.snapshotReadPolicy == platform.ReadLocalSnapshotOnly {
+				// Save a snapshot from executor 2.
+				workDir2 := testfs.MakeDirAll(t, rootDir2, "executor-2")
+				runAndSnapshotVM(getEnvWithFC(fc2), workDir2, "Executor2")
+
+				// Ensure that executor 1 cannot resume from a snapshot, even though
+				// a remote snapshot exists for the same key.
+				workDir := testfs.MakeDirAll(t, rootDir1, "executor-1")
+				opts.ActionWorkingDirectory = workDir
+				vm, err := firecracker.NewContainer(ctx, getEnvWithFC(fc), task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				err = vm.Unpause(ctx)
+				require.Error(t, err)
+			}
+
+			// Save a snapshot from executor 1.
+			workDir1 := testfs.MakeDirAll(t, rootDir1, "executor-1")
+			runAndSnapshotVM(getEnvWithFC(fc), workDir1, "Executor1")
+
+			// Save a snapshot from executor 2.
+			workDir2 := testfs.MakeDirAll(t, rootDir2, "executor-2")
+			runAndSnapshotVM(getEnvWithFC(fc2), workDir2, "Executor2")
+
+			// Resume from snapshot on executor 1.
+			resumeFromSnapshot(getEnvWithFC(fc), workDir1, "Resume", tc.expectedOutputAfterResume)
+		})
+	}
+}
+
+func TestFirecracker_SnapshotSharing_UniversalFallback(t *testing.T) {
+	fakeClock := clockwork.NewFakeClock()
+	tests := []struct {
+		name              string
+		testStaleSnapshot bool
+	}{
+		{
+			name: "Successful resume from universal snapshot",
+		},
+		{
+			name:              "Failure - Universal snapshot was too old",
+			testStaleSnapshot: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			env := getTestEnv(ctx, t, envOpts{})
+			env.SetClock(fakeClock)
+			rootDir := testfs.MakeTempDir(t)
+			cfg := getExecutorConfig(t)
+
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+			filecacheRoot := testfs.MakeTempDir(t)
+			fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
+			require.NoError(t, err)
+			fc.WaitForDirectoryScanToComplete()
+			env.SetFileCache(fc)
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					assert.NoError(t, err)
+				}
+			})
+
+			workDir := testfs.MakeDirAll(t, rootDir, "work")
+			opts := firecracker.ContainerOpts{
+				ContainerImage:         busyboxImage,
+				ActionWorkingDirectory: workDir,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:           1,
+					MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+					NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+					ScratchDiskSizeMb: 100,
+				},
+				ExecutorConfig: cfg,
+			}
+
+			instanceName := "test-instance-name"
+			taskTemplate := &repb.ExecutionTask{
+				Command: &repb.Command{
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+					EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+						{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+					},
+				},
+				ExecuteRequest: &repb.ExecuteRequest{
+					InstanceName: instanceName,
+				},
+			}
+
+			// pr-1 saves a snapshot
+			taskPR1 := taskTemplate.CloneVT()
+			taskPR1.Command.EnvironmentVariables = append(taskPR1.Command.EnvironmentVariables, &repb.Command_EnvironmentVariable{
+				Name: "GIT_BRANCH", Value: "pr-1",
+			})
+			vm, err := firecracker.NewContainer(ctx, env, taskPR1, opts)
+			require.NoError(t, err)
+			containersToCleanup = append(containersToCleanup, vm)
+			require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+			err = vm.Create(ctx, workDir)
+			require.NoError(t, err)
+			cmd := appendToLog("pr-1")
+			res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+			require.NoError(t, res.Error)
+			require.Equal(t, "pr-1\n", string(res.Stdout))
+			err = vm.Pause(ctx)
+			require.NoError(t, err)
+
+			if tc.testStaleSnapshot {
+				fakeClock.Advance(snaputil.DefaultMaxStaleFallbackSnapshotAge + 1*time.Hour)
+			}
+
+			// pr-2 tries to resume from a snapshot. Should only succeed if the universal
+			// snapshot is still valid.
+			taskPR2 := taskTemplate.CloneVT()
+			taskPR2.Command.EnvironmentVariables = append(taskPR2.Command.EnvironmentVariables, &repb.Command_EnvironmentVariable{
+				Name: "GIT_BRANCH", Value: "pr-2",
+			})
+			vm2, err := firecracker.NewContainer(ctx, env, taskPR2, opts)
+			require.NoError(t, err)
+			containersToCleanup = append(containersToCleanup, vm2)
+			require.NoError(t, container.PullImageIfNecessary(ctx, env, vm2, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+
+			if tc.testStaleSnapshot {
+				// The universal snapshot is too old to read, so pr-2 should have to boot cold.
+				err = vm2.Create(ctx, workDir)
+				require.NoError(t, err)
+				cmd = appendToLog("pr-2")
+				res = vm2.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, "pr-2\n", string(res.Stdout))
+			} else {
+				// The universal snapshot is still valid, so pr-2 should be able to resume from it.
+				err = vm2.Unpause(ctx)
+				require.NoError(t, err)
+				cmd = appendToLog("pr-2")
+				res = vm2.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, "pr-1\npr-2\n", string(res.Stdout))
+			}
+		})
+	}
+}
+
+func TestFirecracker_SnapshotSharing_UniversalFallback_SavePolicy(t *testing.T) {
+	// Disable local snapshot sharing with filecache to simplify the setup.
+	// We're testing remote cache behavior, so there's no need to also write snapshots to the local filecache,
+	// especially because we'd need to clear it to guarantee we're hitting the remote cache.
+	flags.Set(t, "executor.enable_local_snapshot_sharing", false)
+
+	for _, tc := range []struct {
+		name                    string
+		expireUniversalSnapshot bool
+		expectedFinalLogs       string
+	}{
+		{
+			// pr-2 resumes from the universal snapshot and does not save one
+			// of its own, so re-running it resumes from the universal snapshot
+			// again and prints exactly what it printed the first time.
+			name:                    "valid universal snapshot, don't write another one",
+			expireUniversalSnapshot: false,
+			expectedFinalLogs:       "pr-1\npr-2\n",
+		},
+		{
+			// The universal snapshot is too stale to read, so pr-2 boots cold
+			// and saves a new snapshot. Re-running it resumes from that newly written snapshot.
+			name:                    "stale universal snapshot, should save a snapshot",
+			expireUniversalSnapshot: true,
+			expectedFinalLogs:       "pr-2\npr-2\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			env := getTestEnv(ctx, t, envOpts{})
+			cfg := getExecutorConfig(t)
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+			fakeClock := clockwork.NewFakeClock()
+			env.SetClock(fakeClock)
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					assert.NoError(t, vm.Remove(ctx))
+				}
+			})
+
+			const defaultBranch = "main"
+			prTask := func(branch string) *repb.ExecutionTask {
+				return &repb.ExecutionTask{
+					Command: &repb.Command{
+						Arguments: []string{"./buildbuddy_ci_runner"},
+						Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+							{Name: "recycle-runner", Value: "true"},
+							{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.OnlySaveNonDefaultSnapshotIfNoneAvailable},
+						}},
+						EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+							{Name: "GIT_BRANCH", Value: branch},
+							{Name: "GIT_REPO_DEFAULT_BRANCH", Value: defaultBranch},
+						},
+					},
+				}
+			}
+
+			rootDir := testfs.MakeTempDir(t)
+			run := func(name, branch, expectedLogs string) {
+				workDir := testfs.MakeDirAll(t, rootDir, name)
+				opts := firecracker.ContainerOpts{
+					ContainerImage:         busyboxImage,
+					ActionWorkingDirectory: workDir,
+					VMConfiguration: &fcpb.VMConfiguration{
+						NumCpus:           1,
+						MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+						NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+						ScratchDiskSizeMb: 100,
+					},
+					ExecutorConfig: cfg,
+				}
+				vm, err := firecracker.NewContainer(ctx, env, prTask(branch), opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+				require.NoError(t, vm.Create(ctx, workDir))
+				res := vm.Exec(ctx, appendToLog(branch), nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.NoError(t, vm.Pause(ctx))
+				assert.Equal(t, expectedLogs, string(res.Stdout))
+			}
+
+			// pr-1 has nothing to resume from, so it boots cold. It should save a universal snapshot.
+			run("pr-1", "pr-1", "pr-1\n")
+
+			if tc.expireUniversalSnapshot {
+				fakeClock.Advance(snaputil.DefaultMaxStaleFallbackSnapshotAge + time.Hour)
+			}
+
+			// Start a run from pr-2.
+			if tc.expireUniversalSnapshot {
+				// The universal snapshot is too old to read, so pr-2 boots cold.
+				run("pr-2", "pr-2", "pr-2\n")
+			} else {
+				// The universal snapshot is still valid, so pr-2 should be able to resume from it.
+				// The snapshot should contain the log from pr-1.
+				run("pr-2", "pr-2", "pr-1\npr-2\n")
+			}
+
+			// Start a second run from pr-2.
+			// Depending on the test case, it should either resume from the universal snapshot written by pr-1,
+			// or the newly written snapshot written by pr-2.
+			run("pr-2-again", "pr-2", tc.expectedFinalLogs)
+		})
+	}
+}
+
+func TestFirecracker_SnapshotSharing_ReadPolicy_FallbackSnapshot(t *testing.T) {
+	tests := []struct {
+		name                      string
+		snapshotReadPolicy        string
+		expectedOutputAfterResume string
+	}{
+		{
+			name:               "Always read newest",
+			snapshotReadPolicy: platform.AlwaysReadNewestSnapshot,
+			// We always expect to resume from the newest main snapshot.
+			expectedOutputAfterResume: "MainExecutor1\nMainExecutor2\nPR2Executor1\n",
+		},
+		{
+			name:               "By default, use local first policy",
+			snapshotReadPolicy: "",
+			// Even though a newer main snapshot was written on executor 2, we should
+			// start from the local main snapshot on executor 1.
+			expectedOutputAfterResume: "MainExecutor1\nPR2Executor1\n",
+		},
+		{
+			name:               "Local first",
+			snapshotReadPolicy: platform.ReadLocalSnapshotFirst,
+			// Even though a newer main snapshot was written on executor 2, we should
+			// start from the local main snapshot on executor 1.
+			expectedOutputAfterResume: "MainExecutor1\nPR2Executor1\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := getExecutorConfig(t)
+			rootDir1 := testfs.MakeTempDir(t)
+			rootDir2 := testfs.MakeTempDir(t)
+
+			// Both "executors" should use the same remote cache, but have different
+			// local filecaches.
+			env := getTestEnv(ctx, t, envOpts{})
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+			filecacheRoot1 := testfs.MakeTempDir(t)
+			fc, err := filecache.NewFileCache(filecacheRoot1, fileCacheSize/2, false)
+			require.NoError(t, err)
+			fc.WaitForDirectoryScanToComplete()
+			filecacheRoot2 := testfs.MakeTempDir(t)
+			fc2, err := filecache.NewFileCache(filecacheRoot2, fileCacheSize/2, false)
+			require.NoError(t, err)
+			fc2.WaitForDirectoryScanToComplete()
+
+			getEnvWithFC := func(fc interfaces.FileCache) *testenv.TestEnv {
+				env.SetFileCache(fc)
+				return env
+			}
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					assert.NoError(t, err)
+				}
+			})
+
+			instanceName := "test-instance-name"
+			prBranchTask := &repb.ExecutionTask{
+				Command: &repb.Command{
+					// Note: platform must match in order to share snapshots
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+						{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.AlwaysSaveSnapshot},
+						{Name: platform.SnapshotReadPolicyPropertyName, Value: tc.snapshotReadPolicy},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+					EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+						{Name: "GIT_BRANCH", Value: "pr-branch"},
+						{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+					},
+				},
+				ExecuteRequest: &repb.ExecuteRequest{
+					InstanceName: instanceName,
+				},
+			}
+			mainBranchTask := prBranchTask.CloneVT()
+			mainBranchTask.Command.EnvironmentVariables = []*repb.Command_EnvironmentVariable{
+				{Name: "GIT_BRANCH", Value: "main"},
+			}
+			prBranchTask2 := prBranchTask.CloneVT()
+			prBranchTask2.Command.EnvironmentVariables = []*repb.Command_EnvironmentVariable{
+				{Name: "GIT_BRANCH", Value: "pr-branch-2"},
+				{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+			}
+			opts := firecracker.ContainerOpts{
+				ContainerImage: busyboxImage,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:           1,
+					MemSizeMb:         minMemSizeMB, // small to make snapshotting faster.
+					NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+					ScratchDiskSizeMb: 100,
+				},
+				ExecutorConfig: cfg,
+			}
+
+			runAndSnapshotVM := func(env *testenv.TestEnv, workDir string, task *repb.ExecutionTask, stringToLog string, expectedOutput string) {
+				opts.ActionWorkingDirectory = workDir
+				vm, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+				err = vm.Create(ctx, workDir)
+				require.NoError(t, err)
+				cmd := appendToLog(stringToLog)
+				res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, expectedOutput, string(res.Stdout))
+				err = vm.Pause(ctx)
+				require.NoError(t, err)
+			}
+
+			// Save a main snapshot from executor 1.
+			workDir1 := testfs.MakeDirAll(t, rootDir1, "executor-1")
+			runAndSnapshotVM(getEnvWithFC(fc), workDir1, mainBranchTask, "MainExecutor1", "MainExecutor1\n")
+
+			// On a PR branch, resume from the fallback main snapshot on executor 1.
+			runAndSnapshotVM(getEnvWithFC(fc), workDir1, prBranchTask, "PRExecutor1", "MainExecutor1\nPRExecutor1\n")
+
+			// Save a main snapshot from executor 2.
+			workDir2 := testfs.MakeDirAll(t, rootDir2, "executor-2")
+			runAndSnapshotVM(getEnvWithFC(fc2), workDir2, mainBranchTask, "MainExecutor2", "MainExecutor1\nMainExecutor2\n")
+
+			// On a new PR branch on executor 1, resume from the fallback main snapshot.
+			// Depending on the read policy, it should either resume from the local main snapshot or the newest remote main snapshot.
+			runAndSnapshotVM(getEnvWithFC(fc), workDir1, prBranchTask2, "PR2Executor1", tc.expectedOutputAfterResume)
+		})
+	}
+}
+
+func TestFirecracker_SnapshotSharing_MinWriteInterval(t *testing.T) {
+	tests := []struct {
+		name                      string
+		branch                    string
+		snapshotWritePolicy       string
+		expectedOutputAfterResume string
+	}{
+		{
+			name:                "Always save snapshot, main branch",
+			branch:              "main",
+			snapshotWritePolicy: platform.AlwaysSaveSnapshot,
+			// Even though the second write was within the min write interval, the snapshot
+			// write policy should take precedence.
+			expectedOutputAfterResume: "Run1\nRun2\nRun3\n",
+		},
+		{
+			name:                "Default write policy, main branch",
+			branch:              "main",
+			snapshotWritePolicy: "",
+			// By default, because the min write interval has not passed, we shouldn't
+			// save a snapshot on the second run.
+			expectedOutputAfterResume: "Run1\nRun3\n",
+		},
+		{
+			name:                "Always save snapshot, merge queue branch",
+			branch:              "gh-readonly-queue/main/",
+			snapshotWritePolicy: platform.AlwaysSaveSnapshot,
+			// Even though the second write was within the min write interval, the snapshot
+			// write policy should take precedence.
+			expectedOutputAfterResume: "Run1\nRun2\nRun3\n",
+		},
+		{
+			name:                "Default write policy, merge queue branch",
+			branch:              "gh-readonly-queue/main/",
+			snapshotWritePolicy: "",
+			// By default, because the min write interval has not passed, we shouldn't
+			// save a snapshot on the second run.
+			expectedOutputAfterResume: "Run1\nRun3\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rootDir := testfs.MakeTempDir(t)
+			workDir := testfs.MakeDirAll(t, rootDir, "work")
+			env := getTestEnv(ctx, t, envOpts{})
+			env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			t.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					require.NoError(t, err)
+				}
+			})
+
+			task := &repb.ExecutionTask{
+				Command: &repb.Command{
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+						{Name: platform.SnapshotSavePolicyPropertyName, Value: tc.snapshotWritePolicy},
+						// Set a long min write interval. Unless something else overrides it,
+						// duplicate snapshots on the same branch should not be saved.
+						{Name: platform.MinTimeBetweenSnapshotWritesPropertyName, Value: "10h"},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+					EnvironmentVariables: []*repb.Command_EnvironmentVariable{
+						{Name: "GIT_BRANCH", Value: tc.branch},
+						{Name: "GIT_REPO_DEFAULT_BRANCH", Value: "main"},
+					},
+				},
+			}
+			opts := firecracker.ContainerOpts{
+				ContainerImage:         busyboxImage,
+				ActionWorkingDirectory: workDir,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:           1,
+					MemSizeMb:         minMemSizeMB,
+					NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_LOCAL,
+					ScratchDiskSizeMb: 100,
+				},
+				ExecutorConfig: getExecutorConfig(t),
+			}
+
+			count := 0
+			runAndSnapshotVM := func(env *testenv.TestEnv, taskTemplate *repb.ExecutionTask, stringToLog string, expectedOutput string) {
+				task := taskTemplate.CloneVT()
+
+				// If it's a merge queue branch, create a task with a new branch name for each run, simulating realistic
+				// merge queue behavior.
+				for _, ev := range task.Command.EnvironmentVariables {
+					if ev.Name == "GIT_BRANCH" {
+						if strings.HasPrefix(ev.Value, "gh-readonly-queue") {
+							ev.Value += fmt.Sprintf("%d", count)
+							break
+						}
+					}
+				}
+				vm, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(t, err)
+				containersToCleanup = append(containersToCleanup, vm)
+				require.NoError(t, container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
+				err = vm.Create(ctx, workDir)
+				require.NoError(t, err)
+				cmd := appendToLog(stringToLog)
+				res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(t, res.Error)
+				require.Equal(t, expectedOutput, string(res.Stdout))
+				err = vm.Pause(ctx)
+				require.NoError(t, err)
+				count++
+			}
+
+			// Run the same workload 3X. The first run should always save a snapshot.
+			// The second run will only save a snapshot based on its min write interval + platform properties.
+			runAndSnapshotVM(env, task, "Run1", "Run1\n")
+			runAndSnapshotVM(env, task, "Run2", "Run1\nRun2\n")
+			runAndSnapshotVM(env, task, "Run3", tc.expectedOutputAfterResume)
+		})
+	}
 }
 
 func TestFirecracker_RemoteSnapshotSharing_RemoteInstanceName(t *testing.T) {
-	if !*snaputil.EnableRemoteSnapshotSharing {
-		t.Skip("Snapshot sharing is not enabled")
-	}
-
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	cfg := getExecutorConfig(t)
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	// Set up a task with remote snapshot sharing enabled.
 	task := &repb.ExecutionTask{
@@ -884,11 +2110,11 @@ ATTEMPT_NUMBER=$(( ATTEMPT_NUMBER + 1 ))
 printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 `}}
 
-	run := func(instanceName string, expectedLogs string) {
+	run := func(instanceName string, expectedLogs string, expectedVersionNumber int64) {
 		task.ExecuteRequest.InstanceName = instanceName
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -902,27 +2128,106 @@ printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 		require.Equal(t, 0, res.ExitCode)
 		require.NoError(t, res.Error)
 		assert.Equal(t, expectedLogs, string(res.Stdout))
+		assert.Equal(t, expectedVersionNumber, res.VMMetadata.GetSavedSnapshotVersionNumber())
 	}
 
-	run("", "1")  // Should start clean
-	run("A", "1") // New instance name "A"; should start clean
-	run("A", "2") // Should resume from previous, and increment the counter
+	run("", "1", 0)  // Should start clean
+	run("A", "1", 0) // New instance name "A"; should start clean
+	run("A", "2", 1) // Should resume from previous, and increment the counter
 }
 
-func TestFirecracker_SnapshotSharing_MergeQueueBranches(t *testing.T) {
-	flags.Set(t, "executor.firecracker_enable_vbd", true)
-	flags.Set(t, "executor.firecracker_enable_merged_rootfs", true)
-	flags.Set(t, "executor.firecracker_enable_uffd", true)
-	flags.Set(t, "executor.enable_local_snapshot_sharing", true)
-	flags.Set(t, "executor.enable_remote_snapshot_sharing", true)
-	if !*snaputil.EnableRemoteSnapshotSharing {
-		t.Skip("Snapshot sharing is not enabled")
-	}
-
+func TestFirecracker_RemoteSnapshotSharing_Devbox(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	cfg := getExecutorConfig(t)
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+
+	// Manage our own filecache so we can clear it between runs to force
+	// remote snapshot lookups.
+	filecacheRoot := testfs.MakeTempDir(t)
+	fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+	env.SetFileCache(fc)
+
+	// Set up a non-CI task with a devbox instance name. The devbox instance
+	// name prefix should enable remote snapshotting independently of
+	// isCICommand.
+	devboxInstanceName := snaputil.DevboxPartitionPrefix + "/my-devbox"
+	task := &repb.ExecutionTask{
+		ExecuteRequest: &repb.ExecuteRequest{
+			InstanceName: devboxInstanceName,
+		},
+		Command: &repb.Command{
+			// Intentionally not ./buildbuddy_ci_runner.
+			Arguments: []string{"sh"},
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+				{Name: "allow-remote-snapshots", Value: "true"},
+			}},
+		},
+	}
+	workdir := testfs.MakeTempDir(t)
+	opts := firecracker.ContainerOpts{
+		ExecutorConfig: cfg,
+		ContainerImage: busyboxImage,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
+		},
+		ActionWorkingDirectory: workdir,
+	}
+
+	// Increments /root/attempts and prints the new value.
+	cmd := &repb.Command{Arguments: []string{"sh", "-c", `
+cd /root
+ATTEMPT_NUMBER=$(cat ./attempts 2>/dev/null || echo 0)
+ATTEMPT_NUMBER=$(( ATTEMPT_NUMBER + 1 ))
+printf '%s' $ATTEMPT_NUMBER | tee ./attempts
+`}}
+
+	run := func(expectedOut string, expectedVersionNumber int64) {
+		c, err := firecracker.NewContainer(ctx, env, task, opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { c.Remove(ctx) })
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+		err = c.Create(ctx, workdir)
+		require.NoError(t, err)
+		res := c.Exec(ctx, cmd, nil)
+		{
+			err = c.Pause(ctx)
+			require.NoError(t, err)
+		}
+		require.NoError(t, res.Error)
+		require.Equal(t, 0, res.ExitCode)
+		assert.Equal(t, expectedOut, string(res.Stdout))
+		assert.Equal(t, expectedVersionNumber, res.VMMetadata.GetSavedSnapshotVersionNumber())
+	}
+
+	// First run: fresh start, snapshot saved to remote cache.
+	run("1", 0)
+
+	// Clear the local filecache to force the next run to fetch from remote.
+	err = os.RemoveAll(filecacheRoot)
+	require.NoError(t, err)
+	filecacheRoot2 := testfs.MakeTempDir(t)
+	fc2, err := filecache.NewFileCache(filecacheRoot2, fileCacheSize, false)
+	require.NoError(t, err)
+	fc2.WaitForDirectoryScanToComplete()
+	env.SetFileCache(fc2)
+
+	// Second run: resumes from the remote snapshot despite empty local cache,
+	// proving the devbox instance name enabled remote snapshotting.
+	run("2", 1)
+}
+
+func TestFirecracker_SnapshotSharing_MergeQueueBranches(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	cfg := getExecutorConfig(t)
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	defaultBranch := "main"
 	mergeQueueBranch := "gh-readonly-queue/main/abc"
@@ -979,7 +2284,7 @@ func TestFirecracker_SnapshotSharing_MergeQueueBranches(t *testing.T) {
 		ActionWorkingDirectory: workdir,
 	}
 
-	run := func(task *repb.ExecutionTask, expectedLogs string) {
+	run := func(task *repb.ExecutionTask, expectedLogs string, expectedVersionNumber int64) {
 		// This command writes the task branch name to a file.
 		branchName := ""
 		for _, ev := range task.Command.EnvironmentVariables {
@@ -996,7 +2301,7 @@ cat ./attempts
 
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -1010,28 +2315,25 @@ cat ./attempts
 		require.Equal(t, 0, res.ExitCode)
 		require.NoError(t, res.Error)
 		assert.Equal(t, expectedLogs, string(res.Stdout))
+		assert.Equal(t, expectedVersionNumber, res.VMMetadata.GetSavedSnapshotVersionNumber())
 	}
 
 	// Run the merge queue task.
-	run(mergeQueueTask, mergeQueueBranch)
+	run(mergeQueueTask, mergeQueueBranch, 0)
 	// PR task should be able to start from merge branch snapshot.
-	run(prTask, mergeQueueBranch+prBranch)
+	run(prTask, mergeQueueBranch+prBranch, 1)
 	// Merge queue task should be able to start from merge branch snapshot.
 	// Should not include changes from PR task.
-	run(mergeQueueTask, mergeQueueBranch+mergeQueueBranch)
+	run(mergeQueueTask, mergeQueueBranch+mergeQueueBranch, 1)
 	// PR task should be able to start from the latest PR branch snapshot.
-	run(prTask, mergeQueueBranch+prBranch+prBranch)
+	run(prTask, mergeQueueBranch+prBranch+prBranch, 2)
 }
 
 func TestFirecracker_LocalSnapshotSharing_ContainerImageChunksExpiredFromCache(t *testing.T) {
-	if !*snaputil.EnableRemoteSnapshotSharing {
-		t.Skip("Snapshot sharing is not enabled")
-	}
-
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	cfg := getExecutorConfig(t)
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	// Set up a task with only local snapshotting enabled.
 	task := &repb.ExecutionTask{
@@ -1062,10 +2364,10 @@ ATTEMPT_NUMBER=$(( ATTEMPT_NUMBER + 1 ))
 printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 `}}
 
-	run := func(expectedLogs string) {
+	run := func(expectedLogs string, expectedVersionNumber int64) {
 		c, err := firecracker.NewContainer(ctx, env, task, opts)
 		require.NoError(t, err)
-		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+		container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 		err = c.Create(ctx, workdir)
 		require.NoError(t, err)
 		res := c.Exec(ctx, cmd, nil)
@@ -1079,9 +2381,10 @@ printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 		require.Equal(t, 0, res.ExitCode)
 		require.NoError(t, res.Error)
 		assert.Equal(t, expectedLogs, string(res.Stdout))
+		assert.Equal(t, expectedVersionNumber, res.VMMetadata.GetSavedSnapshotVersionNumber())
 	}
 
-	run("1") // Should start clean
+	run("1", 0) // Should start clean
 
 	// Evict all artifacts from filecache, which should expire the base image.
 	fcDir := testfs.MakeTempDir(t)
@@ -1090,15 +2393,11 @@ printf '%s' $ATTEMPT_NUMBER | tee ./attempts
 	fc.WaitForDirectoryScanToComplete()
 	env.SetFileCache(fc)
 
-	run("1") // Should start clean
-	run("2") // Should resume from previous, and increment the counter
+	run("1", 0) // Should start clean
+	run("2", 1) // Should resume from previous, and increment the counter
 }
 
 func TestFirecrackerSnapshotVersioning(t *testing.T) {
-	if !*snaputil.EnableLocalSnapshotSharing {
-		t.SkipNow()
-	}
-
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	rootDir := testfs.MakeTempDir(t)
@@ -1129,6 +2428,256 @@ func TestFirecrackerSnapshotVersioning(t *testing.T) {
 	require.NotEmpty(t, cmp.Diff(c1.SnapshotKeySet(), c3.SnapshotKeySet(), protocmp.Transform()))
 }
 
+func TestFirecracker_RemoteSnapshotSharing_CacheProxy(t *testing.T) {
+	// Disable local snapshot sharing with filecache to simplify the setup.
+	flags.Set(t, "executor.enable_local_snapshot_sharing", false)
+
+	// Enable cache proxy cluster-local snapshot storage
+	flags.Set(t, "executor.store_snapshots_in_local_cluster_only", true)
+
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{runProxy: true})
+	rootDir := testfs.MakeTempDir(t)
+	cfg := getExecutorConfig(t)
+
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	filecacheRoot := testfs.MakeDirAll(t, cfg.JailerRoot, "filecache")
+	fc, err := filecache.NewFileCache(filecacheRoot, fileCacheSize, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+	env.SetFileCache(fc)
+
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:            1,
+			MemSizeMb:          minMemSizeMB, // small to make snapshotting faster.
+			NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb:  100,
+			GuestKernelVersion: cfg.GuestKernelVersion,
+			FirecrackerVersion: cfg.FirecrackerVersion,
+			GuestApiVersion:    cfg.GuestAPIVersion,
+		},
+		ExecutorConfig: cfg,
+	}
+	instanceName := "test-instance-name"
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			// Note: platform must match in order to share snapshots
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+			}},
+			Arguments: []string{"./buildbuddy_ci_runner"},
+		},
+		ExecuteRequest: &repb.ExecuteRequest{
+			InstanceName: instanceName,
+		},
+	}
+
+	vm, err := firecracker.NewContainer(ctx, env, task, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := vm.Remove(ctx)
+		assert.NoError(t, err)
+	})
+	err = container.PullImageIfNecessary(ctx, env, vm, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+	require.NoError(t, err)
+	err = vm.Create(ctx, opts.ActionWorkingDirectory)
+	require.NoError(t, err)
+
+	// Create a snapshot.
+	cmd := appendToLog("Base")
+	res := vm.Exec(ctx, cmd, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
+	require.Equal(t, "Base\n", string(res.Stdout))
+	err = vm.Pause(ctx)
+	require.NoError(t, err)
+
+	// Only the snapshot version should've been saved to the remote cache. All
+	// other shapsnot artifacts should only be cached in the proxy.
+	remoteCacheStats := env.GetCache().(*disk_cache.DiskCache).Statusz(ctx)
+	require.Contains(t, remoteCacheStats, "Items: 1")
+
+	// Make sure we can start from a snapshot fetched from the proxy
+	err = vm.Unpause(ctx)
+	require.NoError(t, err)
+	cmd = appendToLog("Child")
+	res = vm.Exec(ctx, cmd, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
+	require.Equal(t, "Base\nChild\n", string(res.Stdout))
+}
+
+func TestFirecrackerBalloon(t *testing.T) {
+	flags.Set(t, "executor.firecracker_enable_balloon", true)
+	ctx := context.Background()
+
+	env := getTestEnv(ctx, t, envOpts{})
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+	cfg := getExecutorConfig(t)
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         ubuntuImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:            2,
+			MemSizeMb:          2000,
+			NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+			ScratchDiskSizeMb:  500,
+			GuestKernelVersion: cfg.GuestKernelVersion,
+			FirecrackerVersion: cfg.FirecrackerVersion,
+			GuestApiVersion:    cfg.GuestAPIVersion,
+		},
+		ExecutorConfig: cfg,
+	}
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			// Note: platform must match in order to share snapshots
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+				{Name: platform.MinTimeBetweenSnapshotWritesPropertyName, Value: "0s"},
+			}},
+			Arguments: []string{"./buildbuddy_ci_runner"},
+		},
+	}
+
+	c, err := firecracker.NewContainer(ctx, env, task, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher); err != nil {
+		t.Fatalf("unable to pull image: %s", err)
+	}
+
+	if err := c.Create(ctx, opts.ActionWorkingDirectory); err != nil {
+		t.Fatalf("unable to Create container: %s", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Remove(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	cmd := &repb.Command{
+		// Mount a RAM-based filesystem to /tmp/randomdata to simulate memory usage.
+		Arguments: []string{"bash", "-c", `
+set -eo pipefail
+mkdir /tmp/randomdata && mount -t tmpfs -o size=1700M tmpfs /tmp/randomdata
+dd if=/dev/urandom of=/tmp/randomdata/data bs=1M count=1600
+free -h
+`},
+	}
+
+	res := c.Exec(ctx, cmd, nil /*=stdio*/)
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
+	require.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
+
+	// Try pause, unpause, exec several times.
+	for i := 1; i <= 4; i++ {
+		err = c.Pause(ctx)
+		require.NoError(t, err)
+
+		if err := c.Unpause(ctx); err != nil {
+			t.Fatalf("unable to unpause container: %s", err)
+		}
+
+		res := c.Exec(ctx, cmd, nil /*=stdio*/)
+		require.NoError(t, res.Error)
+		assert.Equal(t, int64(i), res.VMMetadata.GetSavedSnapshotVersionNumber())
+	}
+}
+
+func TestFirecrackerBalloon_DecreasesMemorySnapshotSize(t *testing.T) {
+	ctx := context.Background()
+
+	// execAndPause runs a memory intensive command in a VM and saves the snapshot.
+	// Returns the number of bytes written to the cache.
+	execAndPause := func(enableBalloon bool) int64 {
+		flags.Set(t, "executor.firecracker_enable_balloon", enableBalloon)
+		metrics.SnapshotRemoteCacheUploadSizeBytes.Reset()
+
+		env := getTestEnv(ctx, t, envOpts{})
+		env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+		rootDir := testfs.MakeTempDir(t)
+		workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+		cfg := getExecutorConfig(t)
+		opts := firecracker.ContainerOpts{
+			ContainerImage:         ubuntuImage,
+			ActionWorkingDirectory: workDir,
+			VMConfiguration: &fcpb.VMConfiguration{
+				NumCpus:            2,
+				MemSizeMb:          500,
+				NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+				ScratchDiskSizeMb:  500,
+				GuestKernelVersion: cfg.GuestKernelVersion,
+				FirecrackerVersion: cfg.FirecrackerVersion,
+				GuestApiVersion:    cfg.GuestAPIVersion,
+			},
+			ExecutorConfig: cfg,
+		}
+		task := &repb.ExecutionTask{
+			Command: &repb.Command{
+				// Note: platform must match in order to share snapshots
+				Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+					{Name: "recycle-runner", Value: "true"},
+				}},
+				Arguments: []string{"./buildbuddy_ci_runner"},
+			},
+		}
+
+		c, err := firecracker.NewContainer(ctx, env, task, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher); err != nil {
+			t.Fatalf("unable to pull image: %s", err)
+		}
+
+		if err := c.Create(ctx, opts.ActionWorkingDirectory); err != nil {
+			t.Fatalf("unable to Create container: %s", err)
+		}
+		t.Cleanup(func() {
+			if err := c.Remove(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		cmd := &repb.Command{
+			// Write a 350MB file of random data.
+			// This will dirty memory in the VM before the data gets written to disk.
+			Arguments: []string{"sh", "-c", `
+dd if=/dev/urandom of=/tmp/bigfile bs=1M count=350
+free -h
+		`},
+		}
+
+		res := c.Exec(ctx, cmd, nil /*=stdio*/)
+		require.NoError(t, res.Error)
+		err = c.Pause(ctx)
+		require.NoError(t, err)
+
+		cachedBytes := testmetrics.CounterValueForLabels(
+			t, metrics.SnapshotRemoteCacheUploadSizeBytes,
+			prometheus.Labels{metrics.FileName: "memory"})
+
+		return int64(cachedBytes)
+	}
+
+	bytesCachedNoBalloon := execAndPause(false)
+	bytesCachedWithBalloon := execAndPause(true)
+
+	require.Less(t, bytesCachedWithBalloon, bytesCachedNoBalloon)
+}
+
 func TestFirecrackerComplexFileMapping(t *testing.T) {
 	numFiles := 100
 	fileSizeBytes := int64(1_000_000)
@@ -1140,7 +2689,7 @@ func TestFirecrackerComplexFileMapping(t *testing.T) {
 	subDirs := []string{"a", "b", "c", "d", "e"}
 	files := make([]string, 0, numFiles)
 
-	for i := 0; i < numFiles; i++ {
+	for range numFiles {
 		rand.Shuffle(len(subDirs), func(i, j int) {
 			subDirs[i], subDirs[j] = subDirs[j], subDirs[i]
 		})
@@ -1178,7 +2727,7 @@ func TestFirecrackerComplexFileMapping(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         minMemSizeMB,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -1209,7 +2758,7 @@ func TestFirecrackerComplexFileMapping(t *testing.T) {
 		assert.Fail(t, "/workspace disk usage was not reported")
 	} else {
 		expectedWorkspaceDev := "/dev/vdc"
-		if *firecracker.EnableRootfs {
+		if snaputil.IsChunkedSnapshotSharingEnabled() {
 			expectedWorkspaceDev = "/dev/vdb"
 		}
 
@@ -1233,7 +2782,7 @@ func TestFirecrackerComplexFileMapping(t *testing.T) {
 	}
 	if rootFSU == nil {
 		assert.Fail(t, "root (/) disk usage was not reported")
-	} else if *firecracker.EnableRootfs {
+	} else if snaputil.IsChunkedSnapshotSharingEnabled() {
 		assert.Equal(t, "ext4", rootFSU.GetFstype())
 		assert.Equal(t, "/dev/vda", rootFSU.GetSource())
 	} else {
@@ -1264,13 +2813,96 @@ func TestFirecrackerComplexFileMapping(t *testing.T) {
 	}
 }
 
+func TestStatsReturnsLatestGuestStatsDuringExec(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	workDir := testfs.MakeTempDir(t)
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	require.NoError(t, err)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+	require.NoError(t, err)
+	err = c.Create(ctx, workDir)
+	require.NoError(t, err)
+	defer func() {
+		err := c.Remove(ctx)
+		require.NoError(t, err)
+	}()
+
+	// Start a command blocked on stdin so the host can read stats while the
+	// guest vmexec server is still streaming live usage samples.
+	execCtx, cancel := context.WithCancel(ctx)
+	stdinReader, stdinWriter := io.Pipe()
+	done := make(chan struct{})
+	var res *interfaces.CommandResult
+	go func() {
+		defer close(done)
+		res = c.Exec(execCtx, &repb.Command{Arguments: []string{"cat"}}, &interfaces.Stdio{Stdin: stdinReader})
+	}()
+	defer func() {
+		cancel()
+		_ = stdinWriter.Close()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("timed out waiting for firecracker exec to stop")
+		}
+	}()
+
+	// Wait until the guest has reported a nonzero memory sample.
+	require.Eventually(t, func() bool {
+		stats, err := c.Stats(ctx)
+		if err != nil {
+			return false
+		}
+		return stats.GetMemoryBytes() > 0
+	}, 10*time.Second, 50*time.Millisecond)
+	select {
+	case <-done:
+		require.Failf(t, "exec completed before live stats were observed", "result: %v", res)
+	default:
+	}
+
+	// Finish the command and call `Stats` again to make sure it still reports
+	// nonzero memory, since we haven't yet torn down the VM.
+	err = stdinWriter.Close()
+	require.NoError(t, err)
+	<-done
+	require.NotNil(t, res)
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode)
+
+	stats, err := c.Stats(ctx)
+	require.NoError(t, err)
+	require.Greater(t, stats.GetMemoryBytes(), int64(0))
+
+	// After Pause tears down the VM, the container is no longer consuming live
+	// resources, so Stats should go back to an empty proto.
+	err = c.Pause(ctx)
+	require.NoError(t, err)
+	stats, err = c.Stats(ctx)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(&repb.UsageStats{}, stats, protocmp.Transform()))
+}
+
 func TestFirecrackerRunWithNetwork(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	flags.Set(t, "executor.network_stats_enabled", true)
 
-	// Make sure the container can send packets to something external of the VM
+	// Make sure the container can send packets to something external to the VM
 	googleDNS := "8.8.8.8"
 	cmd := &repb.Command{Arguments: []string{"ping", "-c1", googleDNS}}
 
@@ -1280,7 +2912,7 @@ func TestFirecrackerRunWithNetwork(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -1298,17 +2930,21 @@ func TestFirecrackerRunWithNetwork(t *testing.T) {
 
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Contains(t, string(res.Stdout), "64 bytes from "+googleDNS)
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
 }
 
-func TestSnapshotAndResumeWithNetwork(t *testing.T) {
+func TestFirecrackerRunWithoutNetwork(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	flags.Set(t, "executor.network_stats_enabled", true)
 
-	// Make sure the container can send packets to something external of the VM
+	// Make sure the container can't send packets to the internet when
+	// NetworkMode is LOCAL.
 	googleDNS := "8.8.8.8"
-	cmd := &repb.Command{Arguments: []string{"ping", "-c1", googleDNS}}
+	cmd := &repb.Command{Arguments: []string{"ping", "-c1", "-W1", googleDNS}}
 
 	opts := firecracker.ContainerOpts{
 		ContainerImage:         busyboxImage,
@@ -1316,13 +2952,92 @@ func TestSnapshotAndResumeWithNetwork(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_LOCAL,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
 	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run will handle the full lifecycle: no need to call Remove() here.
+	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+
+	// Ping should fail because external network is disabled.
+	assert.NotEqual(t, 0, res.ExitCode)
+	// Note: some bytes are sent (the ping request) and received (ICMP reject).
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
+}
+
+func TestFirecrackerResolvConf(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+	// Read the host's resolv.conf to verify the VM receives the same content.
+	hostResolvConf, err := os.ReadFile("/etc/resolv.conf")
 	require.NoError(t, err)
+
+	cmd := &repb.Command{Arguments: []string{"cat", "/etc/resolv.conf"}}
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         minMemSizeMB,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_LOCAL,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+		HostResolvConf: string(hostResolvConf),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	require.NoError(t, err)
+
+	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+	require.NoError(t, res.Error)
+
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, string(hostResolvConf), string(res.Stdout))
+}
+
+func TestSnapshotAndResumeWithNetwork(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	flags.Set(t, "executor.network_stats_enabled", true)
+
+	// Make sure the container can send packets to something external of the VM
+	googleDNS := "8.8.8.8"
+	cmd := &repb.Command{
+		Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+			{Name: "recycle-runner", Value: "true"},
+		}},
+		Arguments: []string{"ping", "-c1", googleDNS},
+	}
+
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         2500,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{Command: cmd}, opts)
+	require.NoError(t, err)
+	require.NoError(t, container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher))
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -1332,8 +3047,11 @@ func TestSnapshotAndResumeWithNetwork(t *testing.T) {
 
 	res := c.Exec(ctx, cmd, &interfaces.Stdio{})
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Contains(t, string(res.Stdout), "64 bytes from "+googleDNS)
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
 
 	err = c.Pause(ctx)
 	require.NoError(t, err)
@@ -1343,11 +3061,107 @@ func TestSnapshotAndResumeWithNetwork(t *testing.T) {
 
 	res = c.Exec(ctx, cmd, &interfaces.Stdio{})
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Contains(t, string(res.Stdout), "64 bytes from "+googleDNS)
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesSent(), int64(100))
+	assert.GreaterOrEqual(t, res.UsageStats.GetNetworkStats().GetBytesReceived(), int64(100))
 
 	err = c.Pause(ctx)
 	require.NoError(t, err)
+}
+
+func TestFirecrackerRunWithNetworkPooling(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+	networkPool := networking.NewVMNetworkPool(-1 /*use default size limit*/)
+	t.Cleanup(func() {
+		err := networkPool.Shutdown(ctx)
+		require.NoError(t, err)
+	})
+
+	for range 3 {
+		googleDNS := "8.8.8.8"
+		cmd := &repb.Command{Arguments: []string{"ping", "-c1", googleDNS}}
+		opts := firecracker.ContainerOpts{
+			ContainerImage:         busyboxImage,
+			ActionWorkingDirectory: workDir,
+			VMConfiguration: &fcpb.VMConfiguration{
+				NumCpus:           1,
+				MemSizeMb:         1000,
+				NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+				ScratchDiskSizeMb: 100,
+			},
+			ExecutorConfig:      getExecutorConfig(t),
+			ExternalNetworkPool: networkPool,
+		}
+		c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+		require.NoError(t, err)
+		res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.ExitCode)
+		assert.Contains(t, string(res.Stdout), "64 bytes from "+googleDNS)
+	}
+}
+
+func TestFirecrackerRunWithNetworkPooling_MixedNetworkModes(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+	externalNetworkPool := networking.NewVMNetworkPool(-1 /*use default size limit*/)
+	localNetworkPool := networking.NewVMNetworkPool(-1 /*use default size limit*/)
+	t.Cleanup(func() {
+		require.NoError(t, externalNetworkPool.Shutdown(ctx))
+		require.NoError(t, localNetworkPool.Shutdown(ctx))
+	})
+
+	newContainer := func(mode fcpb.NetworkMode) *firecracker.FirecrackerContainer {
+		opts := firecracker.ContainerOpts{
+			ContainerImage:         busyboxImage,
+			ActionWorkingDirectory: workDir,
+			VMConfiguration: &fcpb.VMConfiguration{
+				NumCpus:           1,
+				MemSizeMb:         1000,
+				NetworkMode:       mode,
+				ScratchDiskSizeMb: 100,
+			},
+			ExecutorConfig:      getExecutorConfig(t),
+			ExternalNetworkPool: externalNetworkPool,
+			LocalNetworkPool:    localNetworkPool,
+		}
+		c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+		require.NoError(t, err)
+		return c
+	}
+
+	// Run a VM with networking enabled but external networking disabled
+	// (NETWORK_MODE_LOCAL). Its network setup rejects all traffic forwarded
+	// through the host. On teardown the network goes back to a pool.
+	{
+		cmd := &repb.Command{Arguments: []string{"sh", "-c", "true"}}
+		c := newContainer(fcpb.NetworkMode_NETWORK_MODE_LOCAL)
+		res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+		require.NoError(t, res.Error)
+		require.Equal(t, 0, res.ExitCode)
+	}
+
+	// Run a VM with external networking, using the same pools. We expect it
+	// to reach the internet: the loopback-only network pooled by the previous
+	// VM must not be handed to a VM that requested external access.
+	{
+		googleDNS := "8.8.8.8"
+		cmd := &repb.Command{Arguments: []string{"ping", "-c1", "-W2", googleDNS}}
+		c := newContainer(fcpb.NetworkMode_NETWORK_MODE_EXTERNAL)
+		res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+		require.NoError(t, res.Error)
+		assert.Equal(t, 0, res.ExitCode)
+		assert.Contains(t, string(res.Stdout), "64 bytes from "+googleDNS)
+	}
 }
 
 func TestFirecrackerRun_ReapOrphanedZombieProcess(t *testing.T) {
@@ -1364,31 +3178,34 @@ func TestFirecrackerRun_ReapOrphanedZombieProcess(t *testing.T) {
 	})
 	testfs.MakeExecutable(t, workDir, "procinfo")
 
-	// Run a shell subprocess that spawns a "sleep 1" child process in the
-	// background, then exits immediately.
-	// The sleep process should be orphaned once the parent shell exits,
-	// then reparented to pid 1 (init).
-	// Once the sleep process exits, it should be reaped by the init process.
+	// Run a shell subprocess that spawns child process (block) in the
+	// background, and exits immediately. "block" waits for a read on a named
+	// pipe before it exits. "block" should be orphaned once the parent shell
+	// exits, then reparented to pid 1 (init).
+	// Once "block" exits, it should be reaped by the init process.
 
 	cmd := &repb.Command{
 		Arguments: []string{"bash", "-e", "-c", `
+			mkfifo sync_pipe
 			sh -c '
-				sleep 0.1 &
-				printf "%s" "$!" > sleep.pid
+				sh -c "message=''; read message <sync_pipe" &
+				printf "%s" "$!" > block.pid
 
 				echo "Before reparent:"
-				./procinfo "$(cat sleep.pid)"
+				./procinfo "$(cat block.pid)"
 			' &
 			printf "%s" "$!" > sh.pid
 			wait
 
 			echo "After reparent:"
-			./procinfo "$(cat sleep.pid)"
+			./procinfo "$(cat block.pid)"
 
-			sleep 0.2
+			# Tell the child it can exit
+			echo "" >sync_pipe
+
 			echo "After exit:"
 			# Note: procinfo is expected to fail here.
-			./procinfo "$(cat sleep.pid)" || true
+			./procinfo "$(cat block.pid)" || true
 		`},
 	}
 
@@ -1404,7 +3221,11 @@ func TestFirecrackerRun_ReapOrphanedZombieProcess(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"sh.pid", "block.pid"},
+		},
+	}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1415,25 +3236,25 @@ func TestFirecrackerRun_ReapOrphanedZombieProcess(t *testing.T) {
 		t.Fatal(res.Error)
 	}
 	assert.Empty(t, string(res.Stderr))
-	require.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, 0, res.ExitCode)
 
 	initPID := 1
 	shPID := testfs.ReadFileAsString(t, opts.ActionWorkingDirectory, "sh.pid")
-	sleepPID := testfs.ReadFileAsString(t, opts.ActionWorkingDirectory, "sleep.pid")
+	blockPID := testfs.ReadFileAsString(t, opts.ActionWorkingDirectory, "block.pid")
 
 	// Note, state codes are documented here:
 	// https://man7.org/linux/man-pages/man1/ps.1.html#PROCESS_STATE_CODES
 
 	expectedOutput := "Before reparent:\n" +
-		// Just after starting, the sleep process should be in state "S"
+		// Just after starting, the block process should be in state "S"
 		// (sleeping) and still parented to the sh process that spawned it.
-		fmt.Sprintf("%s %s S sleep\n", sleepPID, shPID) +
+		fmt.Sprintf("%s %s S sh\n", blockPID, shPID) +
 		"After reparent:\n" +
 		// After the sh process exits it should have been reparented to pid 1
 		// (init) and still in sleeping state.
-		fmt.Sprintf("%s %d S sleep\n", sleepPID, initPID) +
+		fmt.Sprintf("%s %d S sh\n", blockPID, initPID) +
 		"After exit:\n" +
-		// ps output should be empty after the sleep proces exits.
+		// ps output should be empty after the block proces exits.
 		// If it shows state "Z" ("zombie"), it wasn't properly reaped.
 		""
 
@@ -1444,7 +3265,7 @@ func TestFirecrackerNonRoot(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
 	rootDir := testfs.MakeTempDir(t)
-	ws, err := workspace.New(env, rootDir, &workspace.Opts{NonrootWritable: true})
+	ws, err := workspace.New(env, rootDir, &workspace.Opts{})
 	require.NoError(t, err)
 	cmd := &repb.Command{
 		Arguments: []string{"sh", "-c", `
@@ -1470,7 +3291,7 @@ func TestFirecrackerNonRoot(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         1000,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -1489,6 +3310,50 @@ func TestFirecrackerNonRoot(t *testing.T) {
 	require.Regexp(t, regexp.MustCompile(`uid=[0-9]+\(nobody\) gid=[0-9]+\(nobody\)`), string(res.Stdout))
 }
 
+func TestFirecrackerRunAsNonExistentUser(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	ws, err := workspace.New(env, rootDir, &workspace.Opts{})
+	require.NoError(t, err)
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", `
+			# print out the uid/gid
+			id
+			# make sure the workspace root dir is writable
+			touch foo || exit 1
+			# make sure output directories are writable too
+			touch outputs/bar || exit 1
+			touch nested/outputs/baz || exit 1
+		`},
+		OutputDirectories: []string{"outputs", "nested/outputs"},
+	}
+	ws.SetTask(ctx, &repb.ExecutionTask{Command: cmd})
+	err = ws.CreateOutputDirs()
+	require.NoError(t, err)
+
+	opts := firecracker.ContainerOpts{
+		ContainerImage: busyboxImage,
+		// Numeric uid that doesn't correspond to a real user in /etc/passwd
+		// in the busybox image - this is valid.
+		User:                   "1234",
+		ActionWorkingDirectory: ws.Path(),
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         200,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	require.NoError(t, err)
+	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+	require.NoError(t, res.Error)
+	require.Empty(t, string(res.Stderr))
+	require.Equal(t, 0, res.ExitCode)
+	require.Equal(t, "uid=1234 gid=0(root) groups=0(root)\n", string(res.Stdout))
+}
+
 func TestFirecrackerRunNOPWithZeroDisk(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
@@ -1499,9 +3364,9 @@ func TestFirecrackerRunNOPWithZeroDisk(t *testing.T) {
 		ContainerImage:         busyboxImage,
 		ActionWorkingDirectory: workDir,
 		VMConfiguration: &fcpb.VMConfiguration{
-			NumCpus:          1,
-			MemSizeMb:        2500,
-			EnableNetworking: false,
+			NumCpus:     1,
+			MemSizeMb:   2500,
+			NetworkMode: fcpb.NetworkMode_NETWORK_MODE_OFF,
 			// Request 0 disk; implementation should ensure the disk is at least as big
 			// as is required to run a NOP command. Otherwise, users might have to
 			// keep on top of our min disk requirements which is not really feasible.
@@ -1520,7 +3385,81 @@ func TestFirecrackerRunNOPWithZeroDisk(t *testing.T) {
 	assert.Equal(t, "/workspace\n", string(res.Stdout))
 }
 
-func TestFirecrackerRunWithDockerOverUDS(t *testing.T) {
+func TestFirecrackerRunWithIPv6Enabled(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		// TODO(bduffany): update arm64 image and enable this test
+		t.Skipf("test is not yet supported on arm64")
+	}
+
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", `
+			set -e
+
+			# Test ICMP, both ipv4 and ipv6
+
+			ping -c1 127.0.0.1 >/dev/null
+			ping -c1 8.8.8.8 >/dev/null
+			ping6 -c1 ::1 >/dev/null
+
+			# Test TCP (using HTTP, via httpd), both ipv4 and ipv6
+
+			mkdir -p /tmp/http
+			printf 'hello\n' >/tmp/http/index.html
+			httpd -f -p 18080 -h /tmp/http >/tmp/http/httpd.log 2>&1 &
+			httpd_pid=$!
+			trap 'kill "$httpd_pid"' EXIT
+			check_http() {
+				url="$1"
+				out="$2"
+				ok=false
+				for _ in $(seq 50); do
+					if wget -q -O "$out" "$url"; then
+						ok=true
+						break
+					fi
+					sleep 0.1
+				done
+				if [ "$ok" != "true" ]; then
+					cat /tmp/http/httpd.log >&2 || true
+					exit 1
+				fi
+			}
+
+			check_http http://127.0.0.1:18080/ /tmp/http/out-v4
+			grep -qx 'hello' /tmp/http/out-v4
+
+			check_http http://[::1]:18080/ /tmp/http/out
+			grep -qx 'hello' /tmp/http/out
+			echo ipv4_ipv6_enabled
+		`},
+	}
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         busyboxImage,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         2500,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+			Ipv6Enabled:       true,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	require.NoError(t, err)
+
+	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+	require.NoError(t, res.Error)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, "", string(res.Stderr))
+	assert.Equal(t, "ipv4_ipv6_enabled\n", string(res.Stdout))
+}
+
+func testFirecrackerRunWithDockerOverUDS(t *testing.T, containerImage string) {
 	if *skipDockerTests {
 		t.Skip()
 	}
@@ -1530,15 +3469,17 @@ func TestFirecrackerRunWithDockerOverUDS(t *testing.T) {
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
 	cmd := &repb.Command{
-		Arguments: []string{"bash", "-c", `
+		Arguments: []string{"sh", "-c", `
 			set -e
 
 			# Discard pull output to make the output deterministic
-			docker pull ` + busyboxImage + ` &>/dev/null
+			docker pull ` + busyboxImage + ` >/dev/null 2>&1
 
-			# Try running a few commands
+			# Test basic command
 			docker run --rm ` + busyboxImage + ` echo Hello
-			docker run --rm ` + busyboxImage + ` echo world
+
+			# Test port publishing
+			docker run --rm -p 127.0.0.1:18080:80 ` + busyboxImage + ` echo world
 
 			# Check what storage driver docker is using
 			docker info 2>/dev/null | grep 'Storage Driver'
@@ -1546,12 +3487,12 @@ func TestFirecrackerRunWithDockerOverUDS(t *testing.T) {
 	}
 
 	opts := firecracker.ContainerOpts{
-		ContainerImage:         imageWithDockerInstalled,
+		ContainerImage:         containerImage,
 		ActionWorkingDirectory: workDir,
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			InitDockerd:       true,
 			ScratchDiskSizeMb: 100,
 		},
@@ -1569,12 +3510,39 @@ func TestFirecrackerRunWithDockerOverUDS(t *testing.T) {
 	}
 
 	assert.Equal(t, 0, res.ExitCode)
-	expectedStorageDriver := "vfs"
-	if *firecracker.EnableRootfs {
-		expectedStorageDriver = "overlay2"
+	stdout := string(res.Stdout)
+	if snaputil.IsChunkedSnapshotSharingEnabled() {
+		// Docker may report the native overlay-backed fast path as either the
+		// legacy graphdriver name ("overlay2") or the newer containerd
+		// snapshotter name ("overlayfs"), depending on daemon configuration.
+		assert.Regexp(t, `^Hello\nworld\n Storage Driver: (overlay2|overlayfs)\n$`, stdout, "stdout should contain docker output with a native overlay storage driver")
+	} else {
+		assert.Equal(t, "Hello\nworld\n Storage Driver: vfs\n", stdout, "stdout should contain docker output")
 	}
-	assert.Equal(t, "Hello\nworld\n Storage Driver: "+expectedStorageDriver+"\n", string(res.Stdout), "stdout should contain pwd output")
 	assert.Equal(t, "", string(res.Stderr), "stderr should be empty")
+}
+
+func TestFirecrackerRunWithDockerOverUDS(t *testing.T) {
+	testFirecrackerRunWithDockerOverUDS(t, imageWithDockerInstalled)
+}
+
+func TestFirecrackerRunWithDockerV28OverUDS(t *testing.T) {
+	// docker v28 requires nf_raw in order to bind ports, so this tests that the
+	// 'raw' table is properly set up in the guest.
+	testFirecrackerRunWithDockerOverUDS(t, imageWithDockerV28Installed)
+}
+
+func TestFirecrackerRunWithDockerDindOverUDS(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		// TODO(bduffany): make this work on arm64
+		t.Skipf("test is not yet supported on arm64")
+	}
+
+	// docker:dind has docker but doesn't have iptables-legacy, so this tests
+	// that we've properly set up the newer nftables-based iptables in the
+	// guest. It also tests that we've set up NAT correctly which is also needed
+	// to make this image work.
+	testFirecrackerRunWithDockerOverUDS(t, dockerDindImage)
 }
 
 func TestFirecrackerRunWithDockerOverTCP(t *testing.T) {
@@ -1604,7 +3572,7 @@ func TestFirecrackerRunWithDockerOverTCP(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			InitDockerd:       true,
 			ScratchDiskSizeMb: 100,
 			EnableDockerdTcp:  true,
@@ -1650,7 +3618,7 @@ func TestFirecrackerRunWithDockerOverTCPDisabled(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -1663,6 +3631,117 @@ func TestFirecrackerRunWithDockerOverTCPDisabled(t *testing.T) {
 	// Run will handle the full lifecycle: no need to call Remove() here.
 	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
 	assert.NotEqual(t, 0, res.ExitCode)
+}
+
+func TestFirecrackerRunWithDockerMirror(t *testing.T) {
+	if *skipDockerTests {
+		t.Skip()
+	}
+
+	tests := []struct {
+		name                 string
+		return404            bool
+		expectedRequestCount int32
+	}{
+		{
+			name:                 "pull_busybox_through_mirror",
+			return404:            false,
+			expectedRequestCount: 6,
+		},
+		{
+			name:                 "mirror_404_fallback",
+			return404:            true,
+			expectedRequestCount: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			hostIP, err := networking.DefaultIP(ctx)
+			require.NoError(t, err)
+
+			port := testport.FindFree(t)
+			listenAddr := fmt.Sprintf("%s:%d", hostIP, port)
+			registryHost := fmt.Sprintf("%s:%d", hostIP, port)
+			registryURL := fmt.Sprintf("http://%s", registryHost)
+
+			flags.Set(t, "executor.task_allowed_private_ips", []string{"default"})
+			flags.Set(t, "executor.firecracker_vm_docker_mirrors", []string{registryURL})
+			flags.Set(t, "executor.firecracker_vm_docker_insecure_registries", []string{registryHost})
+
+			te := getTestEnv(ctx, t, envOpts{})
+			flags.Set(t, "app.client_identity.client", interfaces.ClientIdentityExecutor)
+			key, err := random.RandomString(16)
+			require.NoError(t, err)
+			flags.Set(t, "app.client_identity.key", string(key))
+			require.NoError(t, err)
+			err = clientidentity.Register(te)
+			require.NoError(t, err)
+			require.NotNil(t, te.GetClientIdentityService())
+
+			rootDir := testfs.MakeTempDir(t)
+			workDir := testfs.MakeDirAll(t, rootDir, "work")
+
+			ocireg, err := ociregistry.New(te)
+			require.NoError(t, err)
+
+			var mirrorCounter atomic.Int32
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				log.Infof("Received registry request: %s %s", r.Method, r.URL.Path)
+				mirrorCounter.Add(1)
+				if tc.return404 && strings.HasPrefix(r.URL.Path, "/v2/library/") {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				ocireg.ServeHTTP(w, r)
+			})
+
+			server := &http.Server{Handler: handler}
+			lis, err := net.Listen("tcp", listenAddr)
+			require.NoError(t, err)
+			go func() { _ = server.Serve(lis) }()
+			t.Cleanup(func() {
+				server.Shutdown(context.Background())
+			})
+
+			opts := firecracker.ContainerOpts{
+				ContainerImage:         imageWithDockerInstalled,
+				ActionWorkingDirectory: workDir,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:           1,
+					MemSizeMb:         2500,
+					NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
+					InitDockerd:       true,
+					ScratchDiskSizeMb: 100,
+				},
+				ExecutorConfig: getExecutorConfig(t),
+			}
+			c, err := firecracker.NewContainer(ctx, te, &repb.ExecutionTask{}, opts)
+			require.NoError(t, err)
+
+			cmd := &repb.Command{
+				Arguments: []string{
+					"bash",
+					"-c",
+					`set -e
+					docker pull busybox`,
+				},
+			}
+
+			res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+			require.NoError(t, res.Error)
+
+			assert.Equal(t, 0, res.ExitCode)
+			assert.Equal(t, "", string(res.Stderr))
+			stdoutString := strings.Trim(string(res.Stdout), "\n")
+			assert.Truef(t, strings.HasSuffix(stdoutString, "docker.io/library/busybox:latest"), "did not find busyboxy:latest in `%s`", stdoutString)
+
+			actualRequestCount := mirrorCounter.Load()
+			assert.Equal(t, tc.expectedRequestCount, actualRequestCount)
+		})
+	}
 }
 
 func TestFirecrackerVMNotRecycledIfWorkspaceDeviceStillBusy(t *testing.T) {
@@ -1696,7 +3775,7 @@ func TestFirecrackerVMNotRecycledIfWorkspaceDeviceStillBusy(t *testing.T) {
 		err := c.Remove(ctx)
 		require.NoError(t, err)
 	})
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = c.Create(ctx, workDir)
 	require.NoError(t, err)
@@ -1709,7 +3788,7 @@ func TestFirecrackerVMNotRecycledIfWorkspaceDeviceStillBusy(t *testing.T) {
 func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
@@ -1728,9 +3807,16 @@ func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+			}},
+		},
+	}
+	c, err := firecracker.NewContainer(ctx, env, task, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -1740,6 +3826,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 	})
 	res := c.Exec(ctx, &repb.Command{Arguments: []string{"sh", "test1.sh"}}, nil /*=stdio*/)
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "", string(res.Stderr))
 	require.Equal(t, "Hello\n", string(res.Stdout))
 
@@ -1758,16 +3845,16 @@ func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 	require.NoError(t, err)
 
 	res = c.Exec(ctx, &repb.Command{Arguments: []string{"sh", "test2.sh"}}, nil /*=stdio*/)
-
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "", string(res.Stderr))
 	require.Equal(t, "world\n", string(res.Stdout))
 
 	err = c.Pause(ctx)
 	require.NoError(t, err)
 
-	// Try resuming again, to test resuming from a snapshot of a VM which was
-	// itself loaded from snapshot.
+	// Try resuming again. RBE actions won't write new snapshots if one already exists,
+	// so this will load the original snapshot.
 	err = os.Remove(filepath.Join(workDir, "test2.sh"))
 	require.NoError(t, err)
 	testfs.WriteAllFileContents(t, workDir, map[string]string{
@@ -1778,8 +3865,8 @@ func TestFirecrackerExecWithRecycledWorkspaceWithNewContents(t *testing.T) {
 	require.NoError(t, err)
 
 	res = c.Exec(ctx, &repb.Command{Arguments: []string{"sh", "test3.sh"}}, nil /*=stdio*/)
-
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "", string(res.Stderr))
 	require.Equal(t, "world\n", string(res.Stdout))
 
@@ -1794,7 +3881,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
@@ -1810,14 +3897,21 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 			NumCpus:           1,
 			MemSizeMb:         2500,
 			ScratchDiskSizeMb: 4000, // 4 GB
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			InitDockerd:       true,
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"preserves.txt"},
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+			}},
+		},
+	}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -1843,6 +3937,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 	}
 	res := c.Exec(ctx, cmd, nil /*=stdio*/)
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "", string(res.Stderr))
 	require.Equal(t, "Hello\nworld\n", string(res.Stdout))
 
@@ -1879,6 +3974,7 @@ func TestFirecrackerExecWithRecycledWorkspaceWithDocker(t *testing.T) {
 	log.Debugf("Resumed VM and executed docker-in-firecracker command in %s", time.Since(start))
 
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	require.Equal(t, "", string(res.Stderr))
 	require.Equal(t, "world\n", string(res.Stdout))
 	require.Equal(t, 0, res.ExitCode)
@@ -1894,7 +3990,7 @@ func TestFirecrackerExecWithDockerFromSnapshot(t *testing.T) {
 
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
 
@@ -1905,17 +4001,25 @@ func TestFirecrackerExecWithDockerFromSnapshot(t *testing.T) {
 			NumCpus:           1,
 			MemSizeMb:         2500,
 			InitDockerd:       true,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			ScratchDiskSizeMb: 1000,
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	task := &repb.ExecutionTask{
+		Command: &repb.Command{
+			// Note: platform must match in order to share snapshots
+			Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+				{Name: "recycle-runner", Value: "true"},
+			}},
+		},
+	}
+	c, err := firecracker.NewContainer(ctx, env, task, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage); err != nil {
+	if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher); err != nil {
 		t.Fatalf("unable to pull image: %s", err)
 	}
 
@@ -1941,6 +4045,7 @@ func TestFirecrackerExecWithDockerFromSnapshot(t *testing.T) {
 	res := c.Exec(ctx, cmd, nil /*=stdio*/)
 
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(0), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Equal(t, "Hello\n", string(res.Stdout), "stdout should contain expected output")
 	assert.Equal(t, "", string(res.Stderr), "stderr should be empty")
@@ -1962,6 +4067,7 @@ func TestFirecrackerExecWithDockerFromSnapshot(t *testing.T) {
 	res = c.Exec(ctx, cmd, nil /*=stdio*/)
 
 	require.NoError(t, res.Error)
+	assert.Equal(t, int64(1), res.VMMetadata.GetSavedSnapshotVersionNumber())
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Equal(t, "world\n", string(res.Stdout), "stdout should contain expected output")
 	assert.Equal(t, "", string(res.Stderr), "stderr should be empty")
@@ -1983,12 +4089,16 @@ func TestFirecrackerRun_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"output.txt"},
+		},
+	}, opts)
 	require.NoError(t, err)
 
 	cmd := &repb.Command{Arguments: []string{"sh", "-c", `
@@ -1997,7 +4107,7 @@ func TestFirecrackerRun_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		echo output > output.txt
 		sleep infinity
 	`}}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
 
@@ -2027,14 +4137,18 @@ func TestFirecrackerExec_Timeout_DebugOutputIsAvailable(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
 	}
-	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{
+		Command: &repb.Command{
+			OutputPaths: []string{"output.txt"},
+		},
+	}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = c.Create(ctx, opts.ActionWorkingDirectory)
 	require.NoError(t, err)
@@ -2096,7 +4210,7 @@ func TestFirecrackerLargeResult(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           1,
 			MemSizeMb:         2500,
-			EnableNetworking:  false,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
 			ScratchDiskSizeMb: 100,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -2122,7 +4236,7 @@ func TestMergeDiffSnapshot(t *testing.T) {
 
 func testMergeDiffSnapshot(t *testing.T, cow bool) {
 	tmp := testfs.MakeTempDir(t)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		copy_on_write.ResetMmmapedBytesMetricForTest()
 
 		ctx := context.Background()
@@ -2169,7 +4283,7 @@ func testMergeDiffSnapshot(t *testing.T, cow bool) {
 		if cow {
 			env := getTestEnv(ctx, t, envOpts{})
 			dataDir := testfs.MakeDirAll(t, tmp, cowDirName)
-			c, err := copy_on_write.ConvertFileToCOW(ctx, env, basePath, 4096*16, dataDir, "", false /*=remoteEnabled*/)
+			c, err := copy_on_write.ConvertFileToCOW(ctx, env, basePath, 4096*16, dataDir, "", false /*=remoteEnabled*/, snaputil.ConvertToCOWConcurrency)
 			require.NoError(t, err)
 			store = c
 		}
@@ -2205,7 +4319,7 @@ func testMergeDiffSnapshot(t *testing.T, cow bool) {
 // copied into expectedBuf at the same offsets.
 func writeRandomPages(t *testing.T, f *os.File, n int, expectedBuf []byte) {
 	const pageSize = 4096
-	for i := 0; i < n; i++ {
+	for range n {
 		offset := rand.Intn(len(expectedBuf))
 		// Round offset down to page-level resolution
 		offset = (offset / pageSize) * pageSize
@@ -2240,7 +4354,7 @@ func TestFirecrackerExecScriptLoadedFromDisk(t *testing.T) {
 			// value).
 			NumCpus:           1,
 			MemSizeMb:         500,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			ScratchDiskSizeMb: 200,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -2274,7 +4388,7 @@ func TestFirecrackerHealthChecking(t *testing.T) {
 	}
 	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
 	require.NoError(t, err)
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
 	require.NoError(t, err)
 	err = c.Create(ctx, workDir)
 	require.NoError(t, err)
@@ -2295,6 +4409,8 @@ func TestFirecrackerHealthChecking(t *testing.T) {
 	res := c.Exec(ctx, cmd, nil /*=stdio*/)
 	require.True(t, status.IsUnavailableError(res.Error), "expected Unavailable err, got %s", res.Error)
 	require.GreaterOrEqual(t, res.UsageStats.GetPeakMemoryBytes(), int64(0))
+	// The dial duration should be recorded even though the exec failed.
+	require.Greater(t, res.VMMetrics.GetVmExecDialDurationUsec(), int64(0))
 }
 
 func TestFirecrackerStressIO(t *testing.T) {
@@ -2329,14 +4445,14 @@ func TestFirecrackerStressIO(t *testing.T) {
 	)
 	// VM configuration
 	const (
-		cpus       = 4
-		memoryMB   = 800
-		scratchMB  = 800
-		dockerd    = false
-		networking = false
+		cpus      = 4
+		memoryMB  = 800
+		scratchMB = 800
+		dockerd   = false
 	)
+	networkMode := fcpb.NetworkMode_NETWORK_MODE_OFF
 
-	if dockerize && (!dockerd || !networking) {
+	if dockerize && (!dockerd || networkMode == fcpb.NetworkMode_NETWORK_MODE_OFF) {
 		require.FailNow(t, "dockerize option requires dockerd and networking")
 	}
 
@@ -2371,7 +4487,7 @@ func TestFirecrackerStressIO(t *testing.T) {
 				MemSizeMb:         memoryMB,
 				ScratchDiskSizeMb: scratchMB,
 				InitDockerd:       dockerd,
-				EnableNetworking:  networking,
+				NetworkMode:       networkMode,
 			},
 		}
 		c, err := firecracker.NewContainer(ctx, te, &repb.ExecutionTask{}, opts)
@@ -2392,6 +4508,7 @@ func TestFirecrackerStressIO(t *testing.T) {
 			assert.FailNowf(t, "pause failed", "%s", err)
 			return err
 		}
+
 		vm.Runs++
 		if vm.Runs < maxRunsPerVM {
 			pool <- vm
@@ -2443,7 +4560,6 @@ func TestFirecrackerStressIO(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	eg.SetLimit(concurrency)
 	for i := 1; i <= runs; i++ {
-		i := i
 		eg.Go(func() (err error) {
 			if t.Failed() {
 				return nil
@@ -2479,6 +4595,177 @@ func TestFirecrackerStressIO(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func Benchmark_FullSnapshotPause(b *testing.B) {
+	for _, memorySizeMb := range []int64{1000, 2000, 4000, 8000} {
+		b.Run(fmt.Sprintf("memory_size_%d_mb", memorySizeMb), func(b *testing.B) {
+			ctx := context.Background()
+			env := getTestEnv(ctx, b, envOpts{})
+			rootDir := testfs.MakeTempDir(b)
+			cfg := getExecutorConfig(b)
+
+			var containersToCleanup []*firecracker.FirecrackerContainer
+			b.Cleanup(func() {
+				for _, vm := range containersToCleanup {
+					err := vm.Remove(ctx)
+					assert.NoError(b, err)
+				}
+			})
+
+			opts := firecracker.ContainerOpts{
+				ContainerImage: ubuntuImage,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:            2,
+					MemSizeMb:          memorySizeMb,
+					NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_OFF,
+					ScratchDiskSizeMb:  500,
+					GuestKernelVersion: cfg.GuestKernelVersion,
+					FirecrackerVersion: cfg.FirecrackerVersion,
+					GuestApiVersion:    cfg.GuestAPIVersion,
+				},
+				ExecutorConfig: cfg,
+			}
+
+			// Don't try to write the full memory size of the VM, or it will OOM.
+			mbToWrite := int(.8 * float64(memorySizeMb))
+			cmd := &repb.Command{
+				// Mount a RAM-based filesystem to /tmp/randomdata to simulate memory usage.
+				Arguments: []string{"sh", "-c", `
+mkdir /tmp/randomdata && mount -t tmpfs -o size=` + strconv.Itoa(mbToWrite) + `M tmpfs /tmp/randomdata
+dd if=/dev/urandom of=/tmp/randomdata/data bs=1M count=` + strconv.Itoa(mbToWrite) + `
+free -h
+		`},
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				task := &repb.ExecutionTask{
+					Command: &repb.Command{
+						Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+							{Name: "recycle-runner", Value: "true"},
+							// This is testing full snapshot generation, so ensure there's no snapshot sharing between runs.
+							{Name: "salt", Value: fmt.Sprintf("%d_%d", memorySizeMb, i)},
+						}},
+						Arguments: []string{"./buildbuddy_ci_runner"},
+					},
+				}
+
+				workDir := testfs.MakeDirAll(b, rootDir, fmt.Sprintf("work%d", i))
+				opts.ActionWorkingDirectory = workDir
+				c, err := firecracker.NewContainer(ctx, env, task, opts)
+				require.NoError(b, err)
+				containersToCleanup = append(containersToCleanup, c)
+
+				err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher)
+				require.NoError(b, err)
+				err = c.Create(ctx, opts.ActionWorkingDirectory)
+				require.NoError(b, err)
+				res := c.Exec(ctx, cmd, nil /*=stdio*/)
+				require.NoError(b, res.Error)
+
+				b.StartTimer()
+				err = c.Pause(ctx)
+				b.StopTimer()
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+func Benchmark_DiffSnapshotPause(b *testing.B) {
+	// Disable remote snapshot sharing to make caching a bit faster.
+	flags.Set(b, "executor.enable_remote_snapshot_sharing", false)
+
+	for _, memorySizeMb := range []int64{1000, 2000, 4000, 8000} {
+		b.Run(fmt.Sprintf("memory_size_%d_mb", memorySizeMb), func(b *testing.B) {
+			ctx := context.Background()
+			env := getTestEnv(ctx, b, envOpts{})
+			cfg := getExecutorConfig(b)
+			rootDir := testfs.MakeTempDir(b)
+			workDir := testfs.MakeDirAll(b, rootDir, "work")
+
+			opts := firecracker.ContainerOpts{
+				ActionWorkingDirectory: workDir,
+				ContainerImage:         ubuntuImage,
+				VMConfiguration: &fcpb.VMConfiguration{
+					NumCpus:            2,
+					MemSizeMb:          memorySizeMb,
+					NetworkMode:        fcpb.NetworkMode_NETWORK_MODE_OFF,
+					ScratchDiskSizeMb:  500,
+					GuestKernelVersion: cfg.GuestKernelVersion,
+					FirecrackerVersion: cfg.FirecrackerVersion,
+					GuestApiVersion:    cfg.GuestAPIVersion,
+				},
+				ExecutorConfig: cfg,
+			}
+			task := &repb.ExecutionTask{
+				Command: &repb.Command{
+					Platform: &repb.Platform{Properties: []*repb.Platform_Property{
+						{Name: "recycle-runner", Value: "true"},
+						{Name: platform.MinTimeBetweenSnapshotWritesPropertyName, Value: "0s"},
+						{Name: platform.SnapshotSavePolicyPropertyName, Value: platform.AlwaysSaveSnapshot},
+					}},
+					Arguments: []string{"./buildbuddy_ci_runner"},
+				},
+			}
+
+			// Don't try to write the full memory size of the VM, or it will OOM.
+			mbToWrite := int(.8 * float64(memorySizeMb))
+			initialCmd := &repb.Command{
+				// Mount a RAM-based filesystem to /tmp/randomdata. Later we'll write to it to simulate memory usage.
+				Arguments: []string{"sh", "-c", `
+mkdir /tmp/randomdata && mount -t tmpfs -o size=` + strconv.Itoa(mbToWrite) + `M tmpfs /tmp/randomdata
+		`},
+			}
+
+			c, err := firecracker.NewContainer(ctx, env, task, opts)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			if err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, opts.ContainerImage, opts.UseOCIFetcher); err != nil {
+				b.Fatalf("unable to pull image: %s", err)
+			}
+
+			if err := c.Create(ctx, opts.ActionWorkingDirectory); err != nil {
+				b.Fatalf("unable to Create container: %s", err)
+			}
+			b.Cleanup(func() {
+				if err := c.Remove(ctx); err != nil {
+					b.Fatal(err)
+				}
+			})
+
+			// Generate one full snapshot outside of the loop. Within the loop, it will always create a diff snapshot.
+			res := c.Exec(ctx, initialCmd, nil /*=stdio*/)
+			require.NoError(b, res.Error)
+			err = c.Pause(ctx)
+			require.NoError(b, err)
+
+			cmdOnResumedRunner := &repb.Command{
+				// Write to the RAM-based filesystem to simulate memory usage.
+				Arguments: []string{"sh", "-c", `
+dd if=/dev/urandom of=/tmp/randomdata/data bs=1M count=` + strconv.Itoa(mbToWrite) + `
+free -h
+		`},
+			}
+
+			b.ResetTimer()
+			b.StopTimer()
+			for i := 0; i < b.N; i++ {
+				err = c.Unpause(ctx)
+				require.NoError(b, err)
+				res = c.Exec(ctx, cmdOnResumedRunner, nil /*=stdio*/)
+				require.NoError(b, res.Error)
+				b.StartTimer()
+				err = c.Pause(ctx)
+				b.StopTimer()
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
 func TestBazelBuild(t *testing.T) {
 	if !*testBazelBuild {
 		t.Skip()
@@ -2500,7 +4787,7 @@ func TestBazelBuild(t *testing.T) {
 		VMConfiguration: &fcpb.VMConfiguration{
 			NumCpus:           6,
 			MemSizeMb:         8000,
-			EnableNetworking:  true,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_EXTERNAL,
 			ScratchDiskSizeMb: 20_000,
 		},
 		ExecutorConfig: getExecutorConfig(t),
@@ -2549,5 +4836,6 @@ func assertCommandResult(t testing.TB, expected *interfaces.CommandResult, actua
 	actual.UsageStats = nil
 	actual.AuxiliaryLogs = nil
 	actual.VMMetadata = nil
+	actual.VMMetrics = nil
 	assert.Equal(t, expected, actual)
 }

@@ -3,10 +3,12 @@ package testredis
 import (
 	"context"
 	"fmt"
+	"net"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,10 @@ import (
 )
 
 const (
+	// DefaultShardCount is the default number of shards to use when creating a
+	// sharded redis setup.
+	DefaultShardCount = 3
+
 	startupTimeout      = 10 * time.Second
 	startupPingInterval = 5 * time.Millisecond
 )
@@ -159,6 +165,80 @@ func StartTCP(t testing.TB) *Handle {
 	return handle
 }
 
+type RingHandle struct {
+	Shards []*Handle
+}
+
+// StartSharded starts a ring of redis servers with the given number of shards.
+// Set the shard count to 0 to use a reasonable default.
+func StartSharded(t testing.TB, count int) *RingHandle {
+	if count <= 0 {
+		count = DefaultShardCount
+	}
+	ch := make(chan *Handle)
+	for range count {
+		go func() { ch <- Start(t) }()
+	}
+	shards := make([]*Handle, 0, count)
+	for range count {
+		shards = append(shards, <-ch)
+	}
+	return &RingHandle{Shards: shards}
+}
+
+// StartShardedTCP starts a ring of redis servers with the given number of
+// shards, using TCP addresses.
+// Set the shard count to 0 to use a reasonable default.
+func StartShardedTCP(t testing.TB, count int) *RingHandle {
+	if count <= 0 {
+		count = DefaultShardCount
+	}
+	ch := make(chan *Handle)
+	for range count {
+		go func() { ch <- StartTCP(t) }()
+	}
+	shards := make([]*Handle, 0, count)
+	for range count {
+		shards = append(shards, <-ch)
+	}
+	return &RingHandle{Shards: shards}
+}
+
+// Addrs returns the ordered addresses of each shard. This can be used to
+// construct a custom client in cases where the default options used in
+// [RingHandle.Client] are not suitable.
+func (h *RingHandle) Addrs() []string {
+	out := make([]string, 0, len(h.Shards))
+	for _, shard := range h.Shards {
+		out = append(out, shard.Target)
+	}
+	return out
+}
+
+func (h *RingHandle) Client() redis.UniversalClient {
+	addrs := make(map[string]string)
+	for i, shard := range h.Shards {
+		var addr string
+		if shard.socketPath != "" {
+			addr = shard.socketPath
+		} else {
+			addr = fmt.Sprintf("localhost:%d", shard.port)
+		}
+		addrs[fmt.Sprintf("shard%d", i)] = addr
+	}
+	ringOptions := &redis.RingOptions{
+		Addrs: addrs,
+	}
+	if h.Shards[0].socketPath != "" {
+		// The default ring client dialer only allows TCP addresses for some
+		// reason. Use a custom dialer for sockets.
+		ringOptions.Dialer = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return net.Dial("unix", addr)
+		}
+	}
+	return redis.NewRing(ringOptions)
+}
+
 func waitUntilHealthy(t testing.TB, target string) {
 	start := time.Now()
 	ctx := context.Background()
@@ -178,12 +258,59 @@ func waitUntilHealthy(t testing.TB, target string) {
 type logWriter struct{}
 
 func (w *logWriter) Write(b []byte) (int, error) {
-	lines := strings.Split(string(b), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(b), "\n")
+	for line := range lines {
 		if line == "" {
 			continue
 		}
 		log.Infof("[redis server] %s", line)
 	}
 	return len(b), nil
+}
+
+// CommandCounter counts Redis commands matching a command name.
+//
+// Example usage:
+//
+//	counter := testredis.NewCommandCounter("ZRANGE")
+//	rdb.AddHook(counter)
+//	rdb.ZRange(/* ... */)
+//	counter.Count() // returns 1
+type CommandCounter struct {
+	name  string
+	count atomic.Int64
+}
+
+// NewCommandCounter returns a Redis hook that counts commands matching name.
+func NewCommandCounter(name string) *CommandCounter {
+	return &CommandCounter{name: strings.ToLower(name)}
+}
+
+// Count returns the number of matching Redis commands observed.
+func (c *CommandCounter) Count() int64 {
+	return c.count.Load()
+}
+
+func (c *CommandCounter) countCommand(cmd redis.Cmder) {
+	if cmd.Name() != c.name {
+		return
+	}
+	c.count.Add(1)
+}
+
+func (c *CommandCounter) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+func (c *CommandCounter) AfterProcess(ctx context.Context, cmd redis.Cmder) error {
+	c.countCommand(cmd)
+	return nil
+}
+func (c *CommandCounter) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+func (c *CommandCounter) AfterProcessPipeline(ctx context.Context, cmds []redis.Cmder) error {
+	for _, cmd := range cmds {
+		c.countCommand(cmd)
+	}
+	return nil
 }

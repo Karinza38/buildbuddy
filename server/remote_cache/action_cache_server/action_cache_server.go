@@ -1,9 +1,11 @@
 package action_cache_server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -12,20 +14,41 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/chunking"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/hit_tracker"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/capabilities"
+	"github.com/buildbuddy-io/buildbuddy/server/util/findmissing"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
+	"google.golang.org/protobuf/types/known/anypb"
 
-	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
+	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 )
+
+var (
+	checkClientActionResultDigests = flag.Bool("cache.check_client_action_result_digests", false, "If true, the server will check (and honor) the bb-specific cached_action_result_digest field on ActionCache.getActionResult requests to reduce bandwidth")
+	recordOrigin                   = flag.Bool("cache.record_action_result_origin", true, "If true, the origin of the action result will be added to it's auxiliary metadata.")
+)
+
+// chunkCheckConcurrency bounds how many chunked-manifest fallback lookups
+// checkFilesExist performs in parallel. Each lookup issues independent cache
+// reads, so the work is I/O-bound.
+const chunkCheckConcurrency = 8
+
+// Set high enough to avoid affecting normal requests while still preventing
+// abusive fan-out.
+const chunkedTreeReadConcurrency = 32
 
 type ActionCacheServer struct {
 	env   environment.Env
@@ -56,18 +79,78 @@ func NewActionCacheServer(env environment.Env) (*ActionCacheServer, error) {
 	}, nil
 }
 
-func checkFilesExist(ctx context.Context, cache interfaces.Cache, digests []*rspb.ResourceName) error {
-	missing, err := cache.FindMissing(ctx, digests)
+func checkFilesExist(ctx context.Context, cache interfaces.Cache, instanceName string, digestFunction repb.DigestFunction_Value, maxChunkSizeBytes int64, digests []*rspb.ResourceName) error {
+	missing, err := cache.FindMissing(findmissing.ContextWithPurpose(ctx, repb.FindMissingBlobsRequest_AC_VALIDATION), digests)
 	if err != nil {
 		return err
 	}
-	if len(missing) > 0 {
-		return status.NotFoundErrorf("ActionResult output file: '%s' not found in cache", missing[0])
+	if len(missing) == 0 {
+		return nil
 	}
-	return nil
+	for _, d := range missing {
+		if d.GetSizeBytes() <= maxChunkSizeBytes {
+			return status.NotFoundErrorf("ActionResult output file %q not found in cache", digest.String(d))
+		}
+	}
+	checker := chunking.NewMissingChunkChecker(cache, repb.FindMissingBlobsRequest_AC_MISSING_CHUNK_VALIDATION)
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(chunkCheckConcurrency)
+	for _, d := range missing {
+		eg.Go(func() error {
+			manifest, err := chunking.LoadManifest(egCtx, cache, d, instanceName, digestFunction)
+			if err != nil {
+				return status.WrapErrorf(err, "ActionResult output file %q: load chunk manifest", digest.String(d))
+			}
+			anyMissing, err := checker.AnyChunkMissing(egCtx, manifest)
+			if err != nil {
+				return status.WrapErrorf(err, "ActionResult output file %q: failed to check chunks", digest.String(d))
+			}
+			if anyMissing {
+				return status.NotFoundErrorf("ActionResult output file %q: missing chunks", digest.String(d))
+			}
+			return nil
+		})
+	}
+	return eg.Wait()
+}
+
+func readOutputTree(ctx context.Context, cache interfaces.Cache, instanceName string, digestFunction repb.DigestFunction_Value, maxChunkSizeBytes int64, chunkedReadLimiter *semaphore.Weighted, treeDigest *repb.Digest) (*repb.Tree, error) {
+	rn := digest.NewResourceName(treeDigest, instanceName, rspb.CacheType_CAS, digestFunction).ToProto()
+	blob, err := cache.Get(ctx, rn)
+	if err != nil {
+		isNotFound := status.IsNotFoundError(err) || os.IsNotExist(err)
+		treeSizeBytes := treeDigest.GetSizeBytes()
+		if !isNotFound ||
+			treeSizeBytes <= maxChunkSizeBytes ||
+			treeSizeBytes > rpcutil.GRPCMaxSizeBytes {
+			return nil, err
+		}
+		// Avoid unbounded fan-out across chunked Tree reconstructions.
+		if err := chunkedReadLimiter.Acquire(ctx, 1); err != nil {
+			return nil, err
+		}
+		defer chunkedReadLimiter.Release(1)
+		blob, err = chunking.GetBlob(ctx, cache, treeDigest, instanceName, rn.GetDigestFunction(), repb.Compressor_IDENTITY)
+		if err != nil {
+			return nil, err
+		}
+		computedDigest, err := digest.Compute(bytes.NewReader(blob), rn.GetDigestFunction())
+		if err != nil {
+			return nil, err
+		}
+		if !digest.Equal(computedDigest, treeDigest) {
+			return nil, status.DataLossErrorf("reconstructed output Tree digest %s does not match expected %s", digest.String(computedDigest), digest.String(treeDigest))
+		}
+	}
+	tree := &repb.Tree{}
+	if err := proto.Unmarshal(blob, tree); err != nil {
+		return nil, err
+	}
+	return tree, nil
 }
 
 func ValidateActionResult(ctx context.Context, cache interfaces.Cache, remoteInstanceName string, digestFunction repb.DigestFunction_Value, r *repb.ActionResult) error {
+	maxChunkSizeBytes := chunking.MaxChunkSizeBytes()
 	outputFileDigests := make([]*rspb.ResourceName, 0, len(r.OutputFiles))
 	mu := &sync.Mutex{}
 	appendDigest := func(d *repb.Digest) {
@@ -83,16 +166,12 @@ func ValidateActionResult(ctx context.Context, cache interfaces.Cache, remoteIns
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
+	chunkedTreeReadLimiter := semaphore.NewWeighted(chunkedTreeReadConcurrency)
 	for _, d := range r.OutputDirectories {
 		dc := d
 		g.Go(func() error {
-			rn := digest.NewResourceName(dc.GetTreeDigest(), remoteInstanceName, rspb.CacheType_CAS, digestFunction).ToProto()
-			blob, err := cache.Get(gCtx, rn)
+			tree, err := readOutputTree(gCtx, cache, remoteInstanceName, digestFunction, maxChunkSizeBytes, chunkedTreeReadLimiter, dc.GetTreeDigest())
 			if err != nil {
-				return err
-			}
-			tree := &repb.Tree{}
-			if err := proto.Unmarshal(blob, tree); err != nil {
 				return err
 			}
 			for _, f := range tree.GetRoot().GetFiles() {
@@ -110,10 +189,10 @@ func ValidateActionResult(ctx context.Context, cache interfaces.Cache, remoteIns
 		return err
 	}
 
-	return checkFilesExist(ctx, cache, outputFileDigests)
+	return checkFilesExist(ctx, cache, remoteInstanceName, digestFunction, maxChunkSizeBytes, outputFileDigests)
 }
 
-func setWorkerMetadata(ar *repb.ActionResult) error {
+func setWorkerMetadata(ar *repb.ActionResult) {
 	if ar.ExecutionMetadata == nil {
 		ar.ExecutionMetadata = &repb.ExecutedActionMetadata{
 			// This will return the Host ID in the normal case and
@@ -124,7 +203,87 @@ func setWorkerMetadata(ar *repb.ActionResult) error {
 			Worker: hostid.GetFailsafeHostID(""),
 		}
 	}
+}
+
+func setOriginMetadata(ar *repb.ActionResult, rm *repb.RequestMetadata) error {
+	if !*recordOrigin {
+		return nil
+	}
+	if ar == nil {
+		return nil
+	}
+	invocationID := rm.GetToolInvocationId()
+	if invocationID == "" {
+		return nil
+	}
+
+	om := &repb.OriginMetadata{InvocationId: invocationID}
+	am, err := anypb.New(om)
+	if err != nil {
+		return err
+	}
+	if ar.GetExecutionMetadata() == nil {
+		ar.ExecutionMetadata = &repb.ExecutedActionMetadata{}
+	}
+	ar.GetExecutionMetadata().AuxiliaryMetadata = append(ar.GetExecutionMetadata().GetAuxiliaryMetadata(), am)
 	return nil
+}
+
+// RecordActionResultOriginEnabled reports whether origin metadata should be recorded
+// and exposed to clients.
+func RecordActionResultOriginEnabled() bool {
+	return *recordOrigin
+}
+
+func (s *ActionCacheServer) fetchActionResult(ctx context.Context, rn *digest.ACResourceName, req *repb.GetActionResultRequest) (*repb.ActionResult, *repb.ExecutedActionMetadata, int64, error) {
+	blob, err := s.cache.Get(ctx, rn.ToProto())
+	if err != nil {
+		return nil, nil, 0, status.NotFoundErrorf("ActionResult (%s) not found: %s", req.GetActionDigest(), err)
+	}
+
+	rsp := &repb.ActionResult{}
+	if err := proto.Unmarshal(blob, rsp); err != nil {
+		return nil, nil, 0, err
+	}
+
+	if err := ValidateActionResult(ctx, s.cache, req.GetInstanceName(), req.GetDigestFunction(), rsp); err != nil {
+		return nil, nil, 0, status.NotFoundErrorf("ActionResult (%s) not found: %s", req.GetActionDigest(), err)
+	}
+	// The default limit on incoming gRPC messages is 4MB and Bazel doesn't
+	// change it.
+	if err := s.maybeInlineOutputFiles(ctx, req, rsp, 4*1024*1024); err != nil {
+		return nil, nil, 0, err
+	}
+
+	if !req.GetIncludeTimelineData() && rsp.GetExecutionMetadata().GetUsageStats() != nil {
+		rsp.GetExecutionMetadata().GetUsageStats().Timeline = nil
+	}
+
+	// See if the caller specified a cached value.  If they did and it matches
+	// the full response that we just computed, then we won't bother sending the
+	// data, and instead just tell the caller that their cache is correct.
+	if *checkClientActionResultDigests && req.GetCachedActionResultDigest().GetHash() != "" {
+		d, err := digest.ComputeForMessage(rsp, req.GetDigestFunction())
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		// NOTE: To avoid double-counting AC hits, callers that specify a
+		// cached_action_result_digest don't do hit tracking on their own.  This
+		// means we need to track the full response size here instead.
+
+		originalMetadata := rsp.GetExecutionMetadata()
+		originalResultSize := int64(proto.Size(rsp))
+
+		// Now that we've tracked size and metadata, wipe out the response.
+		if proto.Equal(req.GetCachedActionResultDigest(), d) {
+			rsp = &repb.ActionResult{
+				ActionResultDigest: d,
+			}
+		}
+		return rsp, originalMetadata, originalResultSize, nil
+	}
+
+	return rsp, rsp.GetExecutionMetadata(), int64(proto.Size(rsp)), nil
 }
 
 // Retrieve a cached execution result.
@@ -143,46 +302,35 @@ func (s *ActionCacheServer) GetActionResult(ctx context.Context, req *repb.GetAc
 	if req.ActionDigest == nil {
 		return nil, status.InvalidArgumentError("ActionDigest is a required field")
 	}
-	rn := digest.NewResourceName(req.GetActionDigest(), req.GetInstanceName(), rspb.CacheType_AC, req.GetDigestFunction())
+	rn := digest.NewACResourceName(req.GetActionDigest(), req.GetInstanceName(), req.GetDigestFunction())
 	if err := rn.Validate(); err != nil {
 		return nil, err
 	}
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
 	}
+	if err := authutil.ValidateRestrictedACAccess(ctx, s.env, req.GetInstanceName()); err != nil {
+		return nil, err
+	}
 
-	ht := hit_tracker.NewHitTracker(ctx, s.env, true)
+	ht := s.env.GetHitTrackerFactory().NewACHitTracker(ctx, bazel_request.GetRequestMetadata(ctx))
 	// Fetch the "ActionResult" object which enumerates all the files in the action.
 	d := req.GetActionDigest()
 	downloadTracker := ht.TrackDownload(d)
-	blob, err := s.cache.Get(ctx, rn.ToProto())
-	if err != nil {
-		if err := ht.TrackMiss(d); err != nil {
-			log.Debugf("GetActionResult: hit tracker error: %s", err)
-		}
-		return nil, status.NotFoundErrorf("ActionResult (%s) not found: %s", d, err)
-	}
-	defer func() {
-		if err := downloadTracker.CloseWithBytesTransferred(int64(len(blob)), int64(len(blob)), repb.Compressor_IDENTITY, "ac_server"); err != nil {
-			log.Debugf("GetActionResult: download tracker error: %s", err)
-		}
-	}()
 
-	rsp := &repb.ActionResult{}
-	if err := proto.Unmarshal(blob, rsp); err != nil {
-		return nil, err
+	rsp, metadata, downloadSizeBytes, err := s.fetchActionResult(ctx, rn, req)
+	ht.SetExecutedActionMetadata(metadata)
+	if err == nil {
+		if trackerErr := downloadTracker.CloseWithBytesTransferred(downloadSizeBytes, downloadSizeBytes, repb.Compressor_IDENTITY, "ac_server"); trackerErr != nil {
+			log.Debugf("GetActionResult: download tracker error: %s", trackerErr)
+		}
+	} else {
+		if trackerErr := ht.TrackMiss(d); trackerErr != nil {
+			log.Debugf("GetActionResult: hit tracker error: %s", trackerErr)
+		}
 	}
-	ht.SetExecutedActionMetadata(rsp.GetExecutionMetadata())
-	if err := ValidateActionResult(ctx, s.cache, req.GetInstanceName(), req.GetDigestFunction(), rsp); err != nil {
-		return nil, status.NotFoundErrorf("ActionResult (%s) not found: %s", d, err)
-	}
-	// The default limit on incoming gRPC messages is 4MB and Bazel doesn't
-	// change it.
-	if err := s.maybeInlineOutputFiles(ctx, req, rsp, 4*1024*1024); err != nil {
-		return nil, err
-	}
-	return rsp, nil
+	return rsp, err
 }
 
 // Upload a new execution result.
@@ -212,12 +360,12 @@ func (s *ActionCacheServer) UpdateActionResult(ctx context.Context, req *repb.Up
 	if err := rn.Validate(); err != nil {
 		return nil, err
 	}
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
 	}
 
-	canWrite, err := capabilities.IsGranted(ctx, s.env, akpb.ApiKey_CACHE_WRITE_CAPABILITY)
+	canWrite, err := capabilities.IsGranted(ctx, s.env.GetAuthenticator(), cappb.Capability_CACHE_WRITE)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +374,12 @@ func (s *ActionCacheServer) UpdateActionResult(ctx context.Context, req *repb.Up
 		return req.ActionResult, nil
 	}
 
-	ht := hit_tracker.NewHitTracker(ctx, s.env, true)
+	if err := authutil.ValidateRestrictedACAccess(ctx, s.env, req.GetInstanceName()); err != nil {
+		return nil, err
+	}
+
+	rm := bazel_request.GetRequestMetadata(ctx)
+	ht := s.env.GetHitTrackerFactory().NewACHitTracker(ctx, rm)
 	ht.SetExecutedActionMetadata(req.GetActionResult().GetExecutionMetadata())
 	d := req.GetActionDigest()
 	acResource := digest.NewResourceName(d, req.GetInstanceName(), rspb.CacheType_AC, req.GetDigestFunction())
@@ -234,7 +387,9 @@ func (s *ActionCacheServer) UpdateActionResult(ctx context.Context, req *repb.Up
 
 	// Context: https://github.com/bazelbuild/remote-apis/pull/131
 	// More: https://github.com/buchgr/bazel-remote/commit/7de536f47bf163fb96bc1e38ffd5e444e2bcaa00
-	if err := setWorkerMetadata(req.ActionResult); err != nil {
+	setWorkerMetadata(req.GetActionResult())
+
+	if err := setOriginMetadata(req.GetActionResult(), rm); err != nil {
 		return nil, err
 	}
 
@@ -265,7 +420,8 @@ func (s *ActionCacheServer) maybeInlineOutputFiles(ctx context.Context, req *rep
 
 	budget := int64(max(0, maxResultSize-proto.Size(ar)))
 	var filesToInline []*repb.OutputFile
-	for i, f := range ar.OutputFiles {
+	inlinedBytes := int64(0)
+	for _, f := range ar.OutputFiles {
 		if _, ok := requestedFiles[f.Path]; !ok {
 			continue
 		}
@@ -276,12 +432,6 @@ func (s *ActionCacheServer) maybeInlineOutputFiles(ctx context.Context, req *rep
 			continue
 		}
 
-		if i == 0 {
-			// Bazel only requests inlining for a single file and we may exit
-			// this loop early, so don't track sizes for the other files.
-			metrics.CacheRequestedInlineSizeBytes.With(prometheus.Labels{}).Observe(float64(contentsSize))
-		}
-
 		// An additional "contents" field requires 1 byte for the tag field
 		// (5:LEN), the bytes for the varint encoding of the length of the
 		// contents and the contents themselves.
@@ -289,17 +439,20 @@ func (s *ActionCacheServer) maybeInlineOutputFiles(ctx context.Context, req *rep
 		if budget < totalSize {
 			continue
 		}
+		inlinedBytes += contentsSize
 		budget -= totalSize
 		filesToInline = append(filesToInline, f)
 	}
+
+	metrics.CacheRequestedInlineSizeBytes.With(prometheus.Labels{}).Observe(float64(inlinedBytes))
 
 	if len(filesToInline) == 0 {
 		return nil
 	}
 
-	ht := hit_tracker.NewHitTracker(ctx, s.env, false)
+	ht := s.env.GetHitTrackerFactory().NewCASHitTracker(ctx, bazel_request.GetRequestMetadata(ctx))
 	resourcesToInline := make([]*rspb.ResourceName, 0, len(filesToInline))
-	downloadTrackers := make([]*hit_tracker.TransferTimer, 0, len(filesToInline))
+	downloadTrackers := make([]interfaces.TransferTimer, 0, len(filesToInline))
 	for _, f := range filesToInline {
 		resourcesToInline = append(resourcesToInline, digest.NewResourceName(f.GetDigest(), req.GetInstanceName(), rspb.CacheType_CAS, req.GetDigestFunction()).ToProto())
 		downloadTrackers = append(downloadTrackers, ht.TrackDownload(f.GetDigest()))

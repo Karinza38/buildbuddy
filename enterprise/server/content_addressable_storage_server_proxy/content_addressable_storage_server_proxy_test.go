@@ -1,24 +1,41 @@
 package content_addressable_storage_server_proxy
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/atime_updater"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/byte_stream_server_proxy"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/content_addressable_storage_server"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/cas"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/jonboulle/clockwork"
+	"github.com/open-feature/go-sdk/openfeature"
+	"github.com/open-feature/go-sdk/openfeature/memprovider"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
@@ -36,17 +53,8 @@ const (
 	atimeUpdatePeriod = time.Minute
 )
 
-// The real AtimeUpdater makes RPCs which may interfere with tests.
-type noOpAtimeUpdater struct{}
-
-func (a *noOpAtimeUpdater) Enqueue(_ context.Context, _ string, _ []*repb.Digest, _ repb.DigestFunction_Value) {
-}
-func (a *noOpAtimeUpdater) EnqueueByResourceName(_ context.Context, _ string) {}
-func (a *noOpAtimeUpdater) EnqueueByFindMissingRequest(_ context.Context, _ *repb.FindMissingBlobsRequest) {
-}
-
 func requestCountingUnaryInterceptor(count *atomic.Int32) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		count.Add(1)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
@@ -59,7 +67,7 @@ func requestCountingStreamInterceptor(count *atomic.Int32) grpc.StreamClientInte
 	}
 }
 
-func runRemoteCASS(ctx context.Context, env *testenv.TestEnv, t *testing.T) (*grpc.ClientConn, *atomic.Int32, *atomic.Int32) {
+func runRemoteCASS(ctx context.Context, env *testenv.TestEnv, t testing.TB) (*grpc.ClientConn, *atomic.Int32, *atomic.Int32) {
 	casServer, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
 	require.NoError(t, err)
 	bsServer, err := byte_stream_server.NewByteStreamServer(env)
@@ -78,27 +86,21 @@ func runRemoteCASS(ctx context.Context, env *testenv.TestEnv, t *testing.T) (*gr
 	return conn, &unaryRequestCounter, &streamRequestCounter
 }
 
-func runLocalCASS(ctx context.Context, env *testenv.TestEnv, t *testing.T) (bspb.ByteStreamClient, repb.ContentAddressableStorageClient) {
-	bs, err := byte_stream_server.NewByteStreamServer(env)
-	require.NoError(t, err)
+func runLocalCASS(ctx context.Context, env *testenv.TestEnv, t testing.TB) repb.ContentAddressableStorageServer {
 	cas, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
 	require.NoError(t, err)
-	grpcServer, runFunc, lis := testenv.RegisterLocalInternalGRPCServer(t, env)
-	repb.RegisterContentAddressableStorageServer(grpcServer, cas)
-	bspb.RegisterByteStreamServer(grpcServer, bs)
-	go runFunc()
-	conn, err := testenv.LocalInternalGRPCConn(ctx, lis)
-	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
-	return bspb.NewByteStreamClient(conn), repb.NewContentAddressableStorageClient(conn)
+	return cas
 }
 
-func runCASProxy(ctx context.Context, clientConn *grpc.ClientConn, env *testenv.TestEnv, t *testing.T) *grpc.ClientConn {
+func runCASProxy(ctx context.Context, clientConn *grpc.ClientConn, env *testenv.TestEnv, t testing.TB) *grpc.ClientConn {
 	env.SetByteStreamClient(bspb.NewByteStreamClient(clientConn))
 	env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(clientConn))
-	bs, cas := runLocalCASS(ctx, env, t)
-	env.SetLocalByteStreamClient(bs)
-	env.SetLocalCASClient(cas)
+	bss, err := byte_stream_server.NewByteStreamServer(env)
+	require.NoError(t, err)
+	env.SetLocalByteStreamServer(bss)
+	cas, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
+	require.NoError(t, err)
+	env.SetLocalCASServer(cas)
 	casServer, err := New(env)
 	require.NoError(t, err)
 	bsServer, err := byte_stream_server_proxy.New(env)
@@ -183,7 +185,7 @@ func read(ctx context.Context, client repb.ContentAddressableStorageClient, dige
 	require.Equal(t, expectedCount, actualCount)
 }
 
-func update(ctx context.Context, client repb.ContentAddressableStorageClient, blobs map[*repb.Digest]string, t *testing.T) {
+func update(ctx context.Context, client repb.ContentAddressableStorageClient, blobs map[*repb.Digest]string, t testing.TB) {
 	resp, err := client.BatchUpdateBlobs(ctx, updateBlobsRequest(blobs))
 	require.NoError(t, err)
 	require.Equal(t, len(blobs), len(resp.Responses))
@@ -192,14 +194,44 @@ func update(ctx context.Context, client repb.ContentAddressableStorageClient, bl
 	}
 }
 
-func expectAtimeUpdate(t *testing.T, clock clockwork.FakeClock, requestCount *atomic.Int32) {
+func TestBatchUpdateBlobsCompressorMetricsLabelsAreBounded(t *testing.T) {
+	cm := newCacheMetrics().addUpdateMetrics([]*repb.BatchUpdateBlobsRequest_Request{
+		{Compressor: repb.Compressor_IDENTITY, Data: []byte("a")},
+		{Compressor: repb.Compressor_ZSTD, Data: []byte("bb")},
+		{Compressor: repb.Compressor_Value(123), Data: []byte("ccc")},
+		{Compressor: repb.Compressor_Value(456), Data: []byte("dddd")},
+	})
+
+	gotDigests := map[string]int{}
+	gotBytes := map[string]int{}
+	for _, byCompressor := range cm.digestsPerStatusAndCompressor {
+		maps.Copy(gotDigests, byCompressor)
+	}
+	for _, byCompressor := range cm.bytesPerStatusAndCompressor {
+		maps.Copy(gotBytes, byCompressor)
+	}
+	require.Equal(t, map[string]int{"IDENTITY": 1, "ZSTD": 1, "unknown": 2}, gotDigests)
+	require.Equal(t, map[string]int{"IDENTITY": 1, "ZSTD": 2, "unknown": 7}, gotBytes)
+}
+
+func expectAtimeUpdate(t *testing.T, clock *clockwork.FakeClock, requestCount *atomic.Int32) {
 	requestCount.Store(0)
-	clock.Advance(atimeUpdatePeriod + time.Second)
 	wait := time.Millisecond
-	for i := 0; i < 7; i++ {
+	for range 10 {
+		// The read that enqueued this atime update is processed asynchronously
+		// by the batcher goroutine, so the pending batch may not be ready when
+		// the sender's flush fires. Advance the clock on every iteration (rather
+		// than only once up front) so that a later tick still flushes the update
+		// once the batcher has caught up.
+		clock.Advance(atimeUpdatePeriod + time.Second)
 		time.Sleep(wait)
 		wait = wait * 2
-		if requestCount.Load() == 1 {
+		// A single read can enqueue multiple digests (e.g. read(foo, baz)
+		// updates the atime of both). If the batcher splits them across
+		// pending batches, they may flush on separate ticks, so more than one
+		// update RPC can be observed here. Accept >= 1 rather than == 1 so we
+		// don't spuriously fail when a second flush has already landed.
+		if requestCount.Load() >= 1 {
 			requestCount.Store(0)
 			return
 		}
@@ -207,17 +239,21 @@ func expectAtimeUpdate(t *testing.T, clock clockwork.FakeClock, requestCount *at
 	t.Fatal("Timed out waiting for remote atime update")
 }
 
-func expectNoAtimeUpdate(t *testing.T, clock clockwork.FakeClock, requestCount *atomic.Int32) {
+func expectNoAtimeUpdate(t *testing.T, clock *clockwork.FakeClock, requestCount *atomic.Int32) {
 	requestCount.Store(0)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		clock.Advance(atimeUpdatePeriod + time.Second)
 		time.Sleep(5 * time.Millisecond)
 	}
 	require.Equal(t, int32(0), requestCount.Load())
 }
 
+func testContext() context.Context {
+	return metadata.NewOutgoingContext(context.Background(), metadata.Pairs(authutil.ClientIdentityHeaderName, "fakeheader"))
+}
+
 func TestFindMissingBlobs(t *testing.T) {
-	ctx := context.Background()
+	ctx := testContext()
 	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
 	proxyEnv := testenv.GetTestEnv(t)
 	clock := clockwork.NewFakeClock()
@@ -235,27 +271,241 @@ func TestFindMissingBlobs(t *testing.T) {
 		findMissing(ctx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{fooDigestProto}, t)
 		require.Equal(t, int32(i), requestCount.Load())
 	}
-	expectAtimeUpdate(t, clock, requestCount)
+	expectNoAtimeUpdate(t, clock, requestCount)
 
 	update(ctx, proxy, map[*repb.Digest]string{barDigestProto: "bar"}, t)
 
 	requestCount.Store(0)
 	for i := 1; i < 10; i++ {
 		findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
-		require.Equal(t, int32(0), requestCount.Load())
+		require.Equal(t, int32(i), requestCount.Load())
 	}
-	expectAtimeUpdate(t, clock, requestCount)
+	expectNoAtimeUpdate(t, clock, requestCount)
 
 	requestCount.Store(0)
 	for i := 1; i < 10; i++ {
 		findMissing(ctx, proxy, []*repb.Digest{fooDigestProto, barDigestProto}, []*repb.Digest{fooDigestProto}, t)
 		require.Equal(t, int32(i), requestCount.Load())
 	}
-	expectAtimeUpdate(t, clock, requestCount)
+	expectNoAtimeUpdate(t, clock, requestCount)
+}
+
+func TestFindMissingBlobs_SkipRemote(t *testing.T) {
+	ctx := testContext()
+	remoteConn, _, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyEnv := testenv.GetTestEnv(t)
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(remoteConn))
+	require.NoError(t, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, remoteConn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	digestA := digestProto(fooDigest, 3)
+	digestB := digestProto(foofDigest, 4)
+	digestC := digestProto(barDigest, 3)
+
+	// Write digests A and B to the remote cache
+	remote := proxyEnv.GetContentAddressableStorageClient()
+	_, err := remote.BatchUpdateBlobs(ctx, updateBlobsRequest(map[*repb.Digest]string{digestA: "foo", digestB: "foof"}))
+	require.NoError(t, err)
+
+	// Write digests B and C to the local cache
+	local := proxyEnv.GetLocalCASServer()
+	_, err = local.BatchUpdateBlobs(ctx, updateBlobsRequest(map[*repb.Digest]string{digestB: "foof", digestC: "bar"}))
+	require.NoError(t, err)
+
+	// If hitting the remote cache, FindMissing(A, C) should return digest C
+	req := findMissingBlobsRequest([]*repb.Digest{digestA, digestC})
+	rsp, err := proxy.FindMissingBlobs(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(rsp.MissingBlobDigests))
+	require.Equal(t, digestC.GetHash(), rsp.MissingBlobDigests[0].Hash)
+
+	// If only hitting the local proxy cache, FindMissing(A, C) should return digest A
+	skipRemoteCtx := metadata.AppendToOutgoingContext(ctx, proxy_util.SkipRemoteKey, "true")
+	rsp, err = proxy.FindMissingBlobs(skipRemoteCtx, req)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(rsp.MissingBlobDigests))
+	require.Equal(t, digestA.GetHash(), rsp.MissingBlobDigests[0].Hash)
+}
+
+func TestFindMissingBlobs_Caching(t *testing.T) {
+	ttl := 30 * time.Second
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", ttl)
+	ctx := testContext()
+	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyEnv := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClock()
+	proxyEnv.SetClock(clock)
+	proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	flags.Set(t, "cache_proxy.remote_atime_update_interval", atimeUpdatePeriod)
+	require.NoError(t, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	// The FindMissingBlobs cache is only used for authenticated requests.
+	ctx = metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+
+	fooDigestProto := digestProto(fooDigest, 3)
+	barDigestProto := digestProto(barDigest, 3)
+
+	update(ctx, proxy, map[*repb.Digest]string{barDigestProto: "bar"}, t)
+	requestCount.Store(0)
+
+	// The first check for a present blob goes to the remote; repeat checks
+	// within the TTL are served from the local cache.
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(1), requestCount.Load())
+	for range 5 {
+		findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	}
+	require.Equal(t, int32(1), requestCount.Load())
+
+	// Missing blobs are never cached.
+	for i := 1; i <= 3; i++ {
+		findMissing(ctx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{fooDigestProto}, t)
+		require.Equal(t, int32(1+i), requestCount.Load())
+	}
+
+	// Mixed requests are partially served from the cache.
+	findMissing(ctx, proxy, []*repb.Digest{fooDigestProto, barDigestProto}, []*repb.Digest{fooDigestProto}, t)
+	require.Equal(t, int32(5), requestCount.Load())
+
+	// Once the TTL expires, cached blobs are re-checked against the remote.
+	clock.Advance(ttl + time.Second)
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(6), requestCount.Load())
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(6), requestCount.Load())
+
+	// Empty requests are served without a remote call.
+	findMissing(ctx, proxy, []*repb.Digest{}, []*repb.Digest{}, t)
+	require.Equal(t, int32(6), requestCount.Load())
+}
+
+func TestFindMissingBlobs_CachingSeparatesChunksAndBlobs(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", 30*time.Second)
+	ctx := testContext()
+	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyEnv := testenv.GetTestEnv(t)
+	proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	require.NoError(t, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	fooDigestProto := digestProto(fooDigest, 3)
+	barDigestProto := digestProto(barDigest, 3)
+	remote := repb.NewContentAddressableStorageClient(conn)
+	update(ctx, remote, map[*repb.Digest]string{fooDigestProto: "foo", barDigestProto: "bar"}, t)
+	requestCount.Store(0)
+
+	blobCtx := metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+	chunkCtx := cdc.ContextWithChunked(blobCtx)
+
+	findMissing(blobCtx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(1), requestCount.Load())
+	findMissing(blobCtx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(1), requestCount.Load())
+
+	// A whole-blob cache entry cannot satisfy a chunk lookup.
+	findMissing(chunkCtx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(2), requestCount.Load())
+	findMissing(chunkCtx, proxy, []*repb.Digest{fooDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(2), requestCount.Load())
+
+	findMissing(chunkCtx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(3), requestCount.Load())
+
+	// A whole-blob lookup falls back to the chunk cache.
+	chunkFallbackCounter := findMissingBlobsCacheLookups(metrics.HitStatusLabel, false, "chunk_cache")
+	chunkFallbackHitsBefore := testutil.ToFloat64(chunkFallbackCounter)
+	findMissing(blobCtx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(3), requestCount.Load())
+	require.Equal(t, 1.0, testutil.ToFloat64(chunkFallbackCounter)-chunkFallbackHitsBefore)
+}
+
+func TestFindMissingBlobs_BypassCache(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", 30*time.Second)
+	testProvider := memprovider.NewInMemoryProvider(map[string]memprovider.InMemoryFlag{
+		"cache_proxy.bypass_find_missing_cache": {
+			State:          memprovider.Enabled,
+			DefaultVariant: "true",
+			Variants: map[string]any{
+				"true": true,
+			},
+		},
+	})
+	require.NoError(t, openfeature.SetNamedProviderAndWait(t.Name(), testProvider))
+	fp, err := experiments.NewFlagProvider(t.Name())
+	require.NoError(t, err)
+	ctx := testContext()
+	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyEnv := testenv.GetTestEnv(t)
+	proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
+	proxyEnv.SetExperimentFlagProvider(fp)
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	require.NoError(t, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+	ctx = metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+
+	barDigestProto := digestProto(barDigest, 3)
+	update(ctx, proxy, map[*repb.Digest]string{barDigestProto: "bar"}, t)
+	requestCount.Store(0)
+
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(2), requestCount.Load())
+}
+
+func TestFindMissingBlobs_CachingIsolatedByGroup(t *testing.T) {
+	flags.Set(t, "cache_proxy.find_missing_blobs_cache_ttl", 30*time.Second)
+	ctx := testContext()
+	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyEnv := testenv.GetTestEnv(t)
+	clock := clockwork.NewFakeClock()
+	proxyEnv.SetClock(clock)
+	proxyEnv.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2")))
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	flags.Set(t, "cache_proxy.remote_atime_update_interval", atimeUpdatePeriod)
+	require.NoError(t, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	group1Ctx := metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US1")
+	group2Ctx := metadata.AppendToOutgoingContext(ctx, authutil.APIKeyHeader, "US2")
+
+	// Write the blob directly to the remote cache so FindMissingBlobs reports
+	// it as present for every group.
+	barDigestProto := digestProto(barDigest, 3)
+	remote := repb.NewContentAddressableStorageClient(conn)
+	_, err := remote.BatchUpdateBlobs(ctx, updateBlobsRequest(map[*repb.Digest]string{barDigestProto: "bar"}))
+	require.NoError(t, err)
+	requestCount.Store(0)
+
+	// Group 1's first check goes to the remote and populates its cache entry.
+	findMissing(group1Ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(1), requestCount.Load())
+	findMissing(group1Ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(1), requestCount.Load())
+
+	// Group 2's first check for the same digest must go to the remote:
+	// group 1's cache entry must not be shared across groups.
+	findMissing(group2Ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(2), requestCount.Load())
+	findMissing(group2Ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(2), requestCount.Load())
+
+	// ANON requests go in their own cache partition.
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(3), requestCount.Load())
+	findMissing(ctx, proxy, []*repb.Digest{barDigestProto}, []*repb.Digest{}, t)
+	require.Equal(t, int32(3), requestCount.Load())
 }
 
 func TestReadUpdateBlobs(t *testing.T) {
-	ctx := context.Background()
+	ctx := testContext()
 	conn, requestCount, _ := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
 	casClient := repb.NewContentAddressableStorageClient(conn)
 	proxyEnv := testenv.GetTestEnv(t)
@@ -310,7 +560,7 @@ func TestReadUpdateBlobs(t *testing.T) {
 	expectNoAtimeUpdate(t, clock, requestCount)
 }
 
-func makeTree(ctx context.Context, client bspb.ByteStreamClient, t *testing.T) (*repb.Digest, []string) {
+func makeTree(ctx context.Context, client bspb.ByteStreamClient, t testing.TB) (*repb.Digest, []string) {
 	child1 := uuid.New()
 	digest1, files1 := cas.MakeTree(ctx, t, client, "", 2, 2)
 	child2 := uuid.New()
@@ -343,12 +593,11 @@ func TestGetTree(t *testing.T) {
 
 func testGetTree(t *testing.T, withCaching bool) {
 	flags.Set(t, "cache_proxy.enable_get_tree_caching", withCaching)
-	ctx := context.Background()
+	ctx := testContext()
 	conn, unaryRequests, streamRequests := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
 	casClient := repb.NewContentAddressableStorageClient(conn)
 	bsClient := bspb.NewByteStreamClient(conn)
 	proxyEnv := testenv.GetTestEnv(t)
-	proxyEnv.SetAtimeUpdater(&noOpAtimeUpdater{})
 	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
 	casProxy := repb.NewContentAddressableStorageClient(proxyConn)
 	bsProxy := bspb.NewByteStreamClient(proxyConn)
@@ -464,4 +713,334 @@ func testGetTree(t *testing.T, withCaching bool) {
 		require.Equal(t, int32(0), unaryRequests.Load())
 		require.Equal(t, int32(1), streamRequests.Load())
 	}
+}
+
+func BenchmarkFindMissingBlobs(b *testing.B) {
+	ctx := testContext()
+	conn, _, _ := runRemoteCASS(ctx, testenv.GetTestEnv(b), b)
+	proxyEnv := testenv.GetTestEnv(b)
+	clock := clockwork.NewFakeClock()
+	proxyEnv.SetClock(clock)
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	require.NoError(b, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, b)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	fooDigestProto := digestProto(fooDigest, 3)
+	foofDigestProto := digestProto(foofDigest, 4)
+	barDigestProto := digestProto(barDigest, 3)
+	barrDigestProto := digestProto(barrDigest, 4)
+	barrrDigestProto := digestProto(barrrDigest, 5)
+	bazDigestProto := digestProto(bazDigest, 3)
+	quxDigestProto := digestProto(quxDigest, 3)
+	update(ctx, proxy, map[*repb.Digest]string{
+		fooDigestProto: "foo",
+		barDigestProto: "bar",
+		bazDigestProto: "baz",
+		quxDigestProto: "qux",
+	}, b)
+	req := findMissingBlobsRequest([]*repb.Digest{
+		fooDigestProto,
+		foofDigestProto,
+		barDigestProto,
+		barrDigestProto,
+		barrrDigestProto,
+		bazDigestProto,
+		quxDigestProto,
+	})
+
+	expected := []*repb.Digest{
+		foofDigestProto,
+		barrDigestProto,
+		barrrDigestProto,
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		resp, err := proxy.FindMissingBlobs(ctx, req)
+		require.NoError(b, err)
+		require.ElementsMatch(b, expected, resp.GetMissingBlobDigests())
+	}
+}
+
+func BenchmarkBatchReadBlobs(b *testing.B) {
+	ctx := testContext()
+	conn, _, _ := runRemoteCASS(ctx, testenv.GetTestEnv(b), b)
+	proxyEnv := testenv.GetTestEnv(b)
+	clock := clockwork.NewFakeClock()
+	proxyEnv.SetClock(clock)
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	require.NoError(b, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, b)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	fooDigestProto := digestProto(fooDigest, 3)
+	foofDigestProto := digestProto(foofDigest, 4)
+	barDigestProto := digestProto(barDigest, 3)
+	barrDigestProto := digestProto(barrDigest, 4)
+	barrrDigestProto := digestProto(barrrDigest, 5)
+	bazDigestProto := digestProto(bazDigest, 3)
+	quxDigestProto := digestProto(quxDigest, 3)
+	blobs := map[*repb.Digest]string{
+		fooDigestProto:   "foo",
+		foofDigestProto:  "foof",
+		barDigestProto:   "bar",
+		barrDigestProto:  "barr",
+		barrrDigestProto: "barrr",
+		bazDigestProto:   "baz",
+		quxDigestProto:   "qux",
+	}
+
+	update(ctx, proxy, blobs, b)
+	req := readBlobsRequest(slices.Collect(maps.Keys(blobs)))
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		resp, err := proxy.BatchReadBlobs(ctx, req)
+		require.NoError(b, err)
+		require.Equal(b, len(blobs), len(resp.GetResponses()))
+	}
+}
+
+func BenchmarkBatchUpdateBlobs(b *testing.B) {
+	ctx := testContext()
+	conn, _, _ := runRemoteCASS(ctx, testenv.GetTestEnv(b), b)
+	proxyEnv := testenv.GetTestEnv(b)
+	clock := clockwork.NewFakeClock()
+	proxyEnv.SetClock(clock)
+	proxyEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	require.NoError(b, atime_updater.Register(proxyEnv))
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, b)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	fooDigestProto := digestProto(fooDigest, 3)
+	foofDigestProto := digestProto(foofDigest, 4)
+	barDigestProto := digestProto(barDigest, 3)
+	barrDigestProto := digestProto(barrDigest, 4)
+	barrrDigestProto := digestProto(barrrDigest, 5)
+	bazDigestProto := digestProto(bazDigest, 3)
+	quxDigestProto := digestProto(quxDigest, 3)
+	blobs := map[*repb.Digest]string{
+		fooDigestProto:   "foo",
+		foofDigestProto:  "foof",
+		barDigestProto:   "bar",
+		barrDigestProto:  "barr",
+		barrrDigestProto: "barrr",
+		bazDigestProto:   "baz",
+		quxDigestProto:   "qux",
+	}
+
+	i := 0
+	req := updateBlobsRequest(blobs)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		req.InstanceName = fmt.Sprintf("%d", i)
+		resp, err := proxy.BatchUpdateBlobs(ctx, req)
+		require.NoError(b, err)
+		require.Equal(b, len(blobs), len(resp.Responses))
+		for i := 0; i < len(blobs); i++ {
+			require.Equal(b, int32(codes.OK), resp.Responses[i].Status.Code)
+		}
+		i++
+	}
+}
+
+func TestSpliceBlob(t *testing.T) {
+	ctx := testContext()
+	remoteEnv := testenv.GetTestEnv(t)
+	conn, requestCount, _ := runRemoteCASS(ctx, remoteEnv, t)
+	proxyEnv := testenv.GetTestEnv(t)
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	chunk1 := []byte("chunk1data")
+	chunk2 := []byte("chunk2data")
+	chunk1Digest, err := digest.Compute(bytes.NewReader(chunk1), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	chunk2Digest, err := digest.Compute(bytes.NewReader(chunk2), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+
+	update(ctx, proxy, map[*repb.Digest]string{
+		chunk1Digest: string(chunk1),
+		chunk2Digest: string(chunk2),
+	}, t)
+
+	blobData := append(chunk1, chunk2...)
+	blobDigest, err := digest.Compute(bytes.NewReader(blobData), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+
+	requestCount.Store(0)
+	spliceReq := &repb.SpliceBlobRequest{
+		BlobDigest:     blobDigest,
+		ChunkDigests:   []*repb.Digest{chunk1Digest, chunk2Digest},
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+	spliceResp, err := proxy.SpliceBlob(ctx, spliceReq)
+	require.NoError(t, err)
+	require.Equal(t, blobDigest.Hash, spliceResp.BlobDigest.Hash)
+	require.Equal(t, int32(1), requestCount.Load())
+}
+
+func TestSplitBlob(t *testing.T) {
+	ctx := testContext()
+	remoteEnv := testenv.GetTestEnv(t)
+	conn, _, _ := runRemoteCASS(ctx, remoteEnv, t)
+	proxyEnv := testenv.GetTestEnv(t)
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+	remote := repb.NewContentAddressableStorageClient(conn)
+
+	chunk1 := []byte("chunk1")
+	chunk2 := []byte("chunk2")
+	chunk1Digest, err := digest.Compute(bytes.NewReader(chunk1), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	chunk2Digest, err := digest.Compute(bytes.NewReader(chunk2), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+
+	update(ctx, remote, map[*repb.Digest]string{
+		chunk1Digest: string(chunk1),
+		chunk2Digest: string(chunk2),
+	}, t)
+
+	blobData := append(chunk1, chunk2...)
+	blobDigest, err := digest.Compute(bytes.NewReader(blobData), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+
+	_, err = remote.SpliceBlob(ctx, &repb.SpliceBlobRequest{
+		BlobDigest:     blobDigest,
+		ChunkDigests:   []*repb.Digest{chunk1Digest, chunk2Digest},
+		DigestFunction: repb.DigestFunction_SHA256,
+	})
+	require.NoError(t, err)
+
+	splitResp, err := proxy.SplitBlob(ctx, &repb.SplitBlobRequest{
+		BlobDigest:     blobDigest,
+		DigestFunction: repb.DigestFunction_SHA256,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(splitResp.ChunkDigests))
+	require.Equal(t, chunk1Digest.Hash, splitResp.ChunkDigests[0].Hash)
+	require.Equal(t, chunk2Digest.Hash, splitResp.ChunkDigests[1].Hash)
+}
+
+func TestChunkMappingRPCsForwarded(t *testing.T) {
+	ctx := testContext()
+	conn, _, streamRequests := runRemoteCASS(ctx, testenv.GetTestEnv(t), t)
+	proxyConn := runCASProxy(ctx, conn, testenv.GetTestEnv(t), t)
+	proxy := repb.NewContentAddressableStorageClient(proxyConn)
+
+	streamRequests.Store(0)
+	getStream, err := proxy.GetChunkMapping(ctx, &repb.GetChunkMappingRequest{})
+	require.NoError(t, err)
+	_, err = getStream.Recv()
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	require.Equal(t, int32(1), streamRequests.Load())
+
+	registerStream, err := proxy.RegisterChunkMapping(ctx)
+	require.NoError(t, err)
+	_ = registerStream.Send(&repb.RegisterChunkMappingRequest{})
+	_, err = registerStream.CloseAndRecv()
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	require.Equal(t, int32(2), streamRequests.Load())
+}
+
+func BenchmarkGetTree(b *testing.B) {
+	flags.Set(b, "cache_proxy.enable_get_tree_caching", true)
+
+	ctx := testContext()
+	conn, unaryRequests, streamRequests := runRemoteCASS(ctx, testenv.GetTestEnv(b), b)
+	proxyEnv := testenv.GetTestEnv(b)
+	proxyConn := runCASProxy(ctx, conn, proxyEnv, b)
+	casProxy := repb.NewContentAddressableStorageClient(proxyConn)
+	bsProxy := bspb.NewByteStreamClient(proxyConn)
+
+	// Generate a static tree to reduce benchmark variability.
+	fileDigests := map[string]*repb.Digest{}
+	data := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	for _, datum := range data {
+		d, err := cachetools.UploadBlob(ctx, bsProxy, "", repb.DigestFunction_SHA256, bytes.NewReader([]byte(strings.Repeat(datum, 100))))
+		require.NoError(b, err)
+		fileDigests[datum] = d
+	}
+
+	subdirAB := &repb.Directory{
+		Files: []*repb.FileNode{
+			&repb.FileNode{Name: "a", Digest: fileDigests["a"]},
+			&repb.FileNode{Name: "b", Digest: fileDigests["b"]},
+		},
+	}
+	subdirCD := &repb.Directory{
+		Files: []*repb.FileNode{
+			&repb.FileNode{Name: "c", Digest: fileDigests["c"]},
+			&repb.FileNode{Name: "d", Digest: fileDigests["d"]},
+		},
+	}
+	subdirEF := &repb.Directory{
+		Files: []*repb.FileNode{
+			&repb.FileNode{Name: "e", Digest: fileDigests["e"]},
+			&repb.FileNode{Name: "f", Digest: fileDigests["f"]},
+		},
+	}
+	subdirGH := &repb.Directory{
+		Files: []*repb.FileNode{
+			&repb.FileNode{Name: "g", Digest: fileDigests["g"]},
+			&repb.FileNode{Name: "h", Digest: fileDigests["h"]},
+		},
+	}
+	abDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirAB)
+	require.NoError(b, err)
+	cdDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirCD)
+	require.NoError(b, err)
+	efDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirEF)
+	require.NoError(b, err)
+	ghDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirGH)
+	require.NoError(b, err)
+
+	subdirABCD := &repb.Directory{
+		Directories: []*repb.DirectoryNode{
+			&repb.DirectoryNode{Name: "ab", Digest: abDigest},
+			&repb.DirectoryNode{Name: "cd", Digest: cdDigest},
+		},
+	}
+	subdirEFGH := &repb.Directory{
+		Directories: []*repb.DirectoryNode{
+			&repb.DirectoryNode{Name: "ef", Digest: efDigest},
+			&repb.DirectoryNode{Name: "gh", Digest: ghDigest},
+		},
+	}
+	abcdDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirABCD)
+	require.NoError(b, err)
+	efghDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, subdirEFGH)
+	require.NoError(b, err)
+
+	root := &repb.Directory{
+		Directories: []*repb.DirectoryNode{
+			&repb.DirectoryNode{Name: "abcd", Digest: abcdDigest},
+			&repb.DirectoryNode{Name: "efgh", Digest: efghDigest},
+		},
+	}
+	rootDigest, err := cachetools.UploadProto(ctx, bsProxy, "", repb.DigestFunction_SHA256, root)
+	require.NoError(b, err)
+
+	files := []string{"a", "b", "c", "d", "e", "f", "g", "h", "ab", "cd", "ef", "gh", "abcd", "efgh"}
+
+	// Warm up tree cache
+	treeFiles := cas.ReadTree(ctx, b, casProxy, "", rootDigest)
+	require.ElementsMatch(b, files, treeFiles)
+	unaryRequests.Store(0)
+	streamRequests.Store(0)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		treeFiles := cas.ReadTree(ctx, b, casProxy, "", rootDigest)
+		require.ElementsMatch(b, files, treeFiles)
+		require.Equal(b, int32(0), unaryRequests.Load())
+		require.Equal(b, int32(0), streamRequests.Load())
+	}
+
 }

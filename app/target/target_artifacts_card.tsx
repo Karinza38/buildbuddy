@@ -1,12 +1,15 @@
 import { ArrowDownCircle, FileCode } from "lucide-react";
 import React from "react";
 
-import { zip } from "../../proto/zip_ts_proto";
 import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
+import { zip } from "../../proto/zip_ts_proto";
 import capabilities from "../capabilities/capabilities";
-import rpcService from "../service/rpc_service";
 import DigestComponent from "../components/digest/digest";
+import { TextLink } from "../components/link/link";
+import { FileIcon } from "../icons/file_icon";
+import rpcService from "../service/rpc_service";
 import { getFileDigest } from "../util/cache";
+import { isImageExtension, isVideoExtension, parseExtension } from "../util/file_types";
 
 interface Props {
   name: string;
@@ -41,7 +44,7 @@ export default class TargetArtifactsCardComponent extends React.Component<Props,
       return;
     }
     let testOutputsUri = this.props.files.find(
-      (file: build_event_stream.File) => true && file.name === TargetArtifactsCardComponent.ZIPPED_OUTPUTS_FILE
+      (file: build_event_stream.File) => file.name === TargetArtifactsCardComponent.ZIPPED_OUTPUTS_FILE
     )?.uri;
 
     if (!testOutputsUri || !testOutputsUri.startsWith("bytestream://")) {
@@ -80,6 +83,17 @@ export default class TargetArtifactsCardComponent extends React.Component<Props,
   }
 
   makeArtifactViewUri(baseUri: string, outputFilename: string, encodedZipData?: string): string {
+    const extension = parseExtension(outputFilename);
+
+    // Show images and videos with the browser; show other files with the Code component.
+    if (isImageExtension(extension) || isVideoExtension(extension)) {
+      return rpcService.getBytestreamUrl(baseUri, this.props.invocationId, {
+        filename: outputFilename,
+        zip: encodedZipData,
+        view: true,
+      });
+    }
+
     let params: Record<string, string> = {
       bytestream_url: baseUri,
       invocation_id: this.props.invocationId,
@@ -128,25 +142,29 @@ export default class TargetArtifactsCardComponent extends React.Component<Props,
   render() {
     return (
       <div className="card artifacts">
-        <ArrowDownCircle className="icon brown" />
+        <ArrowDownCircle className="brown" />
         <div className="content">
           <div className="title">Artifacts: {this.props.name}</div>
           <div className="details">
             {this.props.files.map((output) => (
               <>
                 <div className="artifact-line">
-                  <a
+                  <TextLink
+                    plain
                     href={rpcService.getBytestreamUrl(output.uri, this.props.invocationId, {
                       filename: output.name,
                     })}
                     className="artifact-name"
                     onClick={this.handleArtifactClicked.bind(this, output.uri, output.name)}>
                     {output.name}
-                  </a>
+                  </TextLink>
                   {output.uri?.startsWith("bytestream://") && (
-                    <a className="artifact-view" href={this.makeArtifactViewUri(output.uri, output.name)}>
-                      <FileCode /> View
-                    </a>
+                    <TextLink
+                      className="artifact-view"
+                      href={this.makeArtifactViewUri(output.uri, output.name)}
+                      target="_blank">
+                      <FileIcon extension={parseExtension(output.name)} /> View
+                    </TextLink>
                   )}
                   <DigestComponent digest={getFileDigest(output) ?? {}} />
                 </div>
@@ -154,12 +172,13 @@ export default class TargetArtifactsCardComponent extends React.Component<Props,
                   this.state.manifest &&
                   this.state.manifest.entry?.map((entry) => (
                     <div className="artifact-line sub-item">
-                      <a
+                      <TextLink
+                        plain
                         href={this.makeArtifactUri(output.uri, entry)}
                         className="artifact-name"
                         onClick={this.handleZipArtifactClicked.bind(this, output.uri, entry.name, entry)}>
                         {entry.name}
-                      </a>
+                      </TextLink>
                       {output.uri?.startsWith("bytestream://") && (
                         <a
                           className="artifact-view"

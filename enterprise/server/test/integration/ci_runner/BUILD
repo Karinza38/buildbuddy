@@ -4,16 +4,16 @@ package(default_visibility = ["//enterprise:__subpackages__"])
 
 go_test(
     name = "ci_runner_test",
-    size = "small",
+    size = "medium",
     srcs = ["ci_runner_test.go"],
     data = [
         "//enterprise/server/cmd/ci_runner",
     ],
     exec_properties = {
-        # TODO: remove network dependency.
-        "test.dockerNetwork": "bridge",
+        "test.EstimatedComputeUnits": "3",
     },
-    shard_count = 29,
+    shard_count = 31,
+    tags = ["block-network"],
     x_defs = {
         "ciRunnerRunfilePath": "$(rlocationpath //enterprise/server/cmd/ci_runner)",
     },
@@ -38,7 +38,7 @@ go_test(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@in_gopkg_yaml_v2//:yaml_v2",
-        "@io_bazel_rules_go//go/runfiles:go_default_library",
+        "@io_bazel_rules_go//go/runfiles",
         "@org_golang_google_protobuf//encoding/protodelim",
     ],
 )

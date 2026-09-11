@@ -1,9 +1,26 @@
 import { config } from "../../proto/config_ts_proto";
 
 declare const window: Window & {
-  buildbuddyConfig: config.FrontendConfig;
   gtag?: (method: string, ...args: any[]) => void;
 };
+
+declare global {
+  var buildbuddyConfig: config.FrontendConfig | undefined;
+}
+
+/**
+ * Returns the default frontend config, matching the server defaults. During
+ * rollouts, setting default values here ensures that the client sees a
+ * reasonable default if it hits a server deployment that hasn't yet been fully
+ * rolled out. Fields only need to be set here explicitly if the desired default
+ * doesn't match the proto default.
+ */
+export function defaultConfig(): config.IFrontendConfig {
+  return {
+    apiKeyValueReadbackEnabled: true,
+    groupMembershipRequestsEnabled: true,
+  };
+}
 
 export class Capabilities {
   name: string = "";
@@ -27,9 +44,11 @@ export class Capabilities {
   action: boolean = false;
   userOwnedExecutors: boolean = false;
   executorKeyCreation: boolean = false;
+  cacheProxyKeyCreation: boolean = false;
   code: boolean = false;
   sso: boolean = false;
   usage: boolean = false;
+  readOnlyGitHubApp: boolean = false;
 
   constructor() {
     this.invocationSharing = true;
@@ -37,7 +56,10 @@ export class Capabilities {
     this.deleteInvocation = true;
     this.manageApiKeys = true;
 
-    this.config = window.buildbuddyConfig;
+    this.config = new config.FrontendConfig({
+      ...defaultConfig(),
+      ...(globalThis.buildbuddyConfig || {}),
+    });
 
     // Note: Please don't add any new config fields below;
     // get them from the config directly.
@@ -51,8 +73,10 @@ export class Capabilities {
     this.executors = this.config.remoteExecutionEnabled;
     this.userOwnedExecutors = this.config.userOwnedExecutorsEnabled;
     this.executorKeyCreation = this.config.executorKeyCreationEnabled;
+    this.cacheProxyKeyCreation = this.config.cacheProxyKeyCreationEnabled;
     this.code = this.config.codeEditorEnabled;
     this.usage = this.config.usageEnabled;
+    this.readOnlyGitHubApp = this.config.readOnlyGithubAppEnabled;
   }
 
   register(name: string, enterprise: boolean, paths: Array<string>) {

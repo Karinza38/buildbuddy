@@ -6,6 +6,7 @@ import "google/protobuf/timestamp.proto";
 import "proto/acl.proto";
 import "proto/context.proto";
 import "proto/trace.proto";
+import "proto/upgrade.proto";
 
 package scheduler;
 
@@ -15,6 +16,15 @@ message NodeAddress {
 
   // The node's port.
   int32 port = 2;
+}
+
+message TaskExistsRequest {
+  // The task ID being checked.
+  string task_id = 1;
+}
+
+message TaskExistsResponse {
+  bool exists = 1;
 }
 
 message LeaseTaskRequest {
@@ -34,6 +44,9 @@ message LeaseTaskRequest {
 
   // ID of the executor making the request.
   string executor_id = 4;
+
+  // The hostname of the executor making the request.
+  string executor_hostname = 9;
 
   // Indicates that the leased task could not be run to completion and should
   // be re-enqueued to be retried.
@@ -95,6 +108,16 @@ message CustomResource {
 
   // Requested resource amount.
   float value = 2;
+}
+
+// WarmupImage represents a container image configured for executor startup
+// warmup.
+message WarmupImage {
+  // Image to warm up, without the "docker://" prefix.
+  string image = 1;
+
+  // Workload isolation type for this warmup image.
+  string isolation = 2;
 }
 
 message TaskSize {
@@ -257,9 +280,19 @@ message CgroupSettings {
     // Max write bytes per second.
     optional int64 wbps = 4;
   }
+
+  // CPUSet: the set of cpus that a task may run on. This field is set by the
+  // executor, based on the estimated task size. Any value set by the app is
+  // ignored.
+  repeated int32 cpuset_cpus = 18;
+
+  // CPUSet: the numa node that a task may run on. This field is set by the
+  // executor, based on the estimated task size. Any value set by the app is
+  // ignored.
+  optional int32 numa_node = 19;
 }
 
-// Next ID: 9
+// Next ID: 18
 message SchedulingMetadata {
   // DEPRECATED. This field has two different meanings:
   // 1. The execution server sets this to the task size "estimate" which only
@@ -299,6 +332,17 @@ message SchedulingMetadata {
   string os = 2;
   string arch = 3;
   string pool = 4;
+
+  reserved 14;
+
+  // If set, the task will be scheduled only on nodes matching this hostname
+  // pattern within the pool.
+  // DEPRECATED: use routing_config instead.
+  string hostname_pattern = 15 [deprecated = true];
+
+  // Experimental routing config.
+  RoutingConfig routing_config = 16;
+
   // Group ID that owns the executors on which the task is to be executed.
   // May be different from the Group ID of the user that issued the Execute
   // request.
@@ -329,6 +373,22 @@ message SchedulingMetadata {
 
   // cgroup2 settings. Will be set only for Linux executions.
   CgroupSettings cgroup_settings = 12;
+
+  // The time at which the task was first enqueued on the app. This value is
+  // preserved when a task is re-enqueued. Executors use it to break priority
+  // ties, so that a task retried on another executor doesn't lose its place
+  // in line.
+  google.protobuf.Timestamp queued_timestamp = 17;
+}
+
+message RoutingConfig {
+  // If set, the task will be scheduled only on nodes matching this hostname
+  // pattern within the pool.
+  string hostname_pattern = 1;
+
+  // If true, and the routing requirements cannot be satisfied, behave as though
+  // the routing config was not specified at all.
+  bool best_effort = 2;
 }
 
 message ScheduleTaskRequest {
@@ -379,6 +439,10 @@ message EnqueueTaskReservationRequest {
   // it can retry the lease.
   google.protobuf.Duration delay = 5;
 
+  // The jwt for this specific task. Can't be propagated via RPC metadata
+  // because this is sent in long-running streaming RPC.
+  string jwt = 6;
+
   // Used to propagate trace information from the initial Execute request.
   // Normally trace information is automatically propagated via RPC metadata but
   // that doesn't work for streamed task reservations since there's one
@@ -387,6 +451,15 @@ message EnqueueTaskReservationRequest {
 }
 
 message EnqueueTaskReservationResponse {
+  string task_id = 1;
+}
+
+// CancelTaskReservationRequest may be sent from the scheduler to the executor
+// to cancel a task reservation previously enqueued with EnqueueTaskReservation.
+// The scheduler only sends these messages if the executor sets
+// supports_proactive_cancellation in the node registration request.
+message CancelTaskReservationRequest {
+  // The ID of the task to cancel.
   string task_id = 1;
 }
 
@@ -438,6 +511,10 @@ message RegisterAndStreamWorkResponse {
 
   // How long to backoff if a AskForMoreWorkRequest was sent.
   AskForMoreWorkResponse ask_for_more_work_response = 4;
+
+  // Request to cancel a task reservation previously enqueued with
+  // EnqueueTaskReservationRequest.
+  CancelTaskReservationRequest cancel_task_reservation_request = 5;
 }
 
 service Scheduler {
@@ -445,6 +522,8 @@ service Scheduler {
       returns (stream RegisterAndStreamWorkResponse) {}
 
   rpc LeaseTask(stream LeaseTaskRequest) returns (stream LeaseTaskResponse) {}
+
+  rpc TaskExists(TaskExistsRequest) returns (TaskExistsResponse) {}
 
   rpc ScheduleTask(ScheduleTaskRequest) returns (ScheduleTaskResponse) {}
 
@@ -473,12 +552,26 @@ message ExecutionNode {
   // Ex. 7000
   int64 assignable_milli_cpu = 4;
 
+  // Assignable disk bytes in remote execution node, for task workspaces
+  // (buildroots). Derived from the capacity of the filesystem holding the build
+  // root, scaled by executor.disk_capacity_ratio, or set explicitly via
+  // executor.disk_bytes.
+  //
+  // A value of 0 means the executor could not report a disk capacity (e.g. an
+  // older executor, or failed detection), and disk must not be used as a
+  // scheduling constraint for this node.
+  // Ex. 107374182400
+  int64 assignable_disk_bytes = 24;
+
   // Assignable custom resources.
   repeated CustomResource assignable_custom_resources = 11;
 
-  // Remote execution node operating system.
-  // Ex. "linux".
-  string os = 5;
+  // Node's operating system family. One of: "darwin", "linux", or "windows".
+  string os_family = 5;
+
+  // Node's operating system with version info, suitable for display. This will
+  // be something like "macOS 10.17 Sierra".
+  string os_display_name = 15;
 
   // Architecture of the remote execution node.
   // Ex. "amd64"
@@ -502,6 +595,48 @@ message ExecutionNode {
   //
   // Ex. "8BiY6U0F"
   string executor_host_id = 10;
+
+  // Supported isolation types for this executor.
+  // Ex. ["docker", "firecracker", "none"]
+  repeated string supported_isolation_types = 12;
+
+  // Current number of tasks in the executor's queue.
+  int32 current_queue_length = 13;
+
+  // The number of in-flight actions the executor is currently executing.
+  int32 active_action_count = 14;
+
+  // The Xcode versions installed on this executor.
+  repeated string xcode_versions = 16;
+
+  reserved 17;
+  reserved "xcode_sdks";
+
+  // Whether the executor supports proactive task cancellation, which allows
+  // cancelling queued requests for tasks that have already been completed by
+  // another executor.
+  bool supports_proactive_cancellation = 18;
+
+  // Configured maximum size of the local filecache. If present and set to 0,
+  // the local filecache is disabled.
+  optional int64 filecache_max_size_bytes = 19;
+
+  // Images configured to warm up during executor startup.
+  repeated WarmupImage warmup_images = 20;
+
+  // Time when this executor process started.
+  google.protobuf.Timestamp start_time = 21;
+
+  // Optional set of key-value labels identifying this executor.
+  map<string, string> labels = 22;
+
+  // The Xcode Simulator runtimes installed on this executor.
+  repeated string xcode_simulator_runtimes = 23;
+
+  // The flags this executor was configured with (via the command line or
+  // config file), in "--name=value" form. Only flags set to non-default
+  // values are included, and the values of secret flags are redacted.
+  repeated string configured_flags = 25;
 }
 
 message GetExecutionNodesRequest {
@@ -518,9 +653,14 @@ message GetExecutionNodesResponse {
 
     // Whether tasks will be routed to this node by default.
     bool is_default = 2;
+
+    // Last time this executor checked in with the scheduler.
+    google.protobuf.Timestamp last_check_in_time = 3;
   }
 
   bool user_owned_executors_supported = 3;
+
+  upgrade.Prompt upgrade_prompt = 4;
 }
 
 // Persisted information about connected executors.

@@ -1,13 +1,13 @@
-import React from "react";
-import { User } from "../../../app/auth/user";
-import router from "../../../app/router/router";
-import auth_service from "../../../app/auth/auth_service";
-import Select, { Option } from "../../../app/components/select/select";
-import Button from "../../../app/components/button/button";
-import { grp } from "../../../proto/group_ts_proto";
-import rpc_service, { Cancelable } from "../../../app/service/rpc_service";
-import error_service from "../../../app/errors/error_service";
 import { CheckCircle, TerminalIcon, XCircle } from "lucide-react";
+import React from "react";
+import auth_service from "../../../app/auth/auth_service";
+import { User } from "../../../app/auth/user";
+import Button from "../../../app/components/button/button";
+import Select, { Option } from "../../../app/components/select/select";
+import error_service from "../../../app/errors/error_service";
+import router from "../../../app/router/router";
+import rpc_service, { Cancelable } from "../../../app/service/rpc_service";
+import { grp } from "../../../proto/group_ts_proto";
 
 export interface CliLoginProps {
   user: User;
@@ -171,7 +171,7 @@ export default class CliLoginComponent extends React.Component<CliLoginProps, St
       return (
         <div className="cli-login" debug-id="cli-login-complete">
           <div className="card">
-            {failed ? <XCircle className="icon red" /> : <CheckCircle className="icon green" />}
+            {failed ? <XCircle className="red" /> : <CheckCircle className="green" />}
             <div className="content">
               <div className="title">{failed ? "CLI login failed" : "CLI login succeeded"}</div>
               <div className="details">
@@ -196,7 +196,7 @@ export default class CliLoginComponent extends React.Component<CliLoginProps, St
     return (
       <div className="cli-login">
         <div className="card">
-          <TerminalIcon className="icon" />
+          <TerminalIcon />
           <div className="content">
             <div className="title">Complete CLI login</div>
             <div className="details">

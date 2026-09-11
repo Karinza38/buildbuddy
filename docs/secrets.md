@@ -6,8 +6,7 @@ sidebar_label: RBE Secrets
 
 Secrets are encrypted environment variables associated with your
 BuildBuddy organization. Secrets can be used in actions executed with
-[remote execution](remote-build-execution) as well as [BuildBuddy
-Workflows](workflows-introduction).
+[remote execution](remote-build-execution) as well as [BuildBuddy remote runners](remote-runner-introduction).
 
 BuildBuddy encrypts secrets with a
 [libsodium sealed box](https://libsodium.gitbook.io/doc/public-key_cryptography/sealed_boxes).
@@ -43,24 +42,41 @@ page.
 
 ### Bazel actions
 
-To opt a specific action into secrets, you can define the remote exec
-property `include-secrets=true`. We recommend doing this per-action to
-avoid exposing secrets to actions that do not need them.
+To allow a target's remotely executed actions to access secrets, use the
+`env-secrets` execution property, which accepts a comma-separated list of
+secrets to pass as environment variables into the action.
+
+It is recommended to set the `env-secrets` execution property per-target, rather
+than globally via `--remote_default_exec_properties` or via execution platforms.
+
+When applicable, it is also recommended to narrow these properties by [execution
+group](https://bazel.build/extending/exec-groups) to further restrict the
+actions within a target that can access the secret. Most commonly, the `test`
+execution group can be used to allow a test to access a secret value, but not
+the action that builds the test.
 
 Example:
 
 ```python title="BUILD"
-foo_library(
+foo_test(
     # ...
     exec_properties = {
-        "include-secrets": "true",
+        # foo_test builds the test (action 1) then runs the test (action 2).
+        # The "test." prefix here only exposes the secrets to the action that
+        # runs the test (action 2).
+        "test.env-secrets": "API_KEY,DB_PASSWORD",
     }
 )
 ```
 
+To make _all_ secrets available in the action environment, the `include-secrets`
+execution property can be set to the string `"true"`. However, it is recommended
+to use `env-secrets` instead, so that the action only receives the secret values
+that it needs.
+
 ### Workflows
 
-[BuildBuddy workflows](workflows-introduction) do not need additional
+[BuildBuddy workflows](workflows-setup) do not need additional
 configuration to use secrets; they receive secrets by default as long as
 the workflow is being triggered on behalf of a trusted collaborator in the
 repository.
@@ -71,12 +87,12 @@ as normal Bazel actions shown above.
 ## Short-lived secrets
 
 For secrets that have a short Time To Live (TTL), BuildBuddy supports setting
-environment variables via special headers passed at the Bazel command line.
-Headers are more secure than setting environment variables with Bazel,
-as they are not stored in the remote cache.
+environment variables via special platform properties that are automatically
+redacted from the action cache and workflow logs. These properties can be set
+via remote execution headers so they are never stored in plain text.
 
 ```bash title="Simple Secrets"
---remote_exec_header=x-buildbuddy-platform.env-overrides=VAR_A=value_a,VAR_B=val_b
+--remote_exec_header=x-buildbuddy-platform.secret-env-overrides=VAR_A=value_a,VAR_B=val_b
 
 ## At execution time:
 > echo $VAR_A
@@ -92,8 +108,8 @@ val_b
 > echo -n 'VAR_C={"a": 1, "b", 2}' | base64
 > echo -n 'VAR_D=asdfa!@@C,+{}' | base64
 
-## then use the base64-encoded strings in the `env-overrides-base64` header, comma separated.
---remote_exec_header=x-buildbuddy-platform.env-overrides-base64=VkFSX0M9eyJhIjogMSwgImIiLCAyfQ==,VkFSX0Q9YXNkZmEhQCNDLCt7fQ==
+## then use the base64-encoded strings in the `secret-env-overrides-base64` header, comma separated.
+--remote_exec_header=x-buildbuddy-platform.secret-env-overrides-base64=VkFSX0M9eyJhIjogMSwgImIiLCAyfQ==,VkFSX0Q9YXNkZmEhQCNDLCt7fQ==
 
 ## At execution time:
 > echo $VAR_C
@@ -105,8 +121,8 @@ asdfa!@@C,+{}
 :::note
 
 If multiple values are given with the same variable name, the last value will be used.
-If a variable is specified in both `env-overrides` and `env-overrides-base64`,
-`env-overrides-base64` will take priority.
+If a variable is specified in both `secret-env-overrides` and `secret-env-overrides-base64`,
+`secret-env-overrides-base64` will take priority.
 
 :::
 
@@ -114,15 +130,20 @@ These secrets will be set as environment variables at action execution time,
 overriding the default environment variables on your container image as well as
 the environment variables set by Bazel as part of the action configuration.
 
-:::warning
+The values of `secret-env-overrides` and `secret-env-overrides-base64` properties
+are automatically **redacted** from action cache entries and workflow logs, so
+the secret material is never persisted in plain text.
 
-Secrets may be cached as part of action results if not properly handled.
-Avoid printing secret values to the console or storing them in action outputs.
+Secrets that are passed through `secret-env-overrides` or `secret-env-overrides-base64`
+headers are not subjected to `include-secrets` control documented above.
+
+:::note
+
+The older `env-overrides` and `env-overrides-base64` properties still work
+but do **not** redact values from the action cache. Prefer
+`secret-env-overrides` / `secret-env-overrides-base64` for any sensitive data.
 
 :::
-
-Secrets that are passed through `env-overrides` or `env-overrides-base64` headers
-are not subjected to `include-secrets` control documented above.
 
 ## Security notes
 

@@ -6,12 +6,11 @@ import (
 
 // Gossip (broadcast) constants
 const (
-	NodeHostIDTag  = "node_host_id"
-	RaftAddressTag = "raft_address"
 	GRPCAddressTag = "grpc_address"
 	MetaRangeTag   = "meta_range"
 	ZoneTag        = "zone"
 	StoreUsageTag  = "store_usage"
+	PodIndexTag    = "pod_index"
 
 	RegistryUpdateEvent       = "registry_update_event"
 	RegistryQueryEvent        = "registry_query_event"
@@ -20,6 +19,8 @@ const (
 	PlacementDriverQueryEvent = "placement_driver_query_event"
 
 	CacheName = "raft"
+
+	DefaultPartitionID = "default"
 )
 
 // Key range contants
@@ -55,8 +56,9 @@ const (
 )
 
 const (
-	CASErrorMessage    = "CAS expected value did not match"
-	TxnNotFoundMessage = "Transaction not found"
+	CASErrorMessage      = "CAS expected value did not match"
+	TxnNotFoundMessage   = "Transaction not found"
+	TxnRolledBackMessage = "Transaction rolled back"
 )
 
 // Key constants (some of these have to be vars because of how they are made.
@@ -70,18 +72,24 @@ var (
 	// descriptors.
 	SystemPrefix = keys.Key{systemPrefixByte}
 
+	// System Keys:
 	// The last replicaID that was generated.
-	LastReplicaIDKey = keys.MakeKey(SystemPrefix, []byte("last_replica_id"))
+	LastReplicaIDKeyPrefix = keys.MakeKey(SystemPrefix, []byte("last_replica_id"))
 
 	// The last rangeID that was generated.
-	LastRangeIDKey = keys.MakeKey(SystemPrefix, []byte("last_range_id"))
+	LastRangeIDKey = keys.MakeKey(SystemPrefix, []byte("last_range_id-"))
 
-	// A prefix to prepend to transaction records. Transaction Records were written
-	// by the transaction coordinator when the transaction state changes. They
-	// were used to recover stuck transactions. They are different from shard-specific
-	// transaction entries written by replicas when preparing the transactions.
+	// A prefix to prepend to transaction records. These records live in the
+	// meta range and track the global txn decision.
 	TxnRecordPrefix = keys.MakeKey(SystemPrefix, []byte("txn-record-"))
 
+	// A prefix to prepend to session keys
+	SessionPrefix = keys.MakeKey(SystemPrefix, []byte("session-"))
+
+	// A prefix to prepend to partition descriptors.
+	PartitionPrefix = keys.MakeKey(SystemPrefix, []byte("partition-"))
+
+	// Local Keys:
 	// When the cluster was created.
 	ClusterSetupTimeKey = keys.MakeKey(LocalPrefix, []byte("cluster_setup_time"))
 
@@ -98,20 +106,24 @@ var (
 	// When this local range was set up.
 	LocalRangeSetupTimeKey = keys.MakeKey(LocalPrefix, []byte("range_initialization_time"))
 
-	// A prefix to prepend to transactions.
+	// A prefix to prepend to participant-local prepared transaction state. The
+	// key is LocalTransactionPrefix + txid, and the value is the marshaled
+	// prepare BatchCmdRequest used to reload prepared state after restart.
 	LocalTransactionPrefix = keys.MakeKey(LocalPrefix, []byte("txn-"))
 
-	// A prefix to prepend to session keys
-	LocalSessionPrefix = keys.MakeKey(SystemPrefix, []byte("session-"))
+	// A prefix to prepend to participant-local rollback markers for the
+	// transaction.
+	LocalTxnRollbackMarkerPrefix = keys.MakeKey(LocalPrefix, []byte("rollback-txn-"))
 )
 
 // Error constants -- sender recognizes these errors.
 var (
-	RangeNotFoundMsg     = "Range not present"   // break
+	RangeNotFoundMsg     = "Range not present"   // continue
 	RangeNotLeasedMsg    = "Range not leased"    // continue
 	RangeNotCurrentMsg   = "Range not current"   // break
 	RangeLeaseInvalidMsg = "Range lease invalid" // continue
 	RangeSplittingMsg    = "Range splitting"
+	ConflictKeyMsg       = "Conflict on key"
 )
 
 type ReplicaState int

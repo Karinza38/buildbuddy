@@ -1,7 +1,6 @@
+import { ChevronsUpDown, File } from "lucide-react";
 import React from "react";
 import { search } from "../../../proto/search_ts_proto";
-import { ChevronsUpDown, File } from "lucide-react";
-import { OutlinedButton } from "../../../app/components/button/button";
 
 interface SnippetProps {
   result: search.Result;
@@ -91,7 +90,7 @@ export default class ResultComponent extends React.Component<ResultProps, Result
     return (
       <div className="result">
         <div className="result-title-bar">
-          <File size={16}></File>
+          <File />
           <div className="repo-name">[{this.props.result.repo}]</div>
           <div className="filename">
             <a href={this.getFileOnlyURL()}>{this.props.result.filename}</a>

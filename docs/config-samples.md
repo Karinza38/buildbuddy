@@ -57,6 +57,7 @@ cache:
   max_size_bytes: 10000000000 # 10 GB
   in_memory: true
 auth:
+  jwt_key: "<randomly-generated-secret>"
   oauth_providers:
     - issuer_url: "https://accounts.google.com"
       client_id: "12345678911-f1r0phjnhbabcdefm32etnia21keeg31.apps.googleusercontent.com"
@@ -80,13 +81,10 @@ storage:
     project_id: "flame-build"
     credentials_file: "your_service-acct.json"
 cache:
-  redis_target: "12.34.56.79:6379"
-  gcs:
-    bucket: "buildbuddy_cache"
-    project_id: "your_gcs_project_id"
-    credentials_file: "/path/to/your/credential/file.json"
-    ttl_days: 30
+  disk:
+    root_directory: /data/buildbuddy-cache
 auth:
+  jwt_key: "<randomly-generated-secret>"
   oauth_providers:
     - issuer_url: "https://your-custom-domain.okta.com"
       client_id: "0aaa5twc7sx0kUW123x6"

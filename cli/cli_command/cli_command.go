@@ -1,106 +1,173 @@
 package cli_command
 
-import (
-	"github.com/buildbuddy-io/buildbuddy/cli/add"
-	"github.com/buildbuddy-io/buildbuddy/cli/analyze"
-	"github.com/buildbuddy-io/buildbuddy/cli/ask"
-	"github.com/buildbuddy-io/buildbuddy/cli/download"
-	"github.com/buildbuddy-io/buildbuddy/cli/execute"
-	"github.com/buildbuddy-io/buildbuddy/cli/explain"
-	"github.com/buildbuddy-io/buildbuddy/cli/fix"
-	"github.com/buildbuddy-io/buildbuddy/cli/login"
-	"github.com/buildbuddy-io/buildbuddy/cli/plugin"
-	"github.com/buildbuddy-io/buildbuddy/cli/printlog"
-	"github.com/buildbuddy-io/buildbuddy/cli/remotebazel"
-	"github.com/buildbuddy-io/buildbuddy/cli/update"
-	"github.com/buildbuddy-io/buildbuddy/cli/upload"
-	"github.com/buildbuddy-io/buildbuddy/cli/versioncmd"
-)
+import "flag"
 
 type Command struct {
 	Name    string
 	Help    string
-	Handler func(args []string) (exitCode int, err error)
 	Aliases []string
+	// Handler runs the command.
+	//
+	// It is nil until Register in cli_command/register is called.
+	Handler func(args []string) (exitCode int, err error)
+	// Flags used for `bb help <command>`.
+	//
+	// It is nil until Register in cli_command/register is called, and remains
+	// nil for commands that declare no flags.
+	Flags *flag.FlagSet
 }
 
-var Commands = []Command{
+// Commands is a slice of all known CLI commands.
+//
+// Handlers and flags are attached to these commands by Register in
+// cli_command/register.
+var Commands = []*Command{
 	{
-		Name:    "add",
-		Help:    "Adds a dependency to your WORKSPACE file.",
-		Handler: add.HandleAdd,
+		Name: "add",
+		Help: "Adds a dependency to your WORKSPACE file.",
 	},
 	{
-		Name:    "analyze",
-		Help:    "Analyzes the dependency graph.",
-		Handler: analyze.HandleAnalyze,
+		Name: "agent",
+		Help: "Runs an AI coding agent to analyze data.",
+	},
+	{
+		Name: "analyze",
+		Help: "Analyzes the dependency graph.",
 	},
 	{
 		Name:    "ask",
 		Help:    "Asks for suggestions about your last invocation.",
-		Handler: ask.HandleAsk,
 		Aliases: []string{"wtf", "huh"},
 	},
 	{
-		Name:    "download",
-		Help:    "Downloads artifacts from a remote cache.",
-		Handler: download.HandleDownload,
+		Name: "box",
+		Help: "Starts a remote Firecracker VM box and opens a session in it.",
 	},
 	{
-		Name:    "execute",
-		Help:    "Executes arbitrary commands using remote execution.",
-		Handler: execute.HandleExecute,
+		Name: "detect",
+		Help: "Detects issues in the current workspace.",
 	},
 	{
-		Name:    "fix",
-		Help:    "Applies fixes to WORKSPACE and BUILD files.",
-		Handler: fix.HandleFix,
-	},
-	// Handle 'help' command separately to avoid circular dependency with `cli_command`
-	// package
-	{
-		Name:    "install",
-		Help:    "Installs a bb plugin (https://buildbuddy.io/plugins).",
-		Handler: plugin.HandleInstall,
+		Name: "download",
+		Help: "Downloads artifacts from a remote cache.",
 	},
 	{
-		Name:    "login",
-		Help:    "Configures bb commands to use your BuildBuddy API key.",
-		Handler: login.HandleLogin,
+		Name: "execute",
+		Help: "Executes arbitrary commands using remote execution.",
 	},
 	{
-		Name:    "logout",
-		Help:    "Configures bb commands to no longer use your saved API key.",
-		Handler: login.HandleLogout,
+		Name: "execution",
+		Help: "Remote execution tools",
 	},
 	{
-		Name:    "print",
-		Help:    "Displays various log file types written by bazel.",
-		Handler: printlog.HandlePrint,
+		Name: "explain",
+		Help: "Explains your build using compact execution logs.",
 	},
 	{
-		Name:    "remote",
-		Help:    "Runs a bazel command in the cloud with BuildBuddy's hosted bazel service.",
-		Handler: remotebazel.HandleRemoteBazel,
+		Name: "fix",
+		Help: "Applies fixes to WORKSPACE and BUILD files.",
+	},
+	// Handle 'help' command separately. It operates on parsed args rather than raw
+	// ones, so it does not fit the Handler signature and is dispatched by
+	// cli/cmd/bb before the args are resolved (see cli/help).
+	{
+		Name: "install",
+		Help: "Installs a bb plugin (https://buildbuddy.io/plugins).",
 	},
 	{
-		Name:    "update",
-		Help:    "Updates the bb CLI to the latest version.",
-		Handler: update.HandleUpdate,
+		Name: "login",
+		Help: "Configures bb commands to use your BuildBuddy API key.",
 	},
 	{
-		Name:    "upload",
-		Help:    "Uploads files to the remote cache.",
-		Handler: upload.HandleUpload,
+		Name: "logout",
+		Help: "Configures bb commands to no longer use your saved API key.",
 	},
 	{
-		Name:    "version",
-		Help:    "Prints bb cli version info.",
-		Handler: versioncmd.HandleVersion,
+		Name: "print",
+		Help: "Displays various log file types written by bazel.",
 	},
 	{
-		Name:    "explain",
-		Help:    "Explains the difference between two compact execution logs.",
-		Handler: explain.HandleExplain,
+		Name: "record",
+		Help: "Records command output and streams it to BuildBuddy.",
 	},
+	{
+		Name: "remote",
+		Help: "Runs a bazel command in the cloud with BuildBuddy's hosted bazel service.",
+	},
+	{
+		Name: "remote-download",
+		Help: "Fetches a remote asset via an intermediate cache.",
+	},
+	{
+		Name: "search",
+		Help: "Searches for code in the remote codesearch index.",
+	},
+	{
+		Name: "ssh",
+		Help: "Runs an SSH client on a user-mode wireguard network.",
+	},
+	{
+		Name: "ssh-server",
+		Help: "Runs an SSH server on a user-mode wireguard network.",
+	},
+	{
+		Name: "index",
+		Help: "Sends updates to the remote codesearch index.",
+	},
+	{
+		Name: "ui",
+		Help: "Opens an interactive terminal UI for viewing builds.",
+	},
+	{
+		Name: "update",
+		Help: "Updates the bb CLI to the latest version.",
+	},
+	{
+		Name: "upload",
+		Help: "Uploads files to the remote cache.",
+	},
+	{
+		Name: "version",
+		Help: "Prints bb cli version info.",
+	},
+	{
+		Name: "view",
+		Help: "Views build logs from BuildBuddy.",
+	},
+}
+
+var (
+	// CommandsByName is a map of every known CLI command, each indexed by its
+	// Name field.
+	CommandsByName = make(map[string]*Command, len(Commands))
+
+	// Aliases maps every known alias to its corresponding CLI command.
+	Aliases = map[string]*Command{}
+)
+
+func init() {
+	for _, command := range Commands {
+		CommandsByName[command.Name] = command
+		for _, alias := range command.Aliases {
+			Aliases[alias] = command
+		}
+	}
+}
+
+// GetCommand returns the Command corresponding to the provided command name or
+// alias, or nil if no such Command exists.
+func GetCommand(commandName string) *Command {
+	if command, ok := CommandsByName[commandName]; ok {
+		return command
+	}
+	if command, ok := Aliases[commandName]; ok {
+		return command
+	}
+	return nil
+}
+
+// IsCommand returns whether name is recognized as a bb CLI command name or
+// alias.
+func IsCommand(name string) bool {
+	return GetCommand(name) != nil
 }

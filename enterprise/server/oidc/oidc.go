@@ -38,6 +38,7 @@ var (
 	oauthProviders       = flag.Slice("auth.oauth_providers", []OauthProvider{}, "The list of oauth providers to use to authenticate.")
 	disableRefreshToken  = flag.Bool("auth.disable_refresh_token", false, "If true, the offline_access scope which requests refresh tokens will not be requested.")
 	forceApproval        = flag.Bool("auth.force_approval", false, "If true, when a user doesn't have a session (first time logging in, or manually logged out) force the auth provider to show the consent screen allowing the user to select an account if they have multiple. This isn't supported by all auth providers.")
+	additionalScopes     = flag.Slice("auth.oauth_scopes", []string{}, "The list of any additional OAuth scopes needed by the application.")
 )
 
 type OauthProvider struct {
@@ -221,17 +222,14 @@ type apiKeyGroupCacheEntry struct {
 type OpenIDAuthenticator struct {
 	env                  environment.Env
 	myURL                *url.URL
-	parseClaims          func(token string) (*claims.Claims, error)
+	parseClaims          func(ctx context.Context, token string) (*claims.Claims, error)
 	authenticators       []authenticator
 	enableAnonymousUsage bool
-	adminGroupID         string
 }
 
 func createAuthenticatorsFromConfig(ctx context.Context, env environment.Env, authConfigs []OauthProvider, authURL *url.URL) ([]authenticator, error) {
 	var authenticators []authenticator
 	for _, authConfig := range authConfigs {
-		// declare local var that shadows loop var for closure capture
-		authConfig := authConfig
 		oidcConfig := &oidc.Config{
 			ClientID:        authConfig.ClientID,
 			SkipExpiryCheck: false,
@@ -258,6 +256,10 @@ func createAuthenticatorsFromConfig(ctx context.Context, env environment.Env, au
 					// https://github.com/coreos/go-oidc/blob/v2.2.1/oidc.go#L30
 					if authConfig.IssuerURL != "https://accounts.google.com" && !*disableRefreshToken {
 						scopes = append(scopes, oidc.ScopeOfflineAccess)
+					}
+					// Add in additional user-provided scopes.
+					if len(*additionalScopes) > 0 {
+						scopes = append(scopes, *additionalScopes...)
 					}
 					// Configure an OpenID Connect aware OAuth2 client.
 					authenticator.cachedOauth2Config = &oauth2.Config{
@@ -290,7 +292,7 @@ func createAuthenticatorsFromConfig(ctx context.Context, env environment.Env, au
 	return authenticators, nil
 }
 
-func newOpenIDAuthenticator(ctx context.Context, env environment.Env, oauthProviders []OauthProvider, adminGroupID string) (*OpenIDAuthenticator, error) {
+func newOpenIDAuthenticator(ctx context.Context, env environment.Env, oauthProviders []OauthProvider) (*OpenIDAuthenticator, error) {
 	authenticators, err := createAuthenticatorsFromConfig(
 		ctx,
 		env,
@@ -301,22 +303,17 @@ func newOpenIDAuthenticator(ctx context.Context, env environment.Env, oauthProvi
 		return nil, err
 	}
 
-	claimsFunc := claims.ParseClaims
-	claimsCache, err := claims.NewClaimsCache()
+	claimsParser, err := claims.NewClaimsParser(claims.DefaultKeyProvider)
 	if err != nil {
 		return nil, err
-	}
-	if claimsCache != nil {
-		claimsFunc = claimsCache.Get
 	}
 
 	return &OpenIDAuthenticator{
 		env:                  env,
 		myURL:                build_buddy_url.WithPath(""),
 		authenticators:       authenticators,
-		parseClaims:          claimsFunc,
+		parseClaims:          claimsParser.Parse,
 		enableAnonymousUsage: AnonymousUsageEnabled(),
-		adminGroupID:         adminGroupID,
 	}, nil
 }
 
@@ -325,7 +322,7 @@ func AnonymousUsageEnabled() bool {
 }
 
 func newForTesting(ctx context.Context, env environment.Env, testAuthenticator authenticator) (*OpenIDAuthenticator, error) {
-	oia, err := newOpenIDAuthenticator(ctx, env, nil /*oauthProviders=*/, "")
+	oia, err := newOpenIDAuthenticator(ctx, env, nil /*oauthProviders=*/)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +330,7 @@ func newForTesting(ctx context.Context, env environment.Env, testAuthenticator a
 	return oia, nil
 }
 
-func NewOpenIDAuthenticator(ctx context.Context, env environment.Env, adminGroupID string) (*OpenIDAuthenticator, error) {
+func NewOpenIDAuthenticator(ctx context.Context, env environment.Env) (*OpenIDAuthenticator, error) {
 	authConfigs := make([]OauthProvider, len(*oauthProviders))
 	copy(authConfigs, *oauthProviders)
 	if selfauth.Enabled() {
@@ -351,16 +348,12 @@ func NewOpenIDAuthenticator(ctx context.Context, env environment.Env, adminGroup
 		return nil, status.FailedPreconditionErrorf("No auth providers specified in config!")
 	}
 
-	a, err := newOpenIDAuthenticator(ctx, env, authConfigs, adminGroupID)
+	a, err := newOpenIDAuthenticator(ctx, env, authConfigs)
 	if err != nil {
 		alert.UnexpectedEvent("authentication_configuration_failed", "Failed to configure authentication: %s", err)
 	}
 
 	return a, err
-}
-
-func (a *OpenIDAuthenticator) AdminGroupID() string {
-	return a.adminGroupID
 }
 
 func (a *OpenIDAuthenticator) AnonymousUsageEnabled(ctx context.Context) bool {
@@ -464,7 +457,7 @@ func (a *OpenIDAuthenticator) AuthContextFromAPIKey(ctx context.Context, apiKey 
 	}
 	ctx = context.WithValue(ctx, authutil.APIKeyHeader, apiKey)
 	c, err := a.claimsFromAPIKey(ctx, apiKey)
-	return claims.AuthContextFromClaims(ctx, c, err)
+	return claims.AuthContextWithJWT(ctx, c, err)
 }
 
 func (a *OpenIDAuthenticator) TrustedJWTFromAuthContext(ctx context.Context) string {
@@ -484,7 +477,7 @@ func (a *OpenIDAuthenticator) claimsFromAPIKey(ctx context.Context, apiKey strin
 	if err != nil {
 		return nil, err
 	}
-	return claims.APIKeyGroupClaims(akg), nil
+	return claims.APIKeyGroupClaims(ctx, akg)
 }
 
 func (a *OpenIDAuthenticator) claimsFromAPIKeyID(ctx context.Context, apiKeyID string) (*claims.Claims, error) {
@@ -492,7 +485,7 @@ func (a *OpenIDAuthenticator) claimsFromAPIKeyID(ctx context.Context, apiKeyID s
 	if err != nil {
 		return nil, err
 	}
-	return claims.APIKeyGroupClaims(akg), nil
+	return claims.APIKeyGroupClaims(ctx, akg)
 }
 
 func (a *OpenIDAuthenticator) claimsFromAuthorityString(ctx context.Context, authority string) (*claims.Claims, error) {
@@ -562,7 +555,7 @@ func (a *OpenIDAuthenticator) authenticateGRPCRequest(ctx context.Context, accep
 // `contextUserErrorKey` context value.
 func (a *OpenIDAuthenticator) AuthenticatedGRPCContext(ctx context.Context) context.Context {
 	c, err := a.authenticateGRPCRequest(ctx, true /* acceptJWT= */)
-	return claims.AuthContextFromClaims(ctx, c, err)
+	return claims.AuthContextWithJWT(ctx, c, err)
 }
 
 func (a *OpenIDAuthenticator) AuthenticatedHTTPContext(w http.ResponseWriter, r *http.Request) context.Context {
@@ -576,7 +569,7 @@ func (a *OpenIDAuthenticator) AuthenticatedHTTPContext(w http.ResponseWriter, r 
 	if err != nil {
 		return authutil.AuthContextWithError(ctx, err)
 	}
-	return claims.AuthContextFromClaims(ctx, c, err)
+	return claims.AuthContextWithJWT(ctx, c, err)
 }
 
 func (a *OpenIDAuthenticator) authenticateUser(w http.ResponseWriter, r *http.Request) (*claims.Claims, *userToken, error) {
@@ -638,6 +631,9 @@ func (a *OpenIDAuthenticator) authenticateUser(w http.ResponseWriter, r *http.Re
 	// the token below.
 	if ut, err := auth.verifyTokenAndExtractUser(ctx, jwt, true /*=checkExpiry*/); err == nil {
 		claims, err := claims.ClaimsFromSubID(ctx, a.env, ut.GetSubID())
+		if claims != nil && auth.getSlug() != "" {
+			claims.CustomerSSO = true
+		}
 		return claims, ut, err
 	}
 
@@ -681,6 +677,9 @@ func (a *OpenIDAuthenticator) authenticateUser(w http.ResponseWriter, r *http.Re
 
 	cookie.SetLoginCookie(w, jwt, issuer, sessionID, newToken.Expiry.Unix())
 	claims, err := claims.ClaimsFromSubID(ctx, a.env, ut.GetSubID())
+	if claims != nil && auth.getSlug() != "" {
+		claims.CustomerSSO = true
+	}
 	return claims, ut, err
 }
 
@@ -714,7 +713,7 @@ func (a *OpenIDAuthenticator) FillUser(ctx context.Context, user *tables.User) e
 	user.ImageURL = t.Picture
 	if t.slug != "" {
 		user.Groups = []*tables.GroupRole{
-			{Group: tables.Group{URLIdentifier: t.slug}},
+			{URLIdentifier: t.slug},
 		}
 	}
 	return nil
@@ -778,11 +777,11 @@ func (a *OpenIDAuthenticator) Logout(w http.ResponseWriter, r *http.Request) err
 	// their access token.
 	jwt := cookie.GetCookie(r, cookie.JWTCookie)
 	if jwt == "" {
-		return status.UnauthenticatedError("Logged out!")
+		return nil
 	}
 	sessionID := cookie.GetCookie(r, cookie.SessionIDCookie)
 	if sessionID == "" {
-		return status.UnauthenticatedError("Logged out!")
+		return nil
 	}
 
 	if authDB := a.env.GetAuthDB(); authDB != nil {
@@ -790,7 +789,7 @@ func (a *OpenIDAuthenticator) Logout(w http.ResponseWriter, r *http.Request) err
 			log.Errorf("Error clearing user session on logout: %s", err)
 		}
 	}
-	return status.UnauthenticatedError("Logged out!")
+	return nil
 }
 
 func (a *OpenIDAuthenticator) Auth(w http.ResponseWriter, r *http.Request) error {

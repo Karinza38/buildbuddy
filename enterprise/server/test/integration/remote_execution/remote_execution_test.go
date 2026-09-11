@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/build_event_publisher"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/test/integration/remote_execution/rbetest"
@@ -23,6 +23,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/execution"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
+	"github.com/buildbuddy-io/buildbuddy/server/build_event_publisher"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
@@ -35,6 +36,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rexec"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -50,7 +52,9 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
+	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 )
 
 const (
@@ -128,8 +132,10 @@ func TestActionResultCacheWithFailedAction(t *testing.T) {
 	assert.Equal(t, 5, res.ExitCode, "exit code should be propagated")
 
 	ctx := context.Background()
-	execRes, err := execution.GetCachedExecuteResponse(ctx, rbe.GetActionResultStorageClient(), res.ID)
-	require.NoError(t, err)
+	// ExecuteResponse should eventually be cached (this can happen in the
+	// background since it's only used to power the Execution page, and is not
+	// strictly needed by the RE client).
+	execRes := waitForCachedExecuteResponse(ctx, t, rbe, res)
 	assert.Equal(t, int32(5), execRes.GetResult().GetExitCode(), "exit code should be set in action result")
 	stdout, stderr, err := rbe.GetStdoutAndStderr(ctx, execRes.GetResult(), res.InstanceName)
 	require.NoError(t, err)
@@ -197,6 +203,9 @@ func TestSimpleCommand_Timeout_StdoutStderrStillVisible(t *testing.T) {
 	assert.Equal(t, 1, int(taskCount-initialTaskCount), "unexpected number of tasks started")
 	execRes, err := execution.GetCachedExecuteResponse(ctx, rbe.GetActionResultStorageClient(), res.ID)
 	require.NoError(t, err)
+	// The ExecuteResponse will have auxiliary metadata, while the ActionResult will not.
+	assert.NotEmpty(t, execRes.GetResult().GetExecutionMetadata().GetAuxiliaryMetadata())
+	execRes.GetResult().GetExecutionMetadata().AuxiliaryMetadata = nil
 	assert.Empty(
 		t,
 		cmp.Diff(res.ActionResult, execRes.GetResult(), protocmp.Transform()),
@@ -459,6 +468,10 @@ func TestSimpleCommand_RunnerReuse_ReLinksFilesFromDuplicateInputs(t *testing.T)
 }
 
 func TestSimpleCommand_RunnerReuse_MultipleExecutors_RoutesCommandToSameExecutor(t *testing.T) {
+	// Set a long max scheduling delay and disable work-stealing to guarantee
+	// affinity routing.
+	flags.Set(t, "remote_execution.max_scheduling_delay", 24*time.Hour)
+	flags.Set(t, "executor.excess_capacity_threshold", -1)
 	ctx := context.Background()
 	rbe := rbetest.NewRBETestEnv(t)
 
@@ -471,39 +484,69 @@ func TestSimpleCommand_RunnerReuse_MultipleExecutors_RoutesCommandToSameExecutor
 			{Name: "preserve-workspace", Value: "true"},
 			{Name: "OSFamily", Value: runtime.GOOS},
 			{Name: "Arch", Value: runtime.GOARCH},
-			{Name: "runner-recycling-max-wait", Value: "1m"},
+			{Name: "runner-recycling-max-wait", Value: "24h"},
 		},
 	}
 	opts := &rbetest.ExecuteOpts{APIKey: rbe.APIKey1}
+	ctx = rbe.WithAPIKey(ctx, rbe.APIKey1)
 
+	// Note: output_paths are needed for affinity routing to work, and
+	// output_paths are also deleted between runs. So we always write the
+	// output to 'foo.out', and using a separate non-output path to check
+	// for runner persistence.
 	cmd := rbe.Execute(&repb.Command{
-		Arguments:   []string{"touch", "foo.txt"},
-		OutputPaths: []string{"foo.txt"},
+		Arguments: []string{"sh", "-ec", `
+			touch foo.out
+			echo foo > persistent.txt
+		`},
+		OutputPaths: []string{"foo.out"},
 		Platform:    platform,
 	}, opts)
 	res := cmd.Wait()
 
 	require.Equal(t, 0, res.ExitCode)
 
+	execRes := waitForCachedExecuteResponse(ctx, t, rbe, res)
+	auxMeta := getExecutionAuxiliaryMetadata(t, execRes)
+	// Check runner task number - should be 1
+	require.Equal(t, int64(1), auxMeta.GetRunnerMetadata().GetTaskNumber())
+	runnerID := auxMeta.GetRunnerMetadata().GetRunnerId()
+	// Runner ID is arbitrary, but should be nonempty
+	require.NotEmpty(t, runnerID)
+
 	rbetest.WaitForAnyPooledRunner(t, ctx)
 
 	cmd = rbe.Execute(&repb.Command{
-		Arguments:   []string{"stat", "foo.txt"},
-		OutputPaths: []string{"foo.txt"},
+		Arguments: []string{"sh", "-ec", `
+			touch foo.out
+			stat persistent.txt
+		`},
+		OutputPaths: []string{"foo.out"},
 		Platform:    platform,
 	}, opts)
 	res = cmd.Wait()
 
 	require.Equal(t, "", res.Stderr)
 	require.Equal(t, 0, res.ExitCode)
+
+	execRes = waitForCachedExecuteResponse(ctx, t, rbe, res)
+	auxMeta = getExecutionAuxiliaryMetadata(t, execRes)
+	// Check task number - should be 2 now
+	require.Equal(t, int64(2), auxMeta.GetRunnerMetadata().GetTaskNumber())
+	// Runner ID should be the same as the previous one
+	require.Equal(t, runnerID, auxMeta.GetRunnerMetadata().GetRunnerId())
 }
 
 func TestSimpleCommand_RunnerReuse_PoolSelectionViaHeader_RoutesCommandToSameExecutor(t *testing.T) {
+	// Set a long max scheduling delay and disable work-stealing to guarantee
+	// affinity routing.
+	flags.Set(t, "remote_execution.max_scheduling_delay", 24*time.Hour)
+	flags.Set(t, "executor.excess_capacity_threshold", -1)
 	ctx := context.Background()
 	rbe := rbetest.NewRBETestEnv(t)
 
 	rbe.AddBuildBuddyServers(3)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{Pool: "foo"})
 	}
 
@@ -514,7 +557,7 @@ func TestSimpleCommand_RunnerReuse_PoolSelectionViaHeader_RoutesCommandToSameExe
 			{Name: "Pool", Value: "THIS_VALUE_SHOULD_BE_OVERRIDDEN"},
 			{Name: "OSFamily", Value: runtime.GOOS},
 			{Name: "Arch", Value: runtime.GOARCH},
-			{Name: "runner-recycling-max-wait", Value: "1m"},
+			{Name: "runner-recycling-max-wait", Value: "24h"},
 		},
 	}
 	opts := &rbetest.ExecuteOpts{
@@ -525,8 +568,11 @@ func TestSimpleCommand_RunnerReuse_PoolSelectionViaHeader_RoutesCommandToSameExe
 	}
 
 	cmd := rbe.Execute(&repb.Command{
-		Arguments:   []string{"touch", "foo.txt"},
-		OutputPaths: []string{"foo.txt"},
+		Arguments: []string{"sh", "-ec", `
+			touch foo.out
+			echo foo > persistent.txt
+		`},
+		OutputPaths: []string{"foo.out"},
 		Platform:    platform,
 	}, opts)
 	res := cmd.Wait()
@@ -536,8 +582,11 @@ func TestSimpleCommand_RunnerReuse_PoolSelectionViaHeader_RoutesCommandToSameExe
 	rbetest.WaitForAnyPooledRunner(t, ctx)
 
 	cmd = rbe.Execute(&repb.Command{
-		Arguments:   []string{"stat", "foo.txt"},
-		OutputPaths: []string{"foo.txt"},
+		Arguments: []string{"sh", "-ec", `
+			touch foo.out
+			stat persistent.txt
+		`},
+		OutputPaths: []string{"foo.out"},
 		Platform:    platform,
 	}, opts)
 	res = cmd.Wait()
@@ -711,12 +760,12 @@ func TestSimpleCommand_DefaultWorkspacePermissions(t *testing.T) {
 	}, &rbetest.ExecuteOpts{InputRootDir: inputRoot})
 	res := cmd.Wait()
 
-	expectedOutput := ""
+	var expectedOutput strings.Builder
 	for _, dir := range dirs {
-		expectedOutput += "755 " + dir + "\n"
+		expectedOutput.WriteString("777 " + dir + "\n")
 	}
 
-	require.Equal(t, expectedOutput, res.Stdout)
+	require.Equal(t, expectedOutput.String(), res.Stdout)
 }
 
 func TestSimpleCommand_NonrootWorkspacePermissions(t *testing.T) {
@@ -730,7 +779,6 @@ func TestSimpleCommand_NonrootWorkspacePermissions(t *testing.T) {
 
 	platform := &repb.Platform{
 		Properties: []*repb.Platform_Property{
-			{Name: "nonroot-workspace", Value: "true"},
 			{Name: "OSFamily", Value: runtime.GOOS},
 			{Name: "Arch", Value: runtime.GOARCH},
 		},
@@ -755,12 +803,12 @@ func TestSimpleCommand_NonrootWorkspacePermissions(t *testing.T) {
 	}, &rbetest.ExecuteOpts{InputRootDir: inputRoot})
 	res := cmd.Wait()
 
-	expectedOutput := ""
+	var expectedOutput strings.Builder
 	for _, dir := range dirs {
-		expectedOutput += "777 " + dir + "\n"
+		expectedOutput.WriteString("777 " + dir + "\n")
 	}
 
-	require.Equal(t, expectedOutput, res.Stdout)
+	require.Equal(t, expectedOutput.String(), res.Stdout)
 }
 
 func TestManySimpleCommandsWithMultipleExecutors(t *testing.T) {
@@ -770,7 +818,7 @@ func TestManySimpleCommandsWithMultipleExecutors(t *testing.T) {
 	rbe.AddExecutors(t, 5)
 
 	var cmds []*rbetest.Command
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
 		cmds = append(cmds, cmd)
 	}
@@ -790,7 +838,7 @@ func TestRedisAvailabilityMonitoring(t *testing.T) {
 	rbe.AddExecutors(t, 5)
 
 	var cmds []*rbetest.Command
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
 		cmds = append(cmds, cmd)
 	}
@@ -1349,17 +1397,15 @@ func TestSaturateTaskQueue(t *testing.T) {
 		},
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 10 {
+		wg.Go(func() {
 
-			cmd := rbe.Execute(cmdProto, &rbetest.ExecuteOpts{})
+			cmd := rbe.Execute(cmdProto, &rbetest.ExecuteOpts{DoNotCacheAction: true})
 			res := cmd.Wait()
 
 			require.NoError(t, res.Err)
 			require.Equal(t, 0, res.ExitCode)
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -1387,7 +1433,7 @@ func TestMultipleSchedulersAndExecutors(t *testing.T) {
 	rbe.AddExecutors(t, 5)
 
 	var cmds []*rbetest.Command
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
 		cmds = append(cmds, cmd)
 	}
@@ -1416,7 +1462,7 @@ func TestWorkSchedulingOnNewExecutor(t *testing.T) {
 
 	// Schedule some additional commands that existing executors can't take on.
 	var cmds []*rbetest.Command
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
 		cmds = append(cmds, cmd)
 	}
@@ -1449,13 +1495,13 @@ func TestWaitExecution(t *testing.T) {
 	rbe := rbetest.NewRBETestEnv(t)
 
 	// Start multiple servers so that executions are spread out across different servers.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		rbe.AddBuildBuddyServer()
 	}
 	rbe.AddExecutors(t, 5)
 
 	var cmds []*rbetest.ControlledCommand
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmds = append(cmds, rbe.ExecuteControlledCommand(fmt.Sprintf("command%d", i+1), &rbetest.ExecuteControlledOpts{}))
 	}
 
@@ -1517,7 +1563,10 @@ func (f *fixedNodeTaskRouter) RankNodes(ctx context.Context, action *repb.Action
 	return out
 }
 
-func (f *fixedNodeTaskRouter) MarkComplete(ctx context.Context, action *repb.Action, cmd *repb.Command, remoteInstanceName, executorHostID string) {
+func (f *fixedNodeTaskRouter) MarkSucceeded(ctx context.Context, action *repb.Action, cmd *repb.Command, remoteInstanceName, executorHostID string) {
+}
+
+func (f *fixedNodeTaskRouter) MarkFailed(ctx context.Context, action *repb.Action, cmd *repb.Command, remoteInstanceName, executorHostID string) {
 }
 
 func (f *fixedNodeTaskRouter) UpdateSubset(executorIDs []string) {
@@ -1555,7 +1604,7 @@ func TestTaskReservationsNotLostOnExecutorShutdown(t *testing.T) {
 	// Now schedule some commands. The fake task router will ensure that the reservations only land on "busy"
 	// executors.
 	var cmds []*rbetest.Command
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmd := rbe.ExecuteCustomCommand("sh", "-c", fmt.Sprintf("echo 'hello from command %d'", i))
 		cmds = append(cmds, cmd)
 	}
@@ -1608,7 +1657,6 @@ func TestCommandWithMissingInputRootDigest(t *testing.T) {
 
 func TestRedisRestart(t *testing.T) {
 	workspaceContents := map[string]string{
-		"WORKSPACE": `workspace(name = "integration_test")`,
 		"BUILD": fmt.Sprintf(`genrule(
   name = "hello_txt",
   outs = ["hello.txt"],
@@ -1617,12 +1665,13 @@ func TestRedisRestart(t *testing.T) {
     "OSFamily": "%s",
     "Arch": "%s",
   },
+  tags = ["no-remote-cache"],
 )`, runtime.GOOS, runtime.GOARCH),
 	}
 
 	var redisShards []*testredis.Handle
-	for i := 0; i < 4; i++ {
-		redisShards = append(redisShards, testredis.StartTCP(t))
+	for range 4 {
+		redisShards = append(redisShards, testredis.Start(t))
 	}
 
 	args := []string{
@@ -1634,14 +1683,10 @@ func TestRedisRestart(t *testing.T) {
 	}
 	app := buildbuddy_enterprise.RunWithConfig(t, buildbuddy_enterprise.DefaultAppConfig(t), buildbuddy_enterprise.NoAuthConfig, args...)
 
-	_ = testexecutor.Run(
-		t,
-		testexecutor.ExecutorRunfilePath,
-		[]string{"--executor.app_target=" + app.GRPCAddress()},
-	)
+	_ = testexecutor.Run(t, "--executor.app_target="+app.GRPCAddress())
 
 	ctx := context.Background()
-	ws := testbazel.MakeTempWorkspace(t, workspaceContents)
+	ws := testbazel.MakeTempModule(t, workspaceContents)
 	buildFlags := []string{"//:hello.txt"}
 	buildFlags = append(buildFlags, app.BESBazelFlags()...)
 	buildFlags = append(buildFlags, app.RemoteExecutorBazelFlags()...)
@@ -1664,7 +1709,7 @@ func TestRedisRestart(t *testing.T) {
 				victimShard = shard
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 	require.NotNil(t, victimShard, "could not find victim shard")
 
@@ -1676,13 +1721,41 @@ func TestRedisRestart(t *testing.T) {
 
 	assert.NoError(t, result.Error)
 	assert.Contains(t, result.Stderr, "Build completed successfully")
-	require.NotContains(
-		t, result.Stderr, "1 remote cache hit",
-		"sanity check: initial build shouldn't be cached",
-	)
+}
+
+type cancelInvocationTestCase struct {
+	name  string
+	flags map[string]any
 }
 
 func TestInvocationCancellation(t *testing.T) {
+	for _, tc := range []cancelInvocationTestCase{
+		{
+			name: "executions stored in redis",
+			flags: map[string]any{
+				"remote_execution.write_execution_progress_state_to_redis": true,
+				"remote_execution.write_executions_to_primary_db":          false,
+			},
+		},
+		{
+			name: "executions stored in DB",
+			flags: map[string]any{
+				"remote_execution.write_execution_progress_state_to_redis": false,
+				"remote_execution.write_executions_to_primary_db":          true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testInvocationCancellation(t, tc)
+		})
+	}
+}
+
+func testInvocationCancellation(t *testing.T, tc cancelInvocationTestCase) {
+	for k, v := range tc.flags {
+		flags.Set(t, k, v)
+	}
+
 	rbe := rbetest.NewRBETestEnv(t)
 
 	bbServer := rbe.AddBuildBuddyServer()
@@ -1690,7 +1763,7 @@ func TestInvocationCancellation(t *testing.T) {
 	initialTaskCount := testmetrics.CounterValue(t, metrics.RemoteExecutionTasksStartedCount)
 
 	iid := uuid.NewString()
-	bep, err := build_event_publisher.New(bbServer.GRPCAddress(), "", iid)
+	bep, err := build_event_publisher.New(bbServer.PublishBuildEventClient(), "", iid)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1739,7 +1812,7 @@ func WaitForPendingExecution(rdb redis.UniversalClient, opID string) error {
 	if err != nil {
 		return err
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, err := rdb.Get(context.Background(), forwardKey).Result()
 		if err == nil {
 			return nil
@@ -1750,7 +1823,7 @@ func WaitForPendingExecution(rdb redis.UniversalClient, opID string) error {
 }
 
 func TestActionMerging_Success(t *testing.T) {
-	rbe := rbetest.NewRBETestEnv(t)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
 
 	rbe.AddBuildBuddyServer()
 	rbe.AddExecutor(t)
@@ -1778,17 +1851,123 @@ func TestActionMerging_Success(t *testing.T) {
 	WaitForPendingExecution(rbe.GetRedisClient(), op3)
 	require.NotEqual(t, op2, op3, "actions under different organizations should not be merged")
 
-	cmd4 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, APIKey: rbe.APIKey1, InvocationID: "invocation4"})
+	cmd4 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: false, APIKey: rbe.APIKey1, InvocationID: "invocation4"})
 	op4 := cmd4.WaitAccepted()
-	require.Equal(t, op3, op4, "expected actions to be merged")
+	require.Equal(t, op3, op4, "expected actions to be merged, even with skip_cache_lookup")
+}
+
+func TestActionMerging_CancellationDoesntAffectMergedActions(t *testing.T) {
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+
+	bbServer := rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	bep, err := build_event_publisher.New(bbServer.PublishBuildEventClient(), "", "invocation1")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	bep.Start(ctx)
+
+	startTime := time.Now()
+	err = bep.Publish(&bespb.BuildEvent{
+		Payload: &bespb.BuildEvent_Started{
+			Started: &bespb.BuildStarted{
+				StartTime: timestamppb.New(startTime),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", "sleep 5"},
+		Platform:  platform,
+	}
+	cmd1 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation1"})
+	op1 := cmd1.WaitAccepted()
+
+	cmd2 := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: "invocation2"})
+	op2 := cmd2.WaitAccepted()
+	require.Equal(t, op1, op2, "the execution IDs for both commands should be the same")
+
+	// Cancel the first invocation.
+	finishTime := time.Now()
+	err = bep.Publish(&bespb.BuildEvent{
+		Payload: &bespb.BuildEvent_Finished{
+			Finished: &bespb.BuildFinished{
+				ExitCode:   &bespb.BuildFinished_ExitCode{Name: "INTERRUPTED", Code: build_event_handler.InterruptedExitCode},
+				FinishTime: timestamppb.New(finishTime),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Verify that the action can run to completion.
+
+	res := cmd1.Wait()
+	require.Equal(t, 0, res.ExitCode)
+
+	res = cmd2.Wait()
+	require.Equal(t, 0, res.ExitCode)
+}
+
+func TestActionMerging_ScheduledConcurrently(t *testing.T) {
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+
+	// This test is racy by nature, but would fail open in case of flakiness.
+	// Reduce the chance this happens by rerunning the test a few times, which
+	// doesn't hurt test times since most of the time is spent in shutdown
+	// anyway.
+	for n := range 5 {
+		cmd := &repb.Command{
+			Arguments: []string{"sh", "-c", fmt.Sprintf("sleep %d", 5+n)},
+			Platform:  platform,
+		}
+
+		wg := sync.WaitGroup{}
+		ops := make(chan string, 5)
+		for i := range 5 {
+			wg.Go(func() {
+				exec := rbe.Execute(cmd, &rbetest.ExecuteOpts{CheckCache: true, InvocationID: fmt.Sprintf("invocation%d", i)})
+				ops <- exec.WaitAccepted()
+			})
+		}
+		wg.Wait()
+		close(ops)
+
+		var onlyOp string
+		for op := range ops {
+			require.NotEmpty(t, op)
+			if onlyOp == "" {
+				onlyOp = op
+			} else {
+				require.Equal(t, onlyOp, op, "not all actions were merged")
+			}
+		}
+	}
 }
 
 func TestActionMerging_LongTask(t *testing.T) {
-	flags.Set(t, "remote_execution.lease_duration", 100*time.Millisecond)
-	rbe := rbetest.NewRBETestEnv(t)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
 	rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{
 		SchedulerServerOptions: scheduler_server.Options{
 			ActionMergingLeaseTTLOverride: 250 * time.Millisecond,
+			LeaseDuration:                 100 * time.Millisecond,
 		},
 	})
 	rbe.AddExecutor(t)
@@ -1817,7 +1996,7 @@ func TestActionMerging_LongTask(t *testing.T) {
 }
 
 func TestActionMerging_ClaimingAppDies(t *testing.T) {
-	rbe := rbetest.NewRBETestEnv(t)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
 	app := rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{
 		SchedulerServerOptions: scheduler_server.Options{
 			ActionMergingLeaseTTLOverride: time.Millisecond,
@@ -1857,7 +2036,7 @@ func TestActionMerging_ClaimingAppDies(t *testing.T) {
 
 func TestActionMerging_Hedging(t *testing.T) {
 	flags.Set(t, "remote_execution.action_merging_hedge_count", 2)
-	rbe := rbetest.NewRBETestEnv(t)
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
 	rbe.AddBuildBuddyServer()
 	rbe.AddExecutor(t)
 
@@ -1932,6 +2111,47 @@ touch %s`, counter, fname)
 	require.Equal(t, "FAST", strings.Trim(cmd4.Wait().Stdout, "\n"))
 }
 
+func TestActionMerging_DisabledWithDoNotCache(t *testing.T) {
+	rbe := rbetest.NewRBETestEnvWithOptions(t, &rbetest.EnvOptions{ShardedRedis: true})
+
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+
+	cmd := &repb.Command{
+		Arguments: []string{"sh", "-c", "sleep 10"},
+		Platform:  platform,
+	}
+
+	numOps := 5
+	wg := sync.WaitGroup{}
+	ops := make(chan string, numOps)
+	for i := range numOps {
+		wg.Go(func() {
+			exec := rbe.Execute(cmd, &rbetest.ExecuteOpts{
+				CheckCache:       true,
+				DoNotCacheAction: true,
+				InvocationID:     fmt.Sprintf("invocation%d", i),
+			})
+			ops <- exec.WaitAccepted()
+		})
+	}
+	wg.Wait()
+	close(ops)
+
+	opsSet := make(map[string]struct{})
+	for op := range ops {
+		opsSet[op] = struct{}{}
+	}
+	require.Len(t, opsSet, numOps, "expected all ops to be unique")
+}
+
 func TestAppShutdownDuringExecution_PublishOperationRetried(t *testing.T) {
 	// Set a short progress publish interval since we want to test killing an
 	// app while an update stream is in progress, and want to catch the error
@@ -1974,7 +2194,7 @@ func TestAppShutdownDuringExecution_PublishOperationRetried(t *testing.T) {
 	rbe.AppProxy.SetDirector(director)
 
 	var cmds []*rbetest.ControlledCommand
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmd := rbe.ExecuteControlledCommand(fmt.Sprintf("cmd-%d", i), &rbetest.ExecuteControlledOpts{
 			// Allow reconnecting with WaitExecution since the test will hard
 			// stop the app, which kills the Execute stream.
@@ -2004,7 +2224,6 @@ func TestAppShutdownDuringExecution_PublishOperationRetried(t *testing.T) {
 
 	eg := &errgroup.Group{}
 	for _, cmd := range cmds {
-		cmd := cmd
 		eg.Go(func() error {
 			// Maybe let the command continue execution for a bit, then exit.
 			randSleepMillis(0, 50)
@@ -2025,15 +2244,20 @@ func TestAppShutdownDuringExecution_PublishOperationRetried(t *testing.T) {
 }
 
 func TestAppShutdownDuringExecution_LeaseTaskRetried(t *testing.T) {
-	// Set a short lease TTL since we want to test killing an app while an
-	// update stream is in progress, and want to catch the error early.
-	flags.Set(t, "remote_execution.lease_duration", 50*time.Millisecond)
 	initialTasksStartedCount := testmetrics.CounterValue(t, metrics.RemoteExecutionTasksStartedCount)
 
 	rbe := rbetest.NewRBETestEnv(t)
 
-	app1 := rbe.AddBuildBuddyServer()
-	app2 := rbe.AddBuildBuddyServer()
+	schedOpts := &rbetest.BuildBuddyServerOptions{
+		SchedulerServerOptions: scheduler_server.Options{
+			// Set a short lease TTL since we want to test killing an app while
+			// an update stream is in progress, and want to catch the error
+			// early.
+			LeaseDuration: 50 * time.Millisecond,
+		},
+	}
+	app1 := rbe.AddBuildBuddyServerWithOptions(schedOpts)
+	app2 := rbe.AddBuildBuddyServerWithOptions(schedOpts)
 
 	// Set up a custom proxy director that makes sure we choose app1 for the
 	// initial LeaseTask request, so that we can test stopping app1 while
@@ -2067,7 +2291,7 @@ func TestAppShutdownDuringExecution_LeaseTaskRetried(t *testing.T) {
 	rbe.AddExecutor(t)
 
 	var cmds []*rbetest.ControlledCommand
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		cmd := rbe.ExecuteControlledCommand(fmt.Sprintf("cmd-%d", i), &rbetest.ExecuteControlledOpts{
 			// Allow reconnecting with WaitExecution since the test will hard
 			// stop the app, which kills the Execute stream.
@@ -2097,7 +2321,6 @@ func TestAppShutdownDuringExecution_LeaseTaskRetried(t *testing.T) {
 
 	eg := &errgroup.Group{}
 	for _, cmd := range cmds {
-		cmd := cmd
 		eg.Go(func() error {
 			// Maybe let the command continue execution for a bit, then exit.
 			randSleepMillis(0, 50)
@@ -2146,7 +2369,211 @@ func TestTerminationGracePeriod(t *testing.T) {
 	assert.Equal(t, "Got SIGTERM\n", res.Stdout)
 }
 
+func TestContainerRegistryBypass(t *testing.T) {
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+	rbe.AddExecutor(t)
+
+	platform := &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			// container-registry-bypass is only supported for server admin
+			// users in impersionation mode - this should fail with an auth
+			// error, even if we're setting it in a non-canonical way, using
+			// weird casing.
+			{Name: "container-ReGiStRy-bypass", Value: "true"},
+			{Name: "OSFamily", Value: runtime.GOOS},
+			{Name: "Arch", Value: runtime.GOARCH},
+		},
+	}
+	cmd := rbe.Execute(&repb.Command{
+		Arguments: []string{"pwd"},
+		Platform:  platform,
+	}, &rbetest.ExecuteOpts{})
+
+	err := cmd.MustFailToSchedule()
+	require.True(t, status.IsUnauthenticatedError(err) || status.IsPermissionDeniedError(err), "expected auth error, got %+#v (%q)", err, err)
+}
+
+func TestProactiveCancellation(t *testing.T) {
+	// Enable proactive cancellation on both the scheduler and executors.
+	flags.Set(t, "remote_execution.proactive_cancellation_enabled", true)
+	flags.Set(t, "executor.proactive_cancellation_enabled", true)
+	// Disable work stealing and queue pruning to make scheduling more
+	// predictable and make sure we're testing the right thing.
+	flags.Set(t, "executor.excess_capacity_threshold", -1)
+	flags.Set(t, "executor.queue_trim_interval", 0)
+
+	rbe := rbetest.NewRBETestEnv(t)
+	rbe.AddBuildBuddyServer()
+
+	// Add 2 single-task executors so each can only run one task at a time.
+	executor1 := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "executor1"})
+	executor2 := rbe.AddSingleTaskExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: "executor2"})
+
+	totalQueueLen := func() int {
+		return executor1.QueueLength() + executor2.QueueLength()
+	}
+
+	// Schedule command1 to occupy one executor.
+	cmd1 := rbe.ExecuteControlledCommand("command1", &rbetest.ExecuteControlledOpts{})
+	cmd1.WaitStarted()
+
+	// The other executor should try the lease and fail, then eventually there
+	// should be no tasks in either queue.
+	require.Eventually(t, func() bool {
+		return totalQueueLen() == 0
+	}, time.Minute, 10*time.Millisecond)
+
+	// Now schedule command2. Since one executor is busy, command2 should:
+	// - Get queued on the busy executor (waiting for resources)
+	// - Start running on the other executor
+	cmd2 := rbe.ExecuteControlledCommand("command2", &rbetest.ExecuteControlledOpts{})
+	cmd2.WaitStarted()
+
+	// Wait for the task reservation to be queued on the busy executor.
+	require.Eventually(t, func() bool {
+		return totalQueueLen() == 1
+	}, time.Minute, 10*time.Millisecond)
+
+	// Now complete command2. This should trigger proactive cancellation of
+	// the task reservation on the other executor.
+	cmd2.Exit(0)
+	res2 := cmd2.Wait()
+	assert.Equal(t, 0, res2.ExitCode)
+
+	// Wait for the cancellation to propagate - total queue length should become
+	// 0.
+	require.Eventually(t, func() bool {
+		return totalQueueLen() == 0
+	}, time.Minute, 10*time.Millisecond)
+
+	// Clean up: exit command1.
+	cmd1.Exit(0)
+	res1 := cmd1.Wait()
+	assert.Equal(t, 0, res1.ExitCode)
+}
+
+func TestExternallyRetriedTask_OOMError_MemoryEstimateIncreasedForNextAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// observedMemoryFactor is how much memory the task used when it was
+		// OOM-killed, as a multiple of its initial memory estimate.
+		observedMemoryFactor float64
+		// expectResize is whether the OOM kill should increase the task's memory
+		// estimate for its next attempt.
+		expectResize bool
+	}{
+		{
+			// The task used more memory than its estimate, so its estimate should
+			// be increased to cover the observed usage.
+			name:                 "task exceeded its memory estimate",
+			observedMemoryFactor: 2,
+			expectResize:         true,
+		},
+		{
+			// The task used less memory than its estimate (it was OOM-killed for
+			// some other reason), so its estimate should be left unchanged.
+			name:                 "task stayed within its memory estimate",
+			observedMemoryFactor: 0.5,
+			expectResize:         false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Create an RBE setup where the test can control the returned command
+			// results via resultsChan.
+			rbe := rbetest.NewRBETestEnv(t)
+			rbe.AddBuildBuddyServer()
+			resultsChan := make(chan *interfaces.CommandResult)
+			rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{
+				Name: "executor1",
+				RunInterceptor: func(ctx context.Context, _original rbetest.RunFunc) *interfaces.CommandResult {
+					return <-resultsChan
+				},
+			})
+
+			// Create an arbitrary task that we will execute multiple times and
+			// observe how its task size is updated.
+			cmdProto := &repb.Command{Arguments: []string{"/bin/true"}}
+
+			// Check the initial memory estimate for this task by running it and
+			// observing the reported memory estimate. Do this twice to confirm that
+			// the estimate is stable.
+			var initialMemoryEstimateBytes int64
+			for i := range 2 {
+				cmd := rbe.Execute(cmdProto, &rbetest.ExecuteOpts{})
+				resultsChan <- &interfaces.CommandResult{}
+				res := cmd.Wait()
+				estimatedMemoryBytes := res.ActionResult.GetExecutionMetadata().GetEstimatedTaskSize().GetEstimatedMemoryBytes()
+				require.Greater(t, estimatedMemoryBytes, int64(0))
+				if i > 0 {
+					require.Equal(t, initialMemoryEstimateBytes, estimatedMemoryBytes, "memory estimate is not stable")
+				} else {
+					initialMemoryEstimateBytes = estimatedMemoryBytes
+				}
+			}
+			require.Greater(t, initialMemoryEstimateBytes, int64(0))
+
+			// Execute the task, simulating an OOM error. In the OOM error details,
+			// report that the task used observedMemoryFactor times its memory
+			// estimate.
+			oomObservedMemoryBytes := int64(test.observedMemoryFactor * float64(initialMemoryEstimateBytes))
+			cmd := rbe.Execute(cmdProto, &rbetest.ExecuteOpts{})
+			resultsChan <- &interfaces.CommandResult{
+				Error: oom.Error(oom.Details{
+					ObservedMemoryBytes:  oomObservedMemoryBytes,
+					EstimatedMemoryBytes: initialMemoryEstimateBytes,
+				}),
+			}
+			res := cmd.MustTerminateAbnormally()
+			require.True(t, status.IsUnavailableError(res.Err))
+
+			// Retry the same task, but have it succeed this time.
+			cmd = rbe.Execute(cmdProto, &rbetest.ExecuteOpts{})
+			resultsChan <- &interfaces.CommandResult{}
+			res = cmd.Wait()
+			require.Equal(t, 0, res.ExitCode)
+
+			retriedTaskMemoryEstimateBytes := res.ActionResult.GetExecutionMetadata().GetEstimatedTaskSize().GetEstimatedMemoryBytes()
+			if test.expectResize {
+				// The retry should be scheduled with at least the memory the task
+				// used when it was OOM-killed, so that it isn't just OOM-killed
+				// again at the same memory level.
+				require.GreaterOrEqual(t, retriedTaskMemoryEstimateBytes, oomObservedMemoryBytes)
+			} else {
+				// The estimate should be unchanged from the initial estimate, since
+				// the task didn't actually exceed it.
+				require.Equal(t, initialMemoryEstimateBytes, retriedTaskMemoryEstimateBytes)
+			}
+		})
+	}
+}
+
+type customResourcesTest struct {
+	Name             string
+	MeasuredTaskSize *scpb.TaskSize
+}
+
 func TestCustomResources(t *testing.T) {
+	for _, test := range []customResourcesTest{
+		{
+			Name: "respects custom resources if measured size is available",
+			MeasuredTaskSize: &scpb.TaskSize{
+				EstimatedMilliCpu:    1000,
+				EstimatedMemoryBytes: 100e6,
+			},
+		},
+		{
+			Name:             "respects custom resources if measured size is unavailable",
+			MeasuredTaskSize: nil,
+		},
+	} {
+		t.Run(test.Name, func(t *testing.T) {
+			testCustomResources(t, test)
+		})
+	}
+}
+
+func testCustomResources(t *testing.T, test customResourcesTest) {
 	flags.Set(t, "executor.custom_resources", []resources.CustomResource{
 		{Name: "foo", Value: 1.0},
 	})
@@ -2157,6 +2584,11 @@ func TestCustomResources(t *testing.T) {
 	rbe.AddBuildBuddyServerWithOptions(&rbetest.BuildBuddyServerOptions{
 		EnvModifier: func(env *real_environment.RealEnv) {
 			env.SetTaskRouter(taskRouter)
+			env.SetTaskSizer(&rbetest.FakeTaskSizer{
+				GetImpl: func(ctx context.Context, cmd *repb.Command, props *platform.Properties) *scpb.TaskSize {
+					return test.MeasuredTaskSize
+				},
+			})
 		},
 	})
 	rbe.AddExecutorWithOptions(t, &rbetest.ExecutorOptions{Name: ex1ID})
@@ -2199,7 +2631,7 @@ func TestCustomResources(t *testing.T) {
 	// are all currently tied up by the command we've started above.
 	taskRouter.UpdateSubset([]string{ex1ID, ex2ID})
 	var cmds []*rbetest.ControlledCommand
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		log.Infof("Starting smaller commands...")
 		cmd := rbe.ExecuteControlledCommand(fmt.Sprintf("cmd-%d", i), &rbetest.ExecuteControlledOpts{
 			Properties: []*repb.Platform_Property{
@@ -2243,11 +2675,29 @@ func getProgressStates(t *testing.T, c *rbetest.Command) []repb.ExecutionProgres
 		rsp, err := rexec.UnpackOperation(op)
 		require.NoError(t, err)
 		var progress repb.ExecutionProgress
-		ok, err := rexec.AuxiliaryMetadata(rsp.ExecuteOperationMetadata.GetPartialExecutionMetadata(), &progress)
+		ok, err := rexec.FindFirstAuxiliaryMetadata(rsp.ExecuteOperationMetadata.GetPartialExecutionMetadata(), &progress)
 		require.NoError(t, err)
 		if ok {
 			states = append(states, progress.ExecutionState)
 		}
 	}
 	return states
+}
+
+func waitForCachedExecuteResponse(ctx context.Context, t testing.TB, rbe *rbetest.Env, res *rbetest.CommandResult) *repb.ExecuteResponse {
+	require.Eventually(t, func() bool {
+		_, err := execution.GetCachedExecuteResponse(ctx, rbe.GetActionResultStorageClient(), res.ID)
+		return err == nil
+	}, 1*time.Minute, 100*time.Millisecond)
+	execRes, err := execution.GetCachedExecuteResponse(ctx, rbe.GetActionResultStorageClient(), res.ID)
+	require.NoError(t, err)
+	return execRes
+}
+
+func getExecutionAuxiliaryMetadata(t testing.TB, execRes *repb.ExecuteResponse) *espb.ExecutionAuxiliaryMetadata {
+	auxMeta := &espb.ExecutionAuxiliaryMetadata{}
+	ok, err := rexec.FindFirstAuxiliaryMetadata(execRes.GetResult().GetExecutionMetadata(), auxMeta)
+	require.NoError(t, err)
+	require.True(t, ok)
+	return auxMeta
 }

@@ -3,28 +3,35 @@ package networking
 import (
 	"bufio"
 	"context"
-	"flag"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/background"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
+
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 var (
@@ -32,6 +39,12 @@ var (
 	preserveExistingNetNamespaces = flag.Bool("executor.preserve_existing_netns", false, "Preserve existing bb-executor net namespaces. By default all \"bb-executor\" net namespaces are removed on executor startup, but if multiple executors are running on the same machine this behavior should be disabled to prevent them interfering with each other.")
 	natSourcePortRange            = flag.String("executor.nat_source_port_range", "", "If set, restrict the source ports for NATed traffic to this range. ")
 	networkLockDir                = flag.String("executor.network_lock_directory", "", "If set, use this directory to store lockfiles for allocated IP ranges. This is required if running multiple executors within the same networking environment.")
+	taskIPRange                   = flag.String("executor.task_ip_range", "192.168.0.0/16", "Subnet to allocate IP addresses from for actions that require network access. Must be a /16 range.")
+	taskAllowedPrivateIPs         = flag.Slice("executor.task_allowed_private_ips", []string{}, "Allowed private IPs that should be reachable from actions: either 'default', an IP address, or IP range. Private IP ranges as defined in RFC1918 are otherwise blocked.")
+	networkStatsEnabled           = flag.Bool("executor.network_stats_enabled", false, "Enable basic tx/rx statistics.")
+	clampMSSToPMTU                = flag.Bool("executor.clamp_mss_to_pmtu", false, "Clamp the TCP MSS to the PMTU for outgoing connections.")
+	_                             = flag.Alias[bool]("executor.clamp_mss_to_pmtu", "executor.clamp-mss-to-pmtu") // old misnamed flag
+	cleanupStaleVethDevices       = flag.Bool("executor.cleanup_stale_veth_devices", false, "If true, clean up stale veth devices with conflicting IPs before creating new ones.", flag.Internal)
 
 	// Private IP ranges, as defined in RFC1918.
 	PrivateIPRanges = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"}
@@ -66,12 +79,31 @@ var (
 	// utilization to 100% utilization while allowing all tasks to use a pooled
 	// network. (The number 4 is based on the current min CPU task size estimate
 	// of 250m)
-	defaultContainerNetworkPoolSizeLimit = runtime.NumCPU() * 4
+	defaultNetworkPoolSizeLimit = runtime.NumCPU() * 4
+
+	// Files in the /sys/class/net/<device>/statistics directory which are read
+	// when reporting network stats.
+	netStatFiles = []string{
+		"rx_bytes",
+		"rx_packets",
+		"tx_bytes",
+		"tx_packets",
+	}
 )
+
+type DNSOverride struct {
+	HostnameToOverride string `yaml:"hostname_to_override"`
+	RedirectToHostname string `yaml:"redirect_to_hostname"`
+}
 
 // runCommand runs the provided command, prepending sudo if the calling user is
 // not already root. Output and errors are returned.
 func sudoCommand(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+	commandLabel := getCommandLabel(args...)
+	tracing.AddStringAttributeToCurrentSpan(ctx, "command", commandLabel)
+
 	// If we're not running as root, use sudo.
 	// Use "-A" to ensure we never get stuck prompting for
 	// a password interactively.
@@ -79,11 +111,56 @@ func sudoCommand(ctx context.Context, args ...string) ([]byte, error) {
 		args = append([]string{"sudo", "-A"}, args...)
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	start := time.Now()
+	defer func() {
+		var cpuTime time.Duration
+		if cmd.ProcessState != nil {
+			cpuTime = cmd.ProcessState.UserTime() + cmd.ProcessState.SystemTime()
+		}
+		metrics.NetworkingCommandDurationUsec.With(prometheus.Labels{
+			metrics.CommandName: commandLabel,
+		}).Observe(float64(time.Since(start).Microseconds()))
+		metrics.NetworkingCommandCPUUsageUsec.With(prometheus.Labels{
+			metrics.CommandName: commandLabel,
+		}).Observe(float64(cpuTime.Microseconds()))
+	}()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, status.InternalErrorf("run %q: %s: %s", cmd, err, string(out))
 	}
 	return out, nil
+}
+
+// Returns a metrics label for a networking command, omitting arguments.
+func getCommandLabel(args ...string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if args[0] == "ip" {
+		// 'ip' commands follow a syntax like 'ip OBJECT COMMAND', e.g. 'ip
+		// route add', 'ip link set', etc. - so we always report the first 3
+		// args.
+		label := strings.Join(args[:min(3, len(args))], " ")
+		// For 'ip netns exec' specifically, also include the label for the
+		// command executed in the namespace.
+		if label == "ip netns exec" && len(args) > 4 {
+			return label + " NAMESPACE " + getCommandLabel(args[4:]...)
+		}
+		return label
+	}
+	// There are various iptables commands that we run, but for now just report
+	// 'iptables' and the flag indicating whether we're adding or deleting.
+	if args[0] == "iptables" {
+		if slices.Contains(args, "-A") {
+			return "iptables -A"
+		}
+		if slices.Contains(args, "--delete") {
+			return "iptables --delete"
+		}
+		return "iptables"
+	}
+	return args[0]
 }
 
 // runCommand runs the provided command, prepending sudo if the calling user is
@@ -108,28 +185,25 @@ func DeleteNetNamespaces(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	output := strings.TrimSpace(string(b))
-	if len(output) == 0 {
-		return nil
-	}
 	var lastErr error
-	for _, ns := range strings.Split(output, "\n") {
+	found, deleted := 0, 0
+	for ns := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 		// Sometimes the output contains spaces, like
-		//     bb-executor-1
-		//     bb-executor-2
-		//     3fe4313e-eb76-4b6d-9d61-53caf12b87e6 (id: 344)
-		//     2ab15e85-d1c3-47bc-ad40-74e2941157a4 (id: 332)
+		//     bb-executor-1 (id: 344)
 		// So we get just the first column here.
 		fields := strings.Fields(ns)
-		if len(fields) > 0 {
-			ns = fields[0]
-		}
-		if !strings.HasPrefix(ns, netNamespacePrefix) {
+		if len(fields) == 0 || !strings.HasPrefix(fields[0], netNamespacePrefix) {
 			continue
 		}
-		if _, err := sudoCommand(ctx, "ip", "netns", "delete", ns); err != nil {
+		found++
+		if _, err := sudoCommand(ctx, "ip", "netns", "delete", fields[0]); err != nil {
 			lastErr = err
+			continue
 		}
+		deleted++
+	}
+	if found > 0 {
+		log.CtxWarningf(ctx, "Cleaned up %d of %d stale executor network namespaces left by a previous process.", deleted, found)
 	}
 	return lastErr
 }
@@ -176,12 +250,100 @@ func randomVethName(prefix string) (string, error) {
 	return prefix + suffix, nil
 }
 
-// createRandomVethPair attempts to create a veth pair with random names, the veth1 end of which will
-// be in the root namespace.
+// cleanupStaleVeths removes any existing veth devices that have the given IP
+// address assigned. This handles the case where a previous process was killed
+// without cleanup (e.g. SIGKILL), leaving orphaned veth devices with stale
+// routes that would cause routing conflicts with newly created veth pairs.
+func cleanupStaleVeths(ctx context.Context, ipWithCIDR string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return status.WrapError(err, "list links")
+	}
+	targetIP, _, err := net.ParseCIDR(ipWithCIDR)
+	if err != nil {
+		return status.WrapError(err, "parse target IP")
+	}
+	for _, link := range links {
+		// Only consider veth devices to avoid accidentally deleting
+		// non-veth interfaces that happen to share the same IP.
+		if link.Type() != "veth" {
+			continue
+		}
+		addrs, err := netlink.AddrList(link, 0 /* FAMILY_ALL */)
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if addr.IP.Equal(targetIP) {
+				staleDev := link.Attrs().Name
+				log.CtxWarningf(ctx, "Cleaning up stale veth device %q with IP %s (likely from a killed process)", staleDev, targetIP)
+				if err := runCommand(ctx, "ip", "link", "delete", staleDev); err != nil {
+					log.CtxWarningf(ctx, "Failed to delete stale veth device %q: %s", staleDev, err)
+				}
+				break // inner loop: each link has one matching addr at most
+			}
+		}
+	}
+	return nil
+}
+
+// checkVethRoute checks whether return traffic to the namespaced end of a veth
+// pair will be routed through the expected host device. A stale veth left by a
+// killed executor process can install the same connected route and silently
+// blackhole return traffic to the task, including DNS responses.
+//
+// This is a diagnostic only: it logs what it finds and never fails the network
+// setup.
+func checkVethRoute(ctx context.Context, veth *vethPair) {
+	if veth == nil || veth.network == nil {
+		log.CtxWarningf(ctx, "Network route check failed: cannot check veth route without an assigned network")
+		return
+	}
+
+	expectedLink, err := netlink.LinkByName(veth.hostDevice)
+	if err != nil {
+		log.CtxWarningf(ctx, "Network route check failed: could not look up expected host device %q: %s", veth.hostDevice, err)
+		return
+	}
+
+	guestIP := net.ParseIP(veth.network.NamespacedIP())
+	routes, err := netlink.RouteGet(guestIP)
+	if err != nil {
+		log.CtxWarningf(ctx, "Network route check failed: could not resolve host route to guest IP %s via expected device %q: %s", guestIP, veth.hostDevice, err)
+		return
+	}
+	if len(routes) == 0 {
+		log.CtxWarningf(ctx, "Network route check failed: no host route found to guest IP %s via expected device %q", guestIP, veth.hostDevice)
+		return
+	}
+
+	actualRoute := routes[0]
+	if actualRoute.LinkIndex == expectedLink.Attrs().Index {
+		return
+	}
+
+	actualDevice := fmt.Sprintf("ifindex-%d", actualRoute.LinkIndex)
+	if actualLink, err := netlink.LinkByIndex(actualRoute.LinkIndex); err == nil {
+		actualDevice = actualLink.Attrs().Name
+	}
+	log.CtxWarningf(
+		ctx,
+		"Network route conflict: host route to guest IP %s uses device %q (ifindex %d), expected device %q (ifindex %d); route: %+v",
+		guestIP,
+		actualDevice,
+		actualRoute.LinkIndex,
+		veth.hostDevice,
+		expectedLink.Attrs().Index,
+		actualRoute,
+	)
+}
+
+// createRandomVethPair attempts to create a veth pair with random names, the
+// veth1 end of which will be in the root namespace.
 func createRandomVethPair(ctx context.Context, netns *Namespace) (string, string, error) {
 	var namespacedVeth, hostVeth string
 	var err error
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		// Compute unique veth names
 		namespacedVeth, err = randomVethName("veth0")
 		if err != nil {
@@ -215,37 +377,70 @@ func attachAddressToVeth(ctx context.Context, netns *Namespace, ipAddr, vethName
 	}
 }
 
-// ContainerNetworkPool holds a pool of container networks that can be reused
-// across container instances. This pooling helps to reduce the performance
-// overhead associated with rapidly creating and destroying networks along with
-// all of their associated configuration.
-//
-// TODO: consolidate logic so that VM networks can be pooled too. VMs have an
-// additional TAP device which isn't needed for container networks, but most of
-// the other setup is the same.
-type ContainerNetworkPool struct {
+// VethPairNetwork is the interface common to OCI container networks and VM
+// networks. Both types of networks are based on veth pairs with one end of the
+// network inside a net namespace. Both types of networks can also be pooled and
+// reused, which mostly removes the cost associated with creating network
+// namespaces.
+type VethPairNetwork interface {
+	comparable
+
+	getVethPair() *vethPair
+
+	// Runs any additional logic needed before adding the network to a pool,
+	// just before removing addresses from the veth pair devices.
+	deactivate(ctx context.Context) error
+
+	// Runs any additional logic needed before returning the network from a
+	// pool, just after new addresses have been assigned to the veth pair
+	// devices.
+	activate(ctx context.Context) error
+
+	Cleanup(ctx context.Context) error
+}
+
+// VethNetworkPool holds a pool of VethPairNetworks that can be reused across
+// executions. This pooling helps to reduce the performance overhead associated
+// with rapidly creating and destroying networks along with all of their
+// associated configuration.
+type VethNetworkPool[T VethPairNetwork] struct {
 	sizeLimit int
 
 	mu           sync.Mutex
-	resources    []*ContainerNetwork
+	resources    []T
 	shuttingDown bool
 }
 
+type ContainerNetworkPool = VethNetworkPool[*ContainerNetwork]
+
 func NewContainerNetworkPool(sizeLimit int) *ContainerNetworkPool {
 	if sizeLimit < 0 {
-		sizeLimit = defaultContainerNetworkPoolSizeLimit
+		sizeLimit = defaultNetworkPoolSizeLimit
 	}
-	return &ContainerNetworkPool{
+	return &VethNetworkPool[*ContainerNetwork]{
+		sizeLimit: sizeLimit,
+	}
+}
+
+type VMNetworkPool = VethNetworkPool[*VMNetwork]
+
+func NewVMNetworkPool(sizeLimit int) *VMNetworkPool {
+	if sizeLimit < 0 {
+		sizeLimit = defaultNetworkPoolSizeLimit
+	}
+	return &VethNetworkPool[*VMNetwork]{
 		sizeLimit: sizeLimit,
 	}
 }
 
 // Get returns a pooled veth pair, or nil if there are no pooled veth pairs
 // available.
-func (p *ContainerNetworkPool) Get(ctx context.Context) *ContainerNetwork {
+func (p *VethNetworkPool[T]) Get(ctx context.Context) T {
+	var zero T
+
 	n := p.get()
-	if n == nil {
-		return nil
+	if n == zero {
+		return zero
 	}
 
 	// If we fail to fully set up the network, then we're on the hook for
@@ -265,36 +460,61 @@ func (p *ContainerNetworkPool) Get(ctx context.Context) *ContainerNetwork {
 	// Assign a new IP before returning the network from the pool.
 	network, err := hostNetAllocator.Get()
 	if err != nil {
-		log.CtxErrorf(ctx, "Failed to allocate new IP range for pooled network: %s", err)
-		return nil
+		log.CtxWarningf(ctx, "Failed to allocate new IP range for pooled network: %s", err)
+		return zero
 	}
-	n.vethPair.network = network
+	n.getVethPair().network = network
+
+	// Clean up stale veths before assigning the new IP, to avoid routing
+	// conflicts with orphaned devices from killed processes.
+	if *cleanupStaleVethDevices {
+		if err := cleanupStaleVeths(ctx, network.HostIPWithCIDR()); err != nil {
+			log.CtxWarningf(ctx, "Error during stale veth cleanup for %s: %s", network.HostIPWithCIDR(), err)
+		}
+	}
 
 	// Assign IPs to the host and namespaced side, and create the default route
 	// in the namespace.
-	if err := attachAddressToVeth(ctx, nil /*=namespace*/, network.HostIPWithCIDR(), n.vethPair.hostDevice); err != nil {
-		log.CtxErrorf(ctx, "Failed to attach address to pooled host veth interface: %s", err)
-		return nil
+	if err := attachAddressToVeth(ctx, nil /*=namespace*/, network.HostIPWithCIDR(), n.getVethPair().hostDevice); err != nil {
+		log.CtxWarningf(ctx, "Failed to attach address to pooled host veth interface: %s", err)
+		return zero
 	}
-	if err := attachAddressToVeth(ctx, n.vethPair.netns, network.NamespacedIPWithCIDR(), n.vethPair.namespacedDevice); err != nil {
-		log.CtxErrorf(ctx, "Failed to attach address to pooled namespaced veth interface: %s", err)
-		return nil
+	if err := attachAddressToVeth(ctx, n.getVethPair().netns, network.NamespacedIPWithCIDR(), n.getVethPair().namespacedDevice); err != nil {
+		log.CtxWarningf(ctx, "Failed to attach address to pooled namespaced veth interface: %s", err)
+		return zero
 	}
-	if err := runCommand(ctx, namespace(n.vethPair.netns, "ip", "route", "add", "default", "via", network.HostIP())...); err != nil {
-		log.CtxErrorf(ctx, "Failed to set up default route in namespace: %s", err)
-		return nil
+	if err := runCommand(ctx, namespace(n.getVethPair().netns, "ip", "route", "add", "default", "via", network.HostIP())...); err != nil {
+		log.CtxWarningf(ctx, "Failed to set up default route in namespace: %s", err)
+		return zero
+	}
+	checkVethRoute(ctx, n.getVethPair())
+
+	// Record a new baseline for network stats, so that the stats reported for
+	// the action only reflect the accumulated stats relative to the baseline.
+	if err := n.getVethPair().updateBaseline(ctx); err != nil {
+		log.CtxWarningf(ctx, "Failed to reset networking stats: %s", err)
+		return zero
+	}
+
+	// Run any implementation-specific logic needed to bring up the pooled
+	// network.
+	if err := n.activate(ctx); err != nil {
+		log.CtxWarningf(ctx, "Failed to activate pooled network: %s", err)
+		return zero
 	}
 
 	ok = true
 	return n
 }
 
-func (p *ContainerNetworkPool) get() *ContainerNetwork {
+func (p *VethNetworkPool[T]) get() T {
+	var zero T
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if len(p.resources) == 0 {
-		return nil
+		return zero
 	}
 
 	head, tail := p.resources[0], p.resources[1:]
@@ -305,10 +525,17 @@ func (p *ContainerNetworkPool) get() *ContainerNetwork {
 // Add adds a veth pair to the pool.
 // It returns whether the veth pair was successfully added.
 // The caller should clean up the veth pair if this returns false.
-func (p *ContainerNetworkPool) Add(ctx context.Context, n *ContainerNetwork) (ok bool) {
+func (p *VethNetworkPool[T]) Add(ctx context.Context, n T) (ok bool) {
+	// Run any implementation-specific logic needed to deactivate the network
+	// before pooling.
+	if err := n.deactivate(ctx); err != nil {
+		log.CtxErrorf(ctx, "Failed to deactivate network before pooling: %s", err)
+		return false
+	}
+
 	// Unassign the IP addresses before adding to the pool. We'll later assign a
 	// new IP when taking the network back out of the pool.
-	if err := n.vethPair.RemoveAddrs(ctx); err != nil {
+	if err := n.getVethPair().RemoveAddrs(ctx); err != nil {
 		log.CtxErrorf(ctx, "Failed to remove IP addresses from network before adding to pool: %s", err)
 		return false
 	}
@@ -326,7 +553,7 @@ func (p *ContainerNetworkPool) Add(ctx context.Context, n *ContainerNetwork) (ok
 
 // Shutdown cleans up any pooled resources and prevents new resources from being
 // returned by the pool.
-func (p *ContainerNetworkPool) Shutdown(ctx context.Context) error {
+func (p *VethNetworkPool[T]) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
 	p.shuttingDown = true
 	resources := p.resources
@@ -349,6 +576,8 @@ func (p *ContainerNetworkPool) Shutdown(ctx context.Context) error {
 
 // HostNetAllocator assigns unique /30 networks from the host for use in VMs.
 type HostNetAllocator struct {
+	baseAddr [4]byte
+
 	mu sync.Mutex
 	// Next index to try locking; wraps around at numAssignableNetworks.
 	// Since most tasks are short-lived, this usually will point to an index
@@ -363,20 +592,34 @@ type HostNetAllocator struct {
 	}
 }
 
-var hostNetAllocator = &HostNetAllocator{}
+func NewHostNetAllocator(ipRange string) (*HostNetAllocator, error) {
+	p, err := netip.ParsePrefix(ipRange)
+	if err != nil {
+		return nil, err
+	}
+	if !p.Addr().Is4() {
+		return nil, fmt.Errorf("ipRange not an IPv4 address")
+	}
+	if p.Bits() != 16 {
+		return nil, fmt.Errorf("ipRange is not a /16")
+	}
+	return &HostNetAllocator{baseAddr: p.Addr().As4()}, nil
+}
+
+var hostNetAllocator *HostNetAllocator
 
 // HostNet represents a reserved /30 network from the host for use in a VM.
 type HostNet struct {
-	netIdx int
-	unlock func()
-}
-
-func (n *HostNet) CIDR() string {
-	return fmt.Sprintf("192.168.%d.%d", n.netIdx/30, (n.netIdx%30)*8+4) + cidrSuffix
+	baseAddr [4]byte
+	netIdx   int
+	unlock   func()
 }
 
 func (n *HostNet) HostIP() string {
-	return fmt.Sprintf("192.168.%d.%d", n.netIdx/30, (n.netIdx%30)*8+5)
+	ip := n.baseAddr
+	ip[2] = byte(n.netIdx / 30)
+	ip[3] = byte(n.netIdx%30)*8 + 5
+	return netip.AddrFrom4(ip).String()
 }
 
 func (n *HostNet) HostIPWithCIDR() string {
@@ -384,7 +627,10 @@ func (n *HostNet) HostIPWithCIDR() string {
 }
 
 func (n *HostNet) NamespacedIP() string {
-	return fmt.Sprintf("192.168.%d.%d", n.netIdx/30, ((n.netIdx%30)*8)+6)
+	ip := n.baseAddr
+	ip[2] = byte(n.netIdx / 30)
+	ip[3] = byte(n.netIdx%30)*8 + 6
+	return netip.AddrFrom4(ip).String()
 }
 
 func (n *HostNet) NamespacedIPWithCIDR() string {
@@ -405,7 +651,7 @@ func (a *HostNetAllocator) Get() (*HostNet, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	for attempt := 0; attempt < numAssignableNetworks; attempt++ {
+	for range numAssignableNetworks {
 		netIdx := a.idx
 		a.idx = (a.idx + 1) % numAssignableNetworks
 
@@ -432,8 +678,9 @@ func (a *HostNetAllocator) Get() (*HostNet, error) {
 		net.locked = true
 
 		return &HostNet{
-			netIdx: netIdx,
-			unlock: func() { a.unlock(netIdx) },
+			baseAddr: a.baseAddr,
+			netIdx:   netIdx,
+			unlock:   func() { a.unlock(netIdx) },
 		}, nil
 	}
 	return nil, status.ResourceExhaustedError("host IP address space exhausted")
@@ -484,6 +731,11 @@ type vethPair struct {
 	// root net namespace.
 	hostDevice string
 
+	// Stats for the host device captured when the device was returned from a
+	// pool. This is used to calculate the incremental network usage for a
+	// single action using the network.
+	hostBaselineStats *repb.NetworkStats
+
 	// namespacedDevice is the name of the end of the veth pair which is in the
 	// namespace.
 	namespacedDevice string
@@ -502,9 +754,14 @@ type vethPair struct {
 // setupVethPair creates a new veth pair with one end in the given network
 // namespace and the other end in the root namespace.
 //
+// If enableExternalNetworking is false, the veth pair will not have forwarding
+// rules added to allow traffic to external networks. This is useful for
+// Firecracker VMs that need internal networking (MMDS) but should not have
+// external network access.
+//
 // The Cleanup method must be called on the returned struct to clean up all
 // resources associated with it.
-func setupVethPair(ctx context.Context, netns *Namespace) (_ *vethPair, err error) {
+func setupVethPair(ctx context.Context, netns *Namespace, enableExternalNetworking bool) (_ *vethPair, err error) {
 	// Keep a list of cleanup work to be done.
 	var cleanupStack cleanupStack
 	// If we return an error from this func then we need to clean up any
@@ -537,6 +794,17 @@ func setupVethPair(ctx context.Context, netns *Namespace) (_ *vethPair, err erro
 		}
 		return nil
 	})
+
+	// Clean up any stale veth devices from previous processes that were
+	// killed without cleanup (e.g. SIGKILL). The flock on the IP range is
+	// released when the process dies, but the kernel-level veth pairs and
+	// routes persist. If we don't clean these up, return traffic will be
+	// routed to a stale veth instead of ours, breaking connectivity.
+	if *cleanupStaleVethDevices {
+		if err := cleanupStaleVeths(ctx, vp.network.HostIPWithCIDR()); err != nil {
+			log.CtxWarningf(ctx, "Error during stale veth cleanup for %s: %s", vp.network.HostIPWithCIDR(), err)
+		}
+	}
 
 	// Create a veth pair with randomly generated names.
 	vp.namespacedDevice, vp.hostDevice, err = createRandomVethPair(ctx, netns)
@@ -575,31 +843,68 @@ func setupVethPair(ctx context.Context, netns *Namespace) (_ *vethPair, err erro
 	if err != nil {
 		return nil, status.WrapError(err, "add default route in namespace")
 	}
+	checkVethRoute(ctx, vp)
 
 	if IsSecondaryNetworkEnabled() {
-		err = runCommand(ctx, "ip", "rule", "add", "from", vp.network.NamespacedIP(), "lookup", routingTableName)
+		// Capture the IP rather than reading vp.network in the cleanup func.
+		// Pooling nils vp.network (and assigns a different IP on reuse), so
+		// reading it at cleanup time would panic or delete the wrong rule.
+		//
+		// TODO: manage this rule in the pool transitions (delete on pool add,
+		// re-add for the new IP on pool get). Currently a network reused from
+		// the pool has no rt1 rule for its new IP, so its traffic routes over
+		// the primary interface instead of the secondary one.
+		namespacedIP := vp.network.NamespacedIP()
+		err = runCommand(ctx, "ip", "rule", "add", "from", namespacedIP, "lookup", routingTableName)
 		if err != nil {
 			return nil, err
 		}
 		cleanupStack = append(cleanupStack, func(ctx context.Context) error {
-			return runCommand(ctx, "ip", "rule", "del", "from", vp.network.NamespacedIP())
+			return runCommand(ctx, "ip", "rule", "del", "from", namespacedIP)
 		})
 	}
 
-	iptablesRules := [][]string{
+	var iptablesRules [][]string
+	for _, allow := range *taskAllowedPrivateIPs {
+		if allow == "default" {
+			defaultIP, err := DefaultIP(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("find default IP: %w", err)
+			}
+			allow = defaultIP.String()
+		}
+		iptablesRules = append(iptablesRules, []string{"FORWARD", "-i", vp.hostDevice, "-d", allow, "-j", "ACCEPT"})
+		iptablesRules = append(iptablesRules, []string{"INPUT", "-i", vp.hostDevice, "-d", allow, "-j", "ACCEPT"})
+	}
+	for _, r := range PrivateIPRanges {
+		iptablesRules = append(iptablesRules, []string{"FORWARD", "-i", vp.hostDevice, "-d", r, "-j", "REJECT"})
+		iptablesRules = append(iptablesRules, []string{"INPUT", "-i", vp.hostDevice, "-d", r, "-j", "REJECT"})
+	}
+	if enableExternalNetworking {
 		// Allow forwarding traffic between the host side of the veth pair and
 		// the device associated with the configured route prefix (usually the
 		// default route). This is necessary on hosts with default-deny policies
 		// in place.
-		{"FORWARD", "-i", vp.hostDevice, "-o", device, "-j", "ACCEPT"},
-		{"FORWARD", "-i", device, "-o", vp.hostDevice, "-j", "ACCEPT"},
-	}
-	for _, r := range PrivateIPRanges {
-		iptablesRules = append(iptablesRules, []string{"FORWARD", "-i", vp.hostDevice, "-d", r, "-j", "REJECT"})
+		iptablesRules = append(iptablesRules, [][]string{
+			{"FORWARD", "-i", vp.hostDevice, "-o", device, "-j", "ACCEPT"},
+			{"FORWARD", "-i", device, "-o", vp.hostDevice, "-j", "ACCEPT"},
+		}...)
+	} else {
+		// Block external network access by rejecting all forwarded traffic
+		// from/to this veth pair. This is needed because hosts may not have
+		// default-deny policies in iptables.
+		iptablesRules = append(iptablesRules, [][]string{
+			{"FORWARD", "-i", vp.hostDevice, "-j", "REJECT"},
+			{"FORWARD", "-o", vp.hostDevice, "-j", "REJECT"},
+		}...)
 	}
 
-	for _, rule := range iptablesRules {
-		if err := runCommand(ctx, append([]string{"iptables", "--wait", "-A"}, rule...)...); err != nil {
+	// IP rules are evaluated in order, so insert restrictions at the top of the
+	// table so they are evaluated before any more permissive default rules.
+	// Insert elements in reverse order to preserve the current ordering of the
+	// rules in the slice.
+	for _, rule := range slices.Backward(iptablesRules) {
+		if err := runCommand(ctx, append([]string{"iptables", "--wait", "-I"}, rule...)...); err != nil {
 			return nil, err
 		}
 		cleanupStack = append(cleanupStack, func(ctx context.Context) error {
@@ -607,8 +912,68 @@ func setupVethPair(ctx context.Context, netns *Namespace) (_ *vethPair, err erro
 		})
 	}
 
+	// Exempt guest traffic from destination NAT in the host's nat PREROUTING
+	// chain. Service proxies like kube-proxy install rules there that rewrite
+	// load balancer VIPs to backend pod IPs; a guest packet addressed to a
+	// public VIP would be rewritten to a private IP and then rejected by the
+	// private-range rules above. Guest traffic must leave the host addressed
+	// exactly as the guest sent it, like traffic from any external client.
+	// (ACCEPT only ends nat PREROUTING traversal; POSTROUTING masquerading
+	// still applies.)
+	natRule := []string{"-t", "nat", "-I", "PREROUTING", "-i", vp.hostDevice, "-j", "ACCEPT"}
+	if err := runCommand(ctx, append([]string{"iptables", "--wait"}, natRule...)...); err != nil {
+		return nil, err
+	}
+	cleanupStack = append(cleanupStack, func(ctx context.Context) error {
+		return runCommand(ctx, "iptables", "--wait", "-t", "nat", "--delete", "PREROUTING", "-i", vp.hostDevice, "-j", "ACCEPT")
+	})
+
 	vp.Cleanup = cleanupStack.Cleanup
 	return vp, nil
+}
+
+func (v *vethPair) updateBaseline(ctx context.Context) error {
+	stats, err := ReadInterfaceStats(ctx, v.hostDevice)
+	if err != nil {
+		return fmt.Errorf("read interface stats: %w", err)
+	}
+	v.hostBaselineStats = stats
+	return nil
+}
+
+func (v *vethPair) Stats(ctx context.Context) (*repb.NetworkStats, error) {
+	stats, err := ReadInterfaceStats(ctx, v.hostDevice)
+	if err != nil {
+		return nil, fmt.Errorf("read interface stats: %w", err)
+	}
+	if stats == nil {
+		return nil, nil
+	}
+
+	// Subtract the baseline stats so that we only report the incremental usage
+	// since the network was returned from the pool (if applicable).
+	if v.hostBaselineStats != nil {
+		subtractStats(stats, v.hostBaselineStats)
+	}
+
+	// Swap TX with RX stats. This is because every packet sent on the
+	// namespaced end is (normally) received on the host end, and vice versa.
+	//
+	// TODO: figure out whether it's possible for packets to be dropped across
+	// the veth pair, which would invalidate this assumption and probably result
+	// in incorrect stats when the system is under heavy load.
+	//
+	// TODO: ideally we would directly report the stats from the namespaced end
+	// of the veth pair, since the namespaced end is what the action actually
+	// interfaces with. But this would require entering the net namespace, which
+	// would mean either (A) shelling out to `ip netns exec`, which adds several
+	// ms of overhead (not ideal especially if we want to poll these metrics and
+	// show them in a graph), or (B) running some sort of persistent agent in
+	// the net namespace to collect the stats, which doesn't seem worth the
+	// complexity right now.
+	swapTxRx(stats)
+
+	return stats, nil
 }
 
 // RemoveAddrs unassigns the IP addresses from the host and veth side of the
@@ -643,7 +1008,7 @@ func (s cleanupStack) Cleanup(ctx context.Context) error {
 		s = s[:len(s)-1]
 		if err := f(ctx); err != nil {
 			// Short-circuit on the first error.
-			alert.UnexpectedEvent("network_cleanup_failed", "Networking cleanup failed. If too many of these errors accumulate, networking may stop functioning correctly. Error: %s", err)
+			alert.CtxUnexpectedEvent(ctx, "network_cleanup_failed", "Networking cleanup failed. If too many of these errors accumulate, networking may stop functioning correctly. Error: %s", err)
 			return err
 		}
 	}
@@ -657,13 +1022,18 @@ func (s cleanupStack) Cleanup(ctx context.Context) error {
 // resources, and reverts the applied host configuration.
 type VMNetwork struct {
 	netns    *Namespace
+	vmIP     string
 	vethPair *vethPair
 	cleanup  func(ctx context.Context) error
 }
 
 // CreateVMNetwork initializes a network namespace, networking
 // interfaces, and host configuration required for VM networking.
-func CreateVMNetwork(ctx context.Context, tapDeviceName, tapAddr, vmIP string) (_ *VMNetwork, err error) {
+//
+// If enableExternalNetworking is false, the VM will not be able to reach
+// external networks, but internal networking (including MMDS for init-dockerd)
+// will still work.
+func CreateVMNetwork(ctx context.Context, tapDeviceName, tapAddr, vmIP string, enableExternalNetworking bool) (_ *VMNetwork, err error) {
 	var cleanupStack cleanupStack
 	defer func() {
 		// If we failed to fully set up the network, make sure to clean up any
@@ -683,7 +1053,7 @@ func CreateVMNetwork(ctx context.Context, tapDeviceName, tapAddr, vmIP string) (
 	})
 
 	// Create a veth pair with one end in the namespace.
-	vethPair, err := setupVethPair(ctx, netns)
+	vethPair, err := setupVethPair(ctx, netns, enableExternalNetworking)
 	if err != nil {
 		return nil, status.WrapError(err, "setup veth pair")
 	}
@@ -704,19 +1074,81 @@ func CreateVMNetwork(ctx context.Context, tapDeviceName, tapAddr, vmIP string) (
 		{"ip", "tuntap", "add", "name", tapDeviceName, "mode", "tap"},
 		{"ip", "addr", "add", tapAddr, "dev", tapDeviceName},
 		{"ip", "link", "set", tapDeviceName, "up"},
-		{"iptables", "--wait", "-t", "nat", "-A", "POSTROUTING", "-o", vethPair.namespacedDevice, "-s", vmIP, "-j", "SNAT", "--to", vethPair.network.NamespacedIP()},
-		{"iptables", "--wait", "-t", "nat", "-A", "PREROUTING", "-i", vethPair.namespacedDevice, "-d", vethPair.network.NamespacedIP(), "-j", "DNAT", "--to", vmIP},
 	} {
 		if err := runCommand(ctx, namespace(netns, command...)...); err != nil {
 			return nil, status.WrapError(err, "set up tap device")
 		}
 	}
 
-	return &VMNetwork{
+	// Rewrite SYN packets sent through the host to have an MTU equal to the
+	// path MTU because GCP machines have smaller MTUs. This requires the
+	// xt_TCPMSS kernel module, which may not be available in all environments.
+	// TODO(go/b/6539): remove this.
+	if *clampMSSToPMTU {
+		if err := runCommand(ctx, "iptables", "--wait", "-t", "mangle", "-A",
+			"FORWARD", "-i", vethPair.hostDevice, "-p", "tcp", "--tcp-flags",
+			"SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"); err != nil {
+			log.CtxWarningf(ctx, "Failed to set up TCPMSS clamping (xt_TCPMSS "+
+				"module may not be available): %s", err)
+		} else {
+			cleanupStack = append(cleanupStack, func(ctx context.Context) error {
+				return runCommand(ctx, "iptables", "--wait", "-t", "mangle", "-D",
+					"FORWARD", "-i", vethPair.hostDevice, "-p", "tcp",
+					"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+					"--clamp-mss-to-pmtu")
+			})
+		}
+	}
+
+	v := &VMNetwork{
 		netns:    netns,
+		vmIP:     vmIP,
 		vethPair: vethPair,
 		cleanup:  cleanupStack.Cleanup,
-	}, nil
+	}
+	if err := v.setupTapNATRules(ctx); err != nil {
+		return nil, err
+	}
+
+	return v, nil
+}
+
+func (v *VMNetwork) getVethPair() *vethPair {
+	return v.vethPair
+}
+
+func (v *VMNetwork) activate(ctx context.Context) error {
+	// Before returning a VMNetwork from a pool, we need to reconfigure the NAT
+	// rules for the tap device, since the veth pair will have a new IP.
+	if err := v.setupTapNATRules(ctx); err != nil {
+		return status.WrapError(err, "setup tap NAT rules")
+	}
+	return nil
+}
+
+func (v *VMNetwork) deactivate(ctx context.Context) error {
+	// Before adding a VMNetwork to a pool, we need to remove the NAT rules for
+	// the tap device, since we'll be removing the IP from the veth pair before
+	// pooling.
+	if err := v.deleteTapNATRules(ctx); err != nil {
+		return status.WrapError(err, "setup tap NAT rules")
+	}
+	// Flush conntrack table so that new packets aren't incorrectly matched
+	// against stale connections.
+	if err := runCommand(ctx, namespace(v.getVethPair().netns, "conntrack", "-F")...); err != nil {
+		return status.WrapError(err, "flush conntrack state")
+	}
+	return nil
+}
+
+// Stats returns the stats for the network. Only external traffic is measured.
+// If the network was returned from a pool, only the incremental stats are
+// reported.
+func (v *VMNetwork) Stats(ctx context.Context) (*repb.NetworkStats, error) {
+	if v.vethPair == nil {
+		return nil, nil
+	}
+	return v.vethPair.Stats(ctx)
 }
 
 func (v *VMNetwork) NamespacePath() string {
@@ -725,6 +1157,30 @@ func (v *VMNetwork) NamespacePath() string {
 
 func (v *VMNetwork) Cleanup(ctx context.Context) error {
 	return v.cleanup(ctx)
+}
+
+func (v *VMNetwork) setupTapNATRules(ctx context.Context) error {
+	for _, command := range [][]string{
+		{"iptables", "--wait", "-t", "nat", "-A", "POSTROUTING", "-o", v.vethPair.namespacedDevice, "-s", v.vmIP, "-j", "SNAT", "--to", v.vethPair.network.NamespacedIP()},
+		{"iptables", "--wait", "-t", "nat", "-A", "PREROUTING", "-i", v.vethPair.namespacedDevice, "-d", v.vethPair.network.NamespacedIP(), "-j", "DNAT", "--to", v.vmIP},
+	} {
+		if err := runCommand(ctx, namespace(v.netns, command...)...); err != nil {
+			return status.WrapError(err, "append tap NAT rule")
+		}
+	}
+	return nil
+}
+
+func (v *VMNetwork) deleteTapNATRules(ctx context.Context) error {
+	for _, command := range [][]string{
+		{"iptables", "--wait", "-t", "nat", "--delete", "POSTROUTING", "-o", v.vethPair.namespacedDevice, "-s", v.vmIP, "-j", "SNAT", "--to", v.vethPair.network.NamespacedIP()},
+		{"iptables", "--wait", "-t", "nat", "--delete", "PREROUTING", "-i", v.vethPair.namespacedDevice, "-d", v.vethPair.network.NamespacedIP(), "-j", "DNAT", "--to", v.vmIP},
+	} {
+		if err := runCommand(ctx, namespace(v.netns, command...)...); err != nil {
+			return status.WrapError(err, "remove tap NAT rule")
+		}
+	}
+	return nil
 }
 
 // ContainerNetwork represents a fully-provisioned container network, which
@@ -771,7 +1227,7 @@ func CreateContainerNetwork(ctx context.Context, loopbackOnly bool) (_ *Containe
 	var vethPair *vethPair
 	if !loopbackOnly {
 		// Create a veth pair with one end in the namespace.
-		vp, err := setupVethPair(ctx, netns)
+		vp, err := setupVethPair(ctx, netns, true /*enableExternalNetworking*/)
 		if err != nil {
 			return nil, status.WrapError(err, "setup veth pair")
 		}
@@ -786,6 +1242,18 @@ func CreateContainerNetwork(ctx context.Context, loopbackOnly bool) (_ *Containe
 	}, nil
 }
 
+func (c *ContainerNetwork) getVethPair() *vethPair {
+	return c.vethPair
+}
+
+func (c *ContainerNetwork) activate(ctx context.Context) error {
+	return nil
+}
+
+func (c *ContainerNetwork) deactivate(ctx context.Context) error {
+	return nil
+}
+
 func (c *ContainerNetwork) NamespacePath() string {
 	return c.netns.Path()
 }
@@ -797,6 +1265,23 @@ func (c *ContainerNetwork) HostNetwork() *HostNet {
 		return nil
 	}
 	return c.vethPair.network
+}
+
+func (c *ContainerNetwork) HostDevice() string {
+	if c.vethPair == nil {
+		return ""
+	}
+	return c.vethPair.hostDevice
+}
+
+// Stats returns the stats for the network. Only external traffic is measured.
+// If the network was returned from a pool, only the incremental stats are
+// reported.
+func (c *ContainerNetwork) Stats(ctx context.Context) (*repb.NetworkStats, error) {
+	if c.vethPair == nil {
+		return nil, nil
+	}
+	return c.vethPair.Stats(ctx)
 }
 
 func (c *ContainerNetwork) Cleanup(ctx context.Context) error {
@@ -887,6 +1372,101 @@ func findRoute(destination string) (route, error) {
 	return route{}, status.FailedPreconditionErrorf("Unable to determine device with prefix: %s", destination)
 }
 
+func ReadInterfaceStatsInNamespace(ctx context.Context, netns *Namespace, device string) (*repb.NetworkStats, error) {
+	command := []string{"cat"}
+	for _, f := range netStatFiles {
+		command = append(command, filepath.Join("/sys/class/net", device, "statistics", f))
+	}
+	output, err := sudoCommand(ctx, namespace(netns, command...)...)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) != len(netStatFiles) {
+		return nil,
+			fmt.Errorf("expected %d lines, got %d", len(netStatFiles), len(lines))
+	}
+	stats := &repb.NetworkStats{}
+	for i, file := range netStatFiles {
+		v, err := strconv.ParseInt(lines[i], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid network interface statistic value %q=%q for device %s: %s", file, lines[i], device, err)
+		}
+		if err := setStatFromSysfs(stats, file, v); err != nil {
+			return nil, err
+		}
+	}
+	return stats, nil
+}
+
+// ReadInterfaceStats reads networking metrics for the given device, e.g.
+// "veth0abc123". This includes things like bytes transmitted and received.
+func ReadInterfaceStats(ctx context.Context, device string) (*repb.NetworkStats, error) {
+	if !*networkStatsEnabled {
+		return nil, nil
+	}
+
+	ctx, spn := tracing.StartSpan(ctx)
+	defer spn.End()
+
+	s := &repb.NetworkStats{}
+	statsDir := filepath.Join("/sys/class/net", device, "statistics")
+	for _, statsFileName := range netStatFiles {
+		path := filepath.Join(statsDir, statsFileName)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				log.CtxInfof(ctx, "Network interface statistic %q not found for device %s at %q", statsFileName, device, path)
+				continue
+			}
+			log.CtxWarningf(ctx, "Failed to read network interface statistic %q for device %s: %s", statsFileName, device, err)
+			continue
+		}
+		v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		if err != nil {
+			log.CtxErrorf(ctx, "Invalid network interface statistic value %q=%q for device %s: %s", statsFileName, string(b), device, err)
+			continue
+		}
+		if err := setStatFromSysfs(s, statsFileName, v); err != nil {
+			log.CtxWarningf(ctx, "Failed to set network interface statistic %q for device %s: %s", statsFileName, device, err)
+		}
+	}
+	return s, nil
+}
+
+// setStatFromSysfs sets the value of a network stat from its corresponding file
+// name under /sys/class/net/[device]/statistics.
+func setStatFromSysfs(s *repb.NetworkStats, name string, v int64) error {
+	switch name {
+	case "rx_bytes":
+		s.BytesReceived = v
+	case "rx_packets":
+		s.PacketsReceived = v
+	case "tx_bytes":
+		s.BytesSent = v
+	case "tx_packets":
+		s.PacketsSent = v
+	default:
+		return fmt.Errorf("unsupported statistic")
+	}
+	return nil
+}
+
+// Subtracts all of the fields of b from a.
+func subtractStats(a, b *repb.NetworkStats) {
+	a.BytesReceived -= b.BytesReceived
+	a.PacketsReceived -= b.PacketsReceived
+	a.BytesSent -= b.BytesSent
+	a.PacketsSent -= b.PacketsSent
+}
+
+// Swaps all "received" fields with their corresponding "sent" fields in a
+// NetworkStats message.
+func swapTxRx(stats *repb.NetworkStats) {
+	stats.BytesReceived, stats.BytesSent = stats.BytesSent, stats.BytesReceived
+	stats.PacketsReceived, stats.PacketsSent = stats.PacketsSent, stats.PacketsReceived
+}
+
 // EnableMasquerading turns on ipmasq for the device with --device_prefix. This is required
 // for networking to work on vms.
 func EnableMasquerading(ctx context.Context) error {
@@ -957,19 +1537,23 @@ func routingTableContainsTable(tableEntry string) (bool, error) {
 	return false, nil
 }
 
-// ConfigureRoutingForIsolation sets up a routing table for handling network
-// isolation via either a secondary network interface or blackholing.
-func ConfigureRoutingForIsolation(ctx context.Context) error {
-	if !IsSecondaryNetworkEnabled() {
-		// No need to add IP rule when we don't use secondary network
-		return nil
+// Configure setups networking related infrastructure, such as traffic isolation
+// and IP allocation.
+func Configure(ctx context.Context) error {
+	a, err := NewHostNetAllocator(*taskIPRange)
+	if err != nil {
+		return status.WrapError(err, "could not create host network allocator")
 	}
+	hostNetAllocator = a
 
-	// Adds a new routing table
-	if err := addRoutingTableEntryIfNotPresent(ctx); err != nil {
-		return err
+	if IsSecondaryNetworkEnabled() {
+		// Adds a new routing table
+		if err := addRoutingTableEntryIfNotPresent(ctx); err != nil {
+			return err
+		}
+		return configurePolicyBasedRoutingForSecondaryNetwork(ctx)
 	}
-	return configurePolicyBasedRoutingForSecondaryNetwork(ctx)
+	return nil
 }
 
 // configurePolicyBasedRoutingForNetworkWIthRoutePrefix configures policy routing for secondary

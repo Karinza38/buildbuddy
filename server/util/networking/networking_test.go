@@ -1,19 +1,28 @@
 package networking_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testnetworking"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
 	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+	"github.com/rs/zerolog"
+	zerologlog "github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -31,13 +40,13 @@ const (
 
 func TestHostNetAllocator(t *testing.T) {
 	const n = 1000
-	a := &networking.HostNetAllocator{}
+	a, err := networking.NewHostNetAllocator("192.168.0.0/16")
+	require.NoError(t, err)
 	var nets [n]*networking.HostNet
-	var err error
 	uniqueCIDRs := map[string]struct{}{}
 
 	// Reserve all possible CIDRs
-	for i := 0; i < n; i++ {
+	for i := range n {
 		nets[i], err = a.Get()
 		require.NoError(t, err, "Get(%d)", i)
 		uniqueCIDRs[nets[i].HostIPWithCIDR()] = struct{}{}
@@ -68,7 +77,7 @@ func TestHostNetAllocator(t *testing.T) {
 	}
 
 	// Attempting to get a new host net should now fail
-	for i := 0; i < n; i++ {
+	for range n {
 		net, err := a.Get()
 		require.Error(t, err)
 		require.Nil(t, net)
@@ -88,12 +97,12 @@ func TestHostNetAllocator(t *testing.T) {
 }
 
 func TestConcurrentSetupAndCleanup(t *testing.T) {
+	ctx := context.Background()
 	testnetworking.Setup(t)
 
-	ctx := context.Background()
 	eg, gCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(8)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		// Note: gCtx is only used for short-circuiting this loop.
 		// Each goroutine is allowed to run to completion, to avoid leaving
 		// things in a messy state.
@@ -101,7 +110,7 @@ func TestConcurrentSetupAndCleanup(t *testing.T) {
 			break
 		}
 		eg.Go(func() error {
-			network, err := networking.CreateVMNetwork(ctx, tapDeviceName, tapAddr, vmIP)
+			network, err := networking.CreateVMNetwork(ctx, tapDeviceName, tapAddr, vmIP, true /*enableExternalNetworking*/)
 			if err != nil {
 				return fmt.Errorf("create VM network: %w", err)
 			}
@@ -118,12 +127,11 @@ func TestConcurrentSetupAndCleanup(t *testing.T) {
 func TestContainerNetworking(t *testing.T) {
 	testnetworking.Setup(t)
 
-	// Enable IP forwarding and masquerading so that we can test external
-	// traffic.
 	ctx := context.Background()
-	err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0)
+	err := networking.EnableMasquerading(ctx)
 	require.NoError(t, err)
-	err = networking.EnableMasquerading(ctx)
+
+	defaultIP, err := networking.DefaultIP(ctx)
 	require.NoError(t, err)
 
 	c1 := createContainerNetwork(ctx, t)
@@ -138,17 +146,18 @@ func TestContainerNetworking(t *testing.T) {
 	netnsExec(t, c2.NamespacePath(), `ping -c 1 -W 3 8.8.8.8`)
 
 	// DNS should work from inside the netns.
-	netnsExec(t, c1.NamespacePath(), `ping -c 1 -W 3 example.com`)
+	netnsExec(t, c1.NamespacePath(), `ping -c 1 -W 3 google.com`)
 
 	// Containers should not be able to reach each other.
 	netnsExec(t, c1.NamespacePath(), `echo 'Pinging c1' && if ping -c 1 -W 1 `+c2.HostNetwork().NamespacedIP()+` ; then exit 1; fi`)
 	netnsExec(t, c2.NamespacePath(), `echo 'Pinging c2' && if ping -c 1 -W 1 `+c1.HostNetwork().NamespacedIP()+` ; then exit 1; fi`)
 
+	// Containers should not be able to reach the default interface IP.
+	netnsExec(t, c1.NamespacePath(), `if ping -c 1 -W 1 `+defaultIP.String()+` ; then exit 1; fi`)
+
 	// Compute an IP that is likely on the same network as the default route IP,
 	// e.g. if the default gateway IP is 192.168.0.1 then we want something like
 	// 192.168.0.2 here.
-	defaultIP, err := networking.DefaultIP(ctx)
-	require.NoError(t, err)
 	ipOnDefaultNet := net.IP(append([]byte{}, defaultIP...))
 	ipOnDefaultNet[3] = byte((int(ipOnDefaultNet[3])+1)%255 + 1)
 
@@ -185,6 +194,22 @@ func TestContainerNetworking(t *testing.T) {
 	}
 }
 
+func TestAllowTrafficToHostDefaultIP(t *testing.T) {
+	testnetworking.Setup(t)
+	flags.Set(t, "executor.task_allowed_private_ips", []string{"default"})
+	ctx := context.Background()
+	err := networking.EnableMasquerading(ctx)
+	require.NoError(t, err)
+	defaultIP, err := networking.DefaultIP(ctx)
+	require.NoError(t, err)
+
+	// Create container network
+	c1 := createContainerNetwork(ctx, t)
+
+	// Should be able to reach host's default IP when flag is enabled
+	netnsExec(t, c1.NamespacePath(), fmt.Sprintf("ping -c 1 -W 1 %s", defaultIP))
+}
+
 func TestContainerNetworkPool(t *testing.T) {
 	testnetworking.Setup(t)
 
@@ -206,6 +231,365 @@ func TestContainerNetworkPool(t *testing.T) {
 	require.NotNil(t, cn, "take from pool")
 
 	netnsExec(t, cn.NamespacePath(), `ping -c 1 -W 3 8.8.8.8`)
+}
+
+func TestContainerNetworkPool_LogsRouteConflict(t *testing.T) {
+	flags.Set(t, "executor.task_ip_range", "198.18.0.0/16")
+	flags.Set(t, "executor.cleanup_stale_veth_devices", false)
+	testnetworking.Setup(t)
+	logs := captureWarnings(t)
+
+	ctx := context.Background()
+	pool := networking.NewContainerNetworkPool(1)
+	t.Cleanup(func() {
+		require.NoError(t, pool.Shutdown(context.Background()))
+	})
+
+	cn, err := networking.CreateContainerNetwork(ctx, false /*=loopbackOnly*/)
+	require.NoError(t, err)
+	require.True(t, pool.Add(ctx, cn), "add network to pool")
+
+	// The allocator hands out /30s in order and doesn't rewind when one is
+	// released, so the pooled network (which took .5/30) will be reassigned
+	// .13/30 on the way out of the pool. Leave a veth holding that address
+	// behind, simulating an executor killed before network cleanup.
+	staleDevice := createStaleVeth(t, "198.18.0.13/30")
+
+	cn = pool.Get(ctx)
+	require.NotNil(t, cn, "take network from pool")
+	t.Cleanup(func() {
+		require.NoError(t, cn.Cleanup(context.Background()))
+	})
+
+	assert.Contains(t, logs.String(), "Network route conflict:")
+	assert.Contains(t, logs.String(), staleDevice)
+	assert.Contains(t, logs.String(), cn.HostDevice())
+}
+
+// captureWarnings redirects warning-level logs to a buffer for the duration of
+// the test.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	previousLogger := zerologlog.Logger
+	zerologlog.Logger = zerolog.New(buf).Level(zerolog.WarnLevel)
+	t.Cleanup(func() {
+		zerologlog.Logger = previousLogger
+	})
+	return buf
+}
+
+func createStaleVeth(t *testing.T, hostIPWithCIDR string) string {
+	t.Helper()
+	suffix := rand.Intn(1 << 20)
+	hostDevice := fmt.Sprintf("vsh%05x", suffix)
+	peerDevice := fmt.Sprintf("vsp%05x", suffix)
+	netNamespace := fmt.Sprintf("bb-stale-%05x", suffix)
+
+	runIP(t, "netns", "add", netNamespace)
+	t.Cleanup(func() {
+		_ = ipCommand("link", "delete", hostDevice).Run()
+		_ = ipCommand("netns", "delete", netNamespace).Run()
+	})
+	runIP(t, "link", "add", hostDevice, "type", "veth", "peer", "name", peerDevice)
+	runIP(t, "link", "set", peerDevice, "netns", netNamespace)
+	runIP(t, "addr", "add", hostIPWithCIDR, "dev", hostDevice)
+	runIP(t, "link", "set", hostDevice, "up")
+	runIP(t, "netns", "exec", netNamespace, "ip", "link", "set", peerDevice, "up")
+	return hostDevice
+}
+
+func runIP(t *testing.T, args ...string) {
+	t.Helper()
+	output, err := ipCommand(args...).CombinedOutput()
+	require.NoError(t, err, "ip %s: %s", strings.Join(args, " "), output)
+}
+
+// ipCommand builds an 'ip' invocation, prepending sudo when not running as
+// root. testnetworking.Setup only guarantees passwordless sudo, not root.
+func ipCommand(args ...string) *exec.Cmd {
+	args = append([]string{"ip"}, args...)
+	if os.Getuid() != 0 {
+		args = append([]string{"sudo", "--non-interactive"}, args...)
+	}
+	return exec.Command(args[0], args[1:]...)
+}
+
+func TestNetworkStats(t *testing.T) {
+	// Set this to true to enable packet capture for debugging. If an assertion
+	// fails about metrics for a given interface, a packet capture from that
+	// interface will be written as test output, which can be viewed with
+	// wireshark to diagnose the unexpected behavior.
+	//
+	// NOTE: Set back to false before merging, since this adds overhead.
+	const enablePcap = false
+
+	// Max number of test cases that can be run concurrently (this test runs
+	// each test case in serial, then runs all test cases concurrently).
+	const maxConcurrency = 8
+
+	testnetworking.Setup(t)
+	// Start a tx/rx test server listening on the default interface since we
+	// need an IP to be able to reach it from within the netns.
+	server := httptest.NewUnstartedServer(http.HandlerFunc(trafficTestHandler))
+	server.Listener = defaultInterfaceListener(t)
+	server.Start()
+	defer server.Close()
+	// Allow traffic on the default interface.
+	flags.Set(t, "executor.task_allowed_private_ips", []string{"default"})
+	// Enable stats.
+	flags.Set(t, "executor.network_stats_enabled", true)
+
+	overrideSysctlsForTest(t, map[string]string{
+		// Set large network buffer sizes to help reduce TCP re-transmissions,
+		// which throw off stats.
+		"net.core.rmem_max": "134217728",
+		"net.core.wmem_max": "134217728",
+		"net.ipv4.tcp_rmem": "4096 16384 67108864",
+		"net.ipv4.tcp_wmem": "4096 16384 67108864",
+	})
+
+	type testCase struct {
+		name         string
+		tx           int64
+		rx           int64
+		pool         bool
+		loopbackOnly bool
+	}
+	testCases := []testCase{
+		{
+			name: "no traffic",
+			tx:   0,
+			rx:   0,
+		},
+		{
+			name: "no traffic with pooling",
+			tx:   0,
+			rx:   0,
+			pool: true,
+		},
+		{
+			name: "tx traffic",
+			tx:   100_000,
+			rx:   0,
+		},
+		{
+			name: "tx traffic with pooling",
+			tx:   0,
+			rx:   0,
+			pool: true,
+		},
+		{
+			name: "rx traffic",
+			tx:   0,
+			rx:   100_000,
+		},
+		{
+			name: "rx traffic pooled",
+			tx:   0,
+			rx:   100_000,
+		},
+		{
+			name: "tx and rx traffic",
+			tx:   50_000,
+			rx:   100_000,
+		},
+		{
+			name: "tx and rx traffic with pooling",
+			tx:   50_000,
+			rx:   100_000,
+			pool: true,
+		},
+		{
+			name:         "loopback only",
+			tx:           0,
+			rx:           0,
+			loopbackOnly: true,
+		},
+	}
+
+	getPool := func(ctx context.Context, t *testing.T) *networking.ContainerNetworkPool {
+		pool := networking.NewContainerNetworkPool(maxConcurrency /*=poolSize*/)
+		t.Cleanup(func() {
+			err := pool.Shutdown(ctx)
+			require.NoError(t, err)
+		})
+		return pool
+	}
+
+	runTestCase := func(ctx context.Context, t *testing.T, pool *networking.ContainerNetworkPool, tc testCase, attemptNumber int) {
+		// We don't pool loopback-only networks in practice - sanity check that
+		// we're not inadvertently testing this.
+		require.False(t, tc.loopbackOnly && tc.pool, "loopback-only networks should not be pooled")
+
+		var cn *networking.ContainerNetwork
+		if tc.pool {
+			cn = pool.Get(ctx)
+		}
+		if cn == nil {
+			n, err := networking.CreateContainerNetwork(ctx, tc.loopbackOnly)
+			require.NoError(t, err)
+			cn = n
+		}
+
+		// Read stats initially; should be 0, even if we just took from
+		// the pool.
+		{
+			stats, err := cn.Stats(ctx)
+			require.NoError(t, err)
+			require.Equal(t, int64(0), stats.GetBytesReceived(), "%s (attempt %d): should have received 0 bytes initially", tc.name, attemptNumber)
+			require.Equal(t, int64(0), stats.GetBytesSent(), "%s (attempt %d): should have sent 0 bytes initially", tc.name, attemptNumber)
+			require.Equal(t, int64(0), stats.GetPacketsReceived(), "%s (attempt %d): should have received 0 packets initially", tc.name, attemptNumber)
+			require.Equal(t, int64(0), stats.GetPacketsSent(), "%s (attempt %d): should have sent 0 packets initially", tc.name, attemptNumber)
+		}
+
+		var pcap *testnetworking.PacketCapture
+		pcapBuf := &bytes.Buffer{}
+		hostDevice := cn.HostDevice()
+		if enablePcap && !tc.loopbackOnly {
+			p, err := testnetworking.StartPacketCapture(hostDevice, pcapBuf)
+			require.NoError(t, err)
+			pcap = p
+		}
+
+		// If external networking is enabled, make a request to the test
+		// server from within the namespace, sending and/or receiving
+		// the expected amount of traffic.
+		if !tc.loopbackOnly && (tc.tx > 0 || tc.rx > 0) {
+			netnsExec(t, cn.NamespacePath(), `
+				yes | head -c `+fmt.Sprint(tc.tx)+` |
+					curl --data-binary @- `+server.URL+`?rx=`+fmt.Sprint(tc.rx)+`
+			`)
+		}
+
+		// Get stats and verify that they match the expected values
+		// within a reasonable tolerance.
+		stats, err := cn.Stats(ctx)
+		require.NoError(t, err)
+		ok := true
+		ok = ok && assert.GreaterOrEqual(t, stats.GetBytesReceived(), tc.rx, "%s (attempt %d): should have received at least %d bytes", tc.name, attemptNumber, tc.rx)
+		ok = ok && assert.GreaterOrEqual(t, stats.GetBytesSent(), tc.tx, "%s (attempt %d): should have sent at least %d bytes", tc.name, attemptNumber, tc.tx)
+		// Note: these tolerances are somewhat large to account for protocol
+		// overhead (HTTP headers, TCP/IP headers, TCP acks, etc.) as well as
+		// TCP re-transmissions which can happen if the machine is under heavy
+		// load. If these assertions fail, consider setting enablePcap to true
+		// to confirm whether it's a real issue, or just due to something like
+		// TCP re-transmissions.
+		ok = ok && assert.InDelta(t, tc.rx, stats.GetBytesReceived(), 16*1024, "%s (attempt %d): bytes received should be within 4KB of expected", tc.name, attemptNumber)
+		ok = ok && assert.InDelta(t, tc.tx, stats.GetBytesSent(), 16*1024, "%s (attempt %d): bytes sent should be within 4KB of expected", tc.name, attemptNumber)
+		if tc.tx > 0 {
+			// Transmitted some bytes; should have sent several packets.
+			ok = ok && assert.GreaterOrEqual(t, stats.GetPacketsSent(), int64(10), "%s (attempt %d): packets sent should be at least 1", tc.name, attemptNumber)
+		} else if tc.rx > 0 {
+			// Received some bytes; should have sent several ACK packets.
+			ok = ok && assert.GreaterOrEqual(t, stats.GetPacketsSent(), int64(10), "%s (attempt %d): packets sent should be at least 1", tc.name, attemptNumber)
+		} else {
+			// No traffic; should have very few packets sent (might have some
+			// ARP packets etc.)
+			ok = ok && assert.LessOrEqual(t, stats.GetPacketsSent(), int64(10), "%s (attempt %d): packets sent should be smaller than 10", tc.name, attemptNumber)
+		}
+		if tc.rx > 0 {
+			// Received some bytes; should have received several packets.
+			ok = ok && assert.GreaterOrEqual(t, stats.GetPacketsReceived(), int64(10), "%s (attempt %d): packets received should be at least 1", tc.name, attemptNumber)
+		} else if tc.tx > 0 {
+			// Sent some bytes; should have received several ACK packets.
+			ok = ok && assert.GreaterOrEqual(t, stats.GetPacketsReceived(), int64(10), "%s (attempt %d): packets received should be at least 1", tc.name, attemptNumber)
+		} else {
+			// No traffic; should have very few packets received (might have
+			// some ARP packets etc.)
+			ok = ok && assert.LessOrEqual(t, stats.GetPacketsReceived(), int64(10), "%s (attempt %d): packets received should be smaller than 10", tc.name, attemptNumber)
+		}
+
+		if pcap != nil {
+			err = pcap.Stop()
+			require.NoError(t, err)
+			err = pcap.Wait()
+			require.NoError(t, err)
+		}
+		// Write packet capture for the interface (for debugging purposes) if
+		// the reported stats don't match the expected values.
+		if pcap != nil && !ok {
+			pcapPath := os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR") + "/" + fmt.Sprintf("%s-%d-%s.pcap", strings.ReplaceAll(tc.name, " ", "_"), attemptNumber, hostDevice)
+			err := os.WriteFile(pcapPath, pcapBuf.Bytes(), 0644)
+			require.NoError(t, err)
+			t.Logf("Wrote pcap to %s", pcapPath)
+		}
+
+		// Release the network.
+		if !tc.loopbackOnly {
+			if ok := pool.Add(ctx, cn); !ok {
+				err := cn.Cleanup(ctx)
+				require.NoError(t, err)
+			}
+		} else {
+			err := cn.Cleanup(ctx)
+			require.NoError(t, err)
+		}
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := getPool(ctx, t)
+			// Run each test case multiple times. If pooling is enabled, then
+			// this is testing that we're only reporting incremental metrics
+			// rather than cumulative. If pooling is disabled, this is just
+			// exercising the code a bit more.
+			for attemptNumber := 1; attemptNumber <= 3; attemptNumber++ {
+				runTestCase(ctx, t, pool, tc, attemptNumber)
+			}
+		})
+	}
+
+	// Run all tests again, this time running all test cases concurrently. This
+	// is testing that traffic from one test case doesn't pollute the results
+	// for other test cases, which could conceivably happen if our packet
+	// routing isn't set up correctly.
+	t.Run("all test cases concurrently", func(t *testing.T) {
+		ctx := context.Background()
+		pool := getPool(ctx, t)
+		var eg errgroup.Group
+		eg.SetLimit(maxConcurrency)
+		for attemptNumber := 1; attemptNumber < 10; attemptNumber++ {
+			rand.Shuffle(len(testCases), func(i, j int) {
+				testCases[i], testCases[j] = testCases[j], testCases[i]
+			})
+			for _, tc := range testCases {
+				eg.Go(func() error {
+					runTestCase(ctx, t, pool, tc, attemptNumber)
+					return nil
+				})
+			}
+		}
+		err := eg.Wait()
+		require.NoError(t, err)
+	})
+}
+
+func overrideSysctlsForTest(t *testing.T, values map[string]string) {
+	oldValues := map[string]string{}
+	for k, v := range values {
+		out := testshell.Run(t, "" /*=workDir*/, fmt.Sprintf("sysctl -n %s", k))
+		oldValues[k] = strings.TrimSpace(out)
+		testshell.Run(t, "" /*=workDir*/, fmt.Sprintf("sysctl -w %s=%q", k, v))
+	}
+	t.Cleanup(func() {
+		for k, v := range oldValues {
+			testshell.Run(t, "" /*=workDir*/, fmt.Sprintf("sysctl -w %s=%q", k, v))
+		}
+	})
+}
+
+func defaultInterfaceIP(t *testing.T) net.IP {
+	ip, err := networking.DefaultIP(context.Background())
+	require.NoError(t, err)
+	return ip
+}
+
+func defaultInterfaceListener(t *testing.T) net.Listener {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:0", defaultInterfaceIP(t)))
+	require.NoError(t, err)
+	return listener
 }
 
 func BenchmarkCreateContainerNetwork_Unpooled(b *testing.B) {
@@ -270,4 +654,36 @@ func netnsExec(t *testing.T, nsPath, script string) string {
 	b, err := exec.Command("ip", "netns", "exec", filepath.Base(nsPath), "sh", "-eu", "-c", script).CombinedOutput()
 	require.NoError(t, err, "%s", string(b))
 	return string(b)
+}
+
+// Handler that allows testing tx/rx traffic. Spin it up using httptest from
+// stdlib. To test the send direction, make a request with a body payload of the
+// desired size, and the handler will fully consume the request body. To test
+// the receive direction, send a request with the "rx" query parameter set to
+// the desired size, and the handler will respond with arbitrary response data
+// of the same size.
+func trafficTestHandler(w http.ResponseWriter, r *http.Request) {
+	buf := bytes.Repeat([]byte{'x'}, 1024)
+	// Fully consume the request body.
+	io.Copy(io.Discard, r.Body)
+
+	// If the request has a "rx" query parameter, respond with the specified
+	// number of bytes.
+	b := r.URL.Query().Get("rx")
+	if b == "" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	n, err := strconv.Atoi(b)
+	if err != nil {
+		http.Error(w, "Invalid response_bytes", http.StatusBadRequest)
+		return
+	}
+	w.Header().Add("Content-Length", strconv.Itoa(n))
+	w.WriteHeader(http.StatusOK)
+	for i := 0; i < n; i += len(buf) {
+		if _, err := w.Write(buf[:min(len(buf), n-i)]); err != nil {
+			return
+		}
+	}
 }

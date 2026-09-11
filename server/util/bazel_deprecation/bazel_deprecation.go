@@ -3,6 +3,7 @@ package bazel_deprecation
 import (
 	"context"
 	"math"
+	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
@@ -17,8 +18,7 @@ var (
 )
 
 const (
-	bazelToolName   = "bazel"
-	profileActionID = "bes-upload"
+	bazelToolName = "bazel"
 
 	warningMetricPrefix = "warning-"
 	warningKey          = "warnings"
@@ -61,11 +61,12 @@ func (w *Warner) incrementWarningCount(ctx context.Context) {
 }
 
 func deprecationError(title string, description ...string) error {
-	buf := "\033[2K" // Clear the line
+	var buf strings.Builder
+	buf.WriteString("\033[2K") // Clear the line
 
 	// The line is cleared but cursor is in the wrong place.
 	// Reset it to the left.
-	buf += "\r"
+	buf.WriteString("\r")
 
 	header := "Deprecation Notice"
 	padding := 2
@@ -75,21 +76,21 @@ func deprecationError(title string, description ...string) error {
 	width := len(title) + (2 * padding)
 	blankLine := borderWrap(printN(width, " "))
 
-	buf += "\n"
-	buf += aurora.Sprintf(aurora.Cyan("  %s  \n"), printN(width, "_"))
-	buf += blankLine
-	buf += borderWrap(aurora.Sprintf("%s%s%s", printN(leftPadding, " "), aurora.Bold(aurora.Red(header)), printN(rightPadding, " ")))
-	buf += blankLine
-	buf += borderWrap(aurora.Sprintf("  %s  ", aurora.Bold(title)))
-	buf += blankLine
+	buf.WriteString("\n")
+	buf.WriteString(aurora.Sprintf(aurora.Cyan("  %s  \n"), printN(width, "_")))
+	buf.WriteString(blankLine)
+	buf.WriteString(borderWrap(aurora.Sprintf("%s%s%s", printN(leftPadding, " "), aurora.Bold(aurora.Red(header)), printN(rightPadding, " "))))
+	buf.WriteString(blankLine)
+	buf.WriteString(borderWrap(aurora.Sprintf("  %s  ", aurora.Bold(title))))
+	buf.WriteString(blankLine)
 	for _, d := range description {
-		buf += borderWrap(aurora.Sprintf("  %s%s  ", aurora.White(d), printN(len(title)-len(d), " ")))
+		buf.WriteString(borderWrap(aurora.Sprintf("  %s%s  ", aurora.White(d), printN(len(title)-len(d), " "))))
 	}
 
-	buf += blankLine
-	buf += borderWrap(aurora.Sprintf(aurora.Cyan(printN(width, "_"))))
-	buf += "\n"
-	return status.FailedPreconditionError(buf)
+	buf.WriteString(blankLine)
+	buf.WriteString(borderWrap(aurora.Sprintf(aurora.Cyan(printN(width, "_")))))
+	buf.WriteString("\n")
+	return status.FailedPreconditionError(buf.String())
 }
 
 func borderWrap(content string) string {
@@ -97,15 +98,15 @@ func borderWrap(content string) string {
 }
 
 func printN(n int, s string) string {
-	buf := ""
+	var buf strings.Builder
 	for range n {
-		buf += s
+		buf.WriteString(s)
 	}
-	return buf
+	return buf.String()
 }
 
 func (w *Warner) Warn(ctx context.Context) error {
-	canWarn := bazel_request.GetToolName(ctx) == bazelToolName && bazel_request.GetActionID(ctx) == profileActionID
+	canWarn := bazel_request.GetToolName(ctx) == bazelToolName && bazel_request.GetActionID(ctx) == bazel_request.BESUploadActionID
 	if !canWarn {
 		return nil
 	}

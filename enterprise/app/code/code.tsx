@@ -1,20 +1,22 @@
-import React from "react";
-import rpcService from "../../../app/service/rpc_service";
-import { User } from "../../../app/auth/auth_service";
-import SidebarNodeComponent, { compareNodes } from "./code_sidebar_node";
-import { Subscription } from "rxjs";
-import * as monaco from "monaco-editor";
 import * as diff from "diff";
-import { runner } from "../../../proto/runner_ts_proto";
+import { ArrowLeft, ArrowUpCircle, ChevronRight, Download, Key, Pencil, Send, XCircle } from "lucide-react";
+import * as monaco from "monaco-editor";
+import React from "react";
+import { Subscription } from "rxjs";
+import alert_service from "../../../app/alert/alert_service";
+import { User } from "../../../app/auth/auth_service";
+import { FilledButton, OutlinedButton } from "../../../app/components/button/button";
+import Spinner from "../../../app/components/spinner/spinner";
+import rpcService from "../../../app/service/rpc_service";
 import { git } from "../../../proto/git_ts_proto";
+import { runner } from "../../../proto/runner_ts_proto";
 import CodeBuildButton from "./code_build_button";
 import CodeEmptyStateComponent from "./code_empty";
-import { ArrowLeft, ArrowUpCircle, ChevronRight, Download, Key, Pencil, Send, XCircle } from "lucide-react";
-import Spinner from "../../../app/components/spinner/spinner";
-import { OutlinedButton, FilledButton } from "../../../app/components/button/button";
 import { createPullRequest, updatePullRequest } from "./code_pull_request";
-import alert_service from "../../../app/alert/alert_service";
+import SidebarNodeComponent, { compareNodes } from "./code_sidebar_node";
 
+import Long from "long";
+import capabilities from "../../../app/capabilities/capabilities";
 import Dialog, {
   DialogBody,
   DialogFooter,
@@ -23,23 +25,21 @@ import Dialog, {
   DialogTitle,
 } from "../../../app/components/dialog/dialog";
 import Modal from "../../../app/components/modal/modal";
+import SearchBar from "../../../app/components/search_bar/search_bar";
+import error_service from "../../../app/errors/error_service";
+import { GithubIcon } from "../../../app/icons/github";
+import picker_service, { PickerModel } from "../../../app/picker/picker_service";
+import router from "../../../app/router/router";
 import { parseLcov } from "../../../app/util/lcov";
 import { github } from "../../../proto/github_ts_proto";
-import Long from "long";
-import ModuleSidekick from "../sidekick/module/module";
-import BazelVersionSidekick from "../sidekick/bazelversion/bazelversion";
-import BazelrcSidekick from "../sidekick/bazelrc/bazelrc";
-import BuildFileSidekick from "../sidekick/buildfile/buildfile";
-import error_service from "../../../app/errors/error_service";
 import { build } from "../../../proto/remote_execution_ts_proto";
 import { search } from "../../../proto/search_ts_proto";
-import OrgPicker from "../org_picker/org_picker";
-import capabilities from "../../../app/capabilities/capabilities";
-import router from "../../../app/router/router";
-import picker_service, { PickerModel } from "../../../app/picker/picker_service";
-import { GithubIcon } from "../../../app/icons/github";
 import { getLangHintFromFilePath } from "../monaco/monaco";
-import SearchBar from "../../../app/components/search_bar/search_bar";
+import OrgPicker from "../org_picker/org_picker";
+import BazelrcSidekick from "../sidekick/bazelrc/bazelrc";
+import BazelVersionSidekick from "../sidekick/bazelversion/bazelversion";
+import BuildFileSidekick from "../sidekick/buildfile/buildfile";
+import ModuleSidekick from "../sidekick/module/module";
 
 interface Props {
   user: User;
@@ -301,7 +301,7 @@ export default class CodeComponent extends React.Component<Props, State> {
 
     this.editor = monaco.editor.create(this.codeViewer.current!, {
       value: "",
-      theme: "vs",
+      theme: document.documentElement.classList.contains("dark") ? "vs-dark" : "vs",
       readOnly: this.isSingleFile() || Boolean(this.getQuery()),
     });
 
@@ -475,7 +475,8 @@ export default class CodeComponent extends React.Component<Props, State> {
       .then((treeResponse) => {
         console.log(treeResponse);
         this.updateState({ repoResponse: repoResponse, treeResponse: treeResponse, commitSHA: treeResponse.sha });
-      });
+      })
+      .catch((e) => error_service.handleError(e));
   }
 
   isNewFile(node: github.TreeNode) {
@@ -561,7 +562,7 @@ export default class CodeComponent extends React.Component<Props, State> {
                 record.data.map((r) => {
                   const parts = r.split(",");
                   const lineNum = parseInt(parts[0]);
-                  const hit = parts[1] == "1";
+                  const hit = parseInt(parts[1]) > 0;
                   return {
                     range: new monaco.Range(lineNum, 0, lineNum, 0),
                     options: {
@@ -883,11 +884,17 @@ export default class CodeComponent extends React.Component<Props, State> {
   }
 
   handleGitHubClicked() {
-    const params = new URLSearchParams({
-      redirect_url: window.location.href,
-      ...(this.props.user.displayUser.userId && { user_id: this.props.user.displayUser.userId.id }),
-    });
-    window.location.href = `/auth/github/app/link/?${params}`;
+    rpcService.service
+      .getGitHubAppInstallPath(new github.GetGithubAppInstallPathRequest())
+      .then((response) => {
+        const userID = this.props.user.displayUser.userId?.id || "";
+        const path = `${response.installPath}?${new URLSearchParams({
+          user_id: userID,
+          redirect_url: window.location.href,
+        })}`;
+        window.location.href = path;
+      })
+      .catch((e) => error_service.handleError(e));
   }
 
   handleUpdatePR() {
@@ -1388,29 +1395,43 @@ export default class CodeComponent extends React.Component<Props, State> {
                 onClick={() => {
                   const bsUrl = this.props.search.get("bytestream_url");
                   const invocationId = this.props.search.get("invocation_id");
+                  const filename = this.props.search.get("filename") || "";
                   if (!bsUrl || !invocationId) {
                     return;
                   }
                   const zip = this.props.search.get("z");
                   if (zip) {
-                    rpcService.downloadBytestreamZipFile(
-                      this.props.search.get("filename") || "",
-                      bsUrl,
-                      zip,
-                      invocationId
-                    );
+                    rpcService.downloadBytestreamZipFile(filename, bsUrl, zip, invocationId);
                   } else {
-                    rpcService.downloadBytestreamFile(this.props.search.get("filename") || "", bsUrl, invocationId);
+                    rpcService.downloadBytestreamFile(filename, bsUrl, invocationId);
                   }
                 }}>
-                <Download /> Download File
+                <Download /> Download File {this.props.search.get("compare_filename") ? "A" : ""}
               </OutlinedButton>
+              {this.props.search.get("compare_bytestream_url") && (
+                <OutlinedButton
+                  className="code-menu-download-button"
+                  onClick={() => {
+                    const filename = this.props.search.get("filename") || "";
+                    const invocationId = this.props.search.get("invocation_id") || "";
+                    const compareUrl = this.props.search.get("compare_bytestream_url") || "";
+                    const compareInvocationID = this.props.search.get("compare_invocation_id");
+                    const compareFilename = this.props.search.get("compare_filename") || "";
+                    rpcService.downloadBytestreamFile(
+                      filename == compareFilename ? filename + ".modified" : compareFilename,
+                      compareUrl,
+                      compareInvocationID || invocationId
+                    );
+                  }}>
+                  <Download /> Download File B
+                </OutlinedButton>
+              )}
             </div>
           )}
           {Boolean(this.getQuery()) && (
             <div className="code-menu-actions">
               <OutlinedButton className="request-review-button" onClick={this.handleEditClicked.bind(this)}>
-                <Pencil className="icon green" /> Edit
+                <Pencil className="green" /> Edit
               </OutlinedButton>
             </div>
           )}
@@ -1427,7 +1448,7 @@ export default class CodeComponent extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon blue" /> Request Review
+                      <Send className="blue" /> Request Review
                     </>
                   )}
                 </OutlinedButton>
@@ -1443,7 +1464,7 @@ export default class CodeComponent extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon blue" /> Update PR
+                      <Send className="blue" /> Update PR
                     </>
                   )}
                 </OutlinedButton>
@@ -1659,7 +1680,7 @@ export default class CodeComponent extends React.Component<Props, State> {
                       window.open(applicableInstallation?.url + `/permissions/update`, "_blank") &&
                       this.updateState({ installationsResponse: undefined })
                     }>
-                    <Key className="icon white" /> Permissions
+                    <Key className="white" /> Permissions
                   </FilledButton>
                 )}
                 <FilledButton
@@ -1672,7 +1693,7 @@ export default class CodeComponent extends React.Component<Props, State> {
                     </>
                   ) : (
                     <>
-                      <Send className="icon white" /> Send
+                      <Send className="white" /> Send
                     </>
                   )}
                 </FilledButton>

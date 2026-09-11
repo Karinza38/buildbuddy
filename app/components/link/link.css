@@ -1,9 +1,27 @@
 .text-link {
   text-decoration: underline;
   cursor: pointer;
-  color: #1565c0;
+  color: var(--color-link);
+}
+
+.text-link.plain {
+  font-weight: 600;
+}
+
+.text-link.plain:not(:hover) {
+  color: var(--color-link-plain);
 }
 
 .text-link:hover {
-  color: #2196f3;
+  color: var(--color-link-hover);
+}
+
+.text-link .icon {
+  /*
+    When an icon appears inside a link, make its size and color match the link text.
+    For lucide icons + Open Sans, 16px icons look good next to a 14px font,
+    so we set the icon size to 16/14 em.
+  */
+  --icon-size: 1.1428571428571428em;
+  stroke: currentColor;
 }

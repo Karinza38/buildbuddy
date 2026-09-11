@@ -11,28 +11,37 @@ import (
 	remote_execution_config "github.com/buildbuddy-io/buildbuddy/server/remote_execution/config"
 )
 
+const cacheRedisFlagMessage = "The cache Redis config is deprecated. Use app.default_redis_target or remote_execution.redis_target for Redis-backed shared state."
+
 var (
-	defaultRedisTarget          = flag.String("app.default_redis_target", "", "A Redis target for storing remote shared state. To ease migration, the redis target from the remote execution config will be used if this value is not specified.", flag.Secret)
-	defaultRedisUseTLS          = flag.Bool("app.default_redis.tls.enabled", false, "Use TLS when connecting to Redis.")
-	defaultRedisShards          = flag.Slice("app.default_sharded_redis.shards", []string{}, "Ordered list of Redis shard addresses.")
-	defaultShardedRedisUsername = flag.String("app.default_sharded_redis.username", "", "Redis username")
-	defaultShardedRedisPassword = flag.String("app.default_sharded_redis.password", "", "Redis password", flag.Secret)
+	defaultRedisTarget               = flag.String("app.default_redis_target", "", "A Redis target for storing remote shared state. To ease migration, the redis target from the remote execution config will be used if this value is not specified.", flag.Secret)
+	defaultRedisShards               = flag.Slice("app.default_sharded_redis.shards", []string{}, "Ordered list of Redis shard addresses.")
+	defaultRedisDefaultEnabledShards = flag.Slice("app.default_sharded_redis.default_enabled_shards", []string{}, "Ordered list of Redis shard addresses to enable. Other shards must be enabled via experiment. If empty, all shards in default_sharded_redis.shards will be enabled.")
+	defaultShardedRedisUsername      = flag.String("app.default_sharded_redis.username", "", "Redis username")
+	defaultShardedRedisPassword      = flag.String("app.default_sharded_redis.password", "", "Redis password", flag.Secret)
+
+	// TODO: add default_enabled_shards for the clients below (to support
+	// migration)
 
 	// Cache Redis
-	// TODO: We need to deprecate one of the redis targets here or distinguish them
-	cacheRedisTargetFallback  = flag.String("cache.redis_target", "", "A redis target for improved Caching/RBE performance. Target can be provided as either a redis connection URI or a host:port pair. URI schemas supported: redis[s]://[[USER][:PASSWORD]@][HOST][:PORT][/DATABASE] or unix://[[USER][:PASSWORD]@]SOCKET_PATH[?db=DATABASE] ** Enterprise only **", flag.Secret)
-	cacheRedisUseTLS          = flag.Bool("cache.redis.tls.enabled", false, "Use TLS when connecting to Redis.")
-	cacheRedisTarget          = flag.String("cache.redis.redis_target", "", "A redis target for improved Caching/RBE performance. Target can be provided as either a redis connection URI or a host:port pair. URI schemas supported: redis[s]://[[USER][:PASSWORD]@][HOST][:PORT][/DATABASE] or unix://[[USER][:PASSWORD]@]SOCKET_PATH[?db=DATABASE] ** Enterprise only **", flag.Secret)
-	cacheRedisShards          = flag.Slice("cache.redis.sharded.shards", []string{}, "Ordered list of Redis shard addresses.")
-	cacheShardedRedisUsername = flag.String("cache.redis.sharded.username", "", "Redis username")
-	cacheShardedRedisPassword = flag.String("cache.redis.sharded.password", "", "Redis password", flag.Secret)
+	cacheRedisTargetFallback  = flag.String("cache.redis_target", "", "A redis target for improved Caching/RBE performance. Target can be provided as either a redis connection URI or a host:port pair. URI schemas supported: redis[s]://[[USER][:PASSWORD]@][HOST][:PORT][/DATABASE] or unix://[[USER][:PASSWORD]@]SOCKET_PATH[?db=DATABASE] ** Enterprise only **", flag.Secret, flag.Deprecated(cacheRedisFlagMessage))
+	cacheRedisTarget          = flag.String("cache.redis.redis_target", "", "A redis target for improved Caching/RBE performance. Target can be provided as either a redis connection URI or a host:port pair. URI schemas supported: redis[s]://[[USER][:PASSWORD]@][HOST][:PORT][/DATABASE] or unix://[[USER][:PASSWORD]@]SOCKET_PATH[?db=DATABASE] ** Enterprise only **", flag.Secret, flag.Deprecated(cacheRedisFlagMessage))
+	cacheRedisShards          = flag.Slice("cache.redis.sharded.shards", []string{}, "Ordered list of Redis shard addresses.", flag.Deprecated(cacheRedisFlagMessage))
+	cacheShardedRedisUsername = flag.String("cache.redis.sharded.username", "", "Redis username", flag.Deprecated(cacheRedisFlagMessage))
+	cacheShardedRedisPassword = flag.String("cache.redis.sharded.password", "", "Redis password", flag.Secret, flag.Deprecated(cacheRedisFlagMessage))
 
 	// Remote Execution Redis
 	remoteExecRedisTarget          = flag.String("remote_execution.redis_target", "", "A Redis target for storing remote execution state. Falls back to app.default_redis_target if unspecified. Required for remote execution. To ease migration, the redis target from the cache config will be used if neither this value nor app.default_redis_target are specified.", flag.Secret)
-	remoteExecRedisUseTLS          = flag.Bool("remote_execution.redis.tls.enabled", false, "Use TLS when connecting to Redis.")
 	remoteExecRedisShards          = flag.Slice("remote_execution.sharded_redis.shards", []string{}, "Ordered list of Redis shard addresses.")
 	remoteExecShardedRedisUsername = flag.String("remote_execution.sharded_redis.username", "", "Redis username")
 	remoteExecShardedRedisPassword = flag.String("remote_execution.sharded_redis.password", "", "Redis password", flag.Secret)
+)
+
+const (
+	// Experiment name that configures the enabled shards for the default
+	// sharded redis client. Can evaluate to either a null/empty object or an
+	// object that unmarshals to [redisutil.MigrationExperimentConfig].
+	defaultShardedRedisMigrationExperimentName = "app.default_sharded_redis.migration"
 )
 
 type ShardedRedisConfig struct {
@@ -41,36 +50,39 @@ type ShardedRedisConfig struct {
 	Password string   `yaml:"password" usage:"Redis password" config:"secret"`
 }
 
-func defaultRedisClientOptsNoFallback() *redisutil.Opts {
-	if opts := redisutil.ShardsToOpts(*defaultRedisShards, *defaultRedisUseTLS, *defaultShardedRedisUsername, *defaultShardedRedisPassword); opts != nil {
+func defaultRedisClientOptsNoFallback(env *real_environment.RealEnv) *redisutil.Opts {
+	if opts := redisutil.ShardsToOpts(*defaultRedisShards, *defaultShardedRedisUsername, *defaultShardedRedisPassword); opts != nil {
+		if fp := env.GetExperimentFlagProvider(); fp != nil && len(*defaultRedisDefaultEnabledShards) > 0 {
+			opts.MigrationConfig = redisutil.NewMigrationConfig(fp, opts.Addrs, *defaultRedisDefaultEnabledShards, defaultShardedRedisMigrationExperimentName)
+		}
 		return opts
 	}
-	return redisutil.TargetToOpts(*defaultRedisTarget, *defaultRedisUseTLS)
+	return redisutil.TargetToOpts(*defaultRedisTarget)
 }
 
 func cacheRedisClientOptsNoFallback() *redisutil.Opts {
 	// Prefer the client configs from Redis sub-config, is present.
-	if opts := redisutil.ShardsToOpts(*cacheRedisShards, *cacheRedisUseTLS, *cacheShardedRedisUsername, *cacheShardedRedisPassword); opts != nil {
+	if opts := redisutil.ShardsToOpts(*cacheRedisShards, *cacheShardedRedisUsername, *cacheShardedRedisPassword); opts != nil {
 		return opts
 	}
-	if opts := redisutil.TargetToOpts(*cacheRedisTarget, *cacheRedisUseTLS); opts != nil {
+	if opts := redisutil.TargetToOpts(*cacheRedisTarget); opts != nil {
 		return opts
 	}
-	return redisutil.TargetToOpts(*cacheRedisTargetFallback, *cacheRedisUseTLS)
+	return redisutil.TargetToOpts(*cacheRedisTargetFallback)
 }
 
 func remoteExecutionRedisClientOptsNoFallback() *redisutil.Opts {
 	if !remote_execution_config.RemoteExecutionEnabled() {
 		return nil
 	}
-	if opts := redisutil.ShardsToOpts(*remoteExecRedisShards, *remoteExecRedisUseTLS, *remoteExecShardedRedisUsername, *remoteExecShardedRedisPassword); opts != nil {
+	if opts := redisutil.ShardsToOpts(*remoteExecRedisShards, *remoteExecShardedRedisUsername, *remoteExecShardedRedisPassword); opts != nil {
 		return opts
 	}
-	return redisutil.TargetToOpts(*remoteExecRedisTarget, *remoteExecRedisUseTLS)
+	return redisutil.TargetToOpts(*remoteExecRedisTarget)
 }
 
-func DefaultRedisClientOpts() *redisutil.Opts {
-	if cfg := defaultRedisClientOptsNoFallback(); cfg != nil {
+func defaultRedisClientOpts(env *real_environment.RealEnv) *redisutil.Opts {
+	if cfg := defaultRedisClientOptsNoFallback(env); cfg != nil {
 		return cfg
 	}
 
@@ -87,12 +99,12 @@ func CacheRedisClientOpts() *redisutil.Opts {
 	return cacheRedisClientOptsNoFallback()
 }
 
-func RemoteExecutionRedisClientOpts() *redisutil.Opts {
+func RemoteExecutionRedisClientOpts(env *real_environment.RealEnv) *redisutil.Opts {
 	if cfg := remoteExecutionRedisClientOptsNoFallback(); cfg != nil {
 		return cfg
 	}
 
-	if cfg := defaultRedisClientOptsNoFallback(); cfg != nil {
+	if cfg := defaultRedisClientOptsNoFallback(env); cfg != nil {
 		return cfg
 	}
 
@@ -100,7 +112,7 @@ func RemoteExecutionRedisClientOpts() *redisutil.Opts {
 }
 
 func RegisterRemoteExecutionRedisClient(env *real_environment.RealEnv) error {
-	opts := RemoteExecutionRedisClientOpts()
+	opts := RemoteExecutionRedisClientOpts(env)
 	if opts == nil {
 		return nil
 	}
@@ -113,7 +125,7 @@ func RegisterRemoteExecutionRedisClient(env *real_environment.RealEnv) error {
 }
 
 func RegisterDefault(env *real_environment.RealEnv) error {
-	opts := DefaultRedisClientOpts()
+	opts := defaultRedisClientOpts(env)
 	if opts == nil {
 		return nil
 	}

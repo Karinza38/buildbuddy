@@ -6,9 +6,12 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/server/resources",
     visibility = [
         "//enterprise:__subpackages__",
+        "//server/util/kubediscovery:__subpackages__",
+        "//server/util/xds:__subpackages__",
     ],
     deps = [
         "//proto:scheduler_go_proto",
+        "//server/util/disk",
         "//server/util/flag",
         "//server/util/flagutil",
         "//server/util/log",
@@ -23,7 +26,6 @@ go_test(
     srcs = ["resources_test.go"],
     deps = [
         ":resources",
-        "//server/testutil/testenviron",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//require",
     ],

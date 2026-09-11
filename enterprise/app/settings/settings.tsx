@@ -1,23 +1,26 @@
-import React from "react";
 import { AlertCircle } from "lucide-react";
+import React from "react";
 import { User } from "../../../app/auth/auth_service";
-import rpc_service from "../../../app/service/rpc_service";
 import capabilities from "../../../app/capabilities/capabilities";
-import FilledButton from "../../../app/components/button/button";
-import ApiKeysComponent from "../api_keys/api_keys";
-import EditOrgComponent from "../org/edit_org";
-import OrgMembersComponent from "../org/org_members";
-import SecretsComponent from "../secrets/secrets";
-import router from "../../../app/router/router";
-import UserPreferences from "../../../app/preferences/preferences";
-import GitHubLink from "./github_link";
-import QuotaComponent from "../quota/quota";
-import UserGitHubLink from "./user_github_link";
 import Banner from "../../../app/components/banner/banner";
+import FilledButton from "../../../app/components/button/button";
 import Link from "../../../app/components/link/link";
-import CompleteGitHubAppInstallationDialog from "./github_complete_installation";
+import UserPreferences from "../../../app/preferences/preferences";
+import router from "../../../app/router/router";
+import rpc_service from "../../../app/service/rpc_service";
+import ApiKeysComponent from "../api_keys/api_keys";
 import EncryptionComponent from "../encryption/encryption";
 import IpRulesComponent from "../iprules/iprules";
+import EditOrgComponent from "../org/edit_org";
+import OrgJoinRequests from "../org/org_join_requests";
+import OrgMembersComponent from "../org/org_members";
+import OrgUserListsComponent from "../org/org_user_lists";
+import SecretsComponent from "../secrets/secrets";
+import CompleteGitHubAppInstallationDialog from "./github_complete_installation";
+import GitHubLink from "./github_link";
+import GroupStatusComponent from "./group_status";
+import SSOConfigComponent from "./sso_config";
+import UserGitHubLink from "./user_github_link";
 
 export interface SettingsProps {
   user: User;
@@ -29,17 +32,17 @@ export interface SettingsProps {
 enum TabId {
   OrgDetails = "org/details",
   OrgMembers = "org/members",
+  OrgUserLists = "org/user-lists",
   OrgGitHub = "org/github",
   OrgApiKeys = "org/api-keys",
   OrgSecrets = "org/secrets",
   OrgCacheEncryption = "org/cache-encryption",
   OrgIpRules = "org/ip-rules",
+  OrgSSO = "org/sso",
 
   PersonalPreferences = "personal/preferences",
   PersonalApiKeys = "personal/api-keys",
   PersonalGitHubLink = "personal/github",
-
-  ServerQuota = "server/quota",
 }
 
 const TAB_IDS = new Set<string>(Object.values(TabId));
@@ -103,6 +106,8 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
     }
 
     const activeTabId = this.getActiveTabId();
+    const apiKeyValueReadbackEnabled = capabilities.config.apiKeyValueReadbackEnabled !== false;
+    const autosizeContent = activeTabId === TabId.OrgApiKeys || activeTabId === TabId.PersonalApiKeys;
 
     return (
       <div className="settings">
@@ -125,18 +130,25 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                   </SettingsTab>
                 )}
                 {router.canAccessOrgMembersPage(this.props.user) && (
-                  <SettingsTab id={TabId.OrgMembers} activeTabId={activeTabId}>
-                    Members
-                  </SettingsTab>
+                  <>
+                    <SettingsTab id={TabId.OrgMembers} activeTabId={activeTabId}>
+                      Members
+                    </SettingsTab>
+                    {capabilities.config.userListsUiEnabled && (
+                      <SettingsTab id={TabId.OrgUserLists} activeTabId={activeTabId}>
+                        IAM Groups
+                      </SettingsTab>
+                    )}
+                  </>
                 )}
                 {router.canAccessOrgGitHubLinkPage(this.props.user) &&
                   (capabilities.github || capabilities.config.githubAppEnabled) && (
                     <SettingsTab id={TabId.OrgGitHub} activeTabId={activeTabId}>
-                      <span>GitHub link</span>
+                      <span>GitHub installations</span>
                       {/* If the user has a group-level GitHub link and the new GitHub App is
                         enabled, show a deprecation alert. */}
                       {capabilities.config.githubAppEnabled && this.props.user.selectedGroup.githubLinked && (
-                        <AlertCircle className="icon orange" />
+                        <AlertCircle className="orange" />
                       )}
                     </SettingsTab>
                   )}
@@ -157,6 +169,11 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                 {capabilities.config.ipRulesEnabled && router.canAccessIpRulesPage(this.props.user) && (
                   <SettingsTab id={TabId.OrgIpRules} activeTabId={activeTabId}>
                     IP rules
+                  </SettingsTab>
+                )}
+                {router.canAccessOrgSSOPage(this.props.user) && (
+                  <SettingsTab id={TabId.OrgSSO} activeTabId={activeTabId}>
+                    Single sign-on
                   </SettingsTab>
                 )}
               </div>
@@ -181,20 +198,8 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                   </SettingsTab>
                 )}
               </div>
-              {this.props.user.canCall("getNamespace") && capabilities.config.quotaManagementEnabled && (
-                <>
-                  <div className="settings-tab-group-header">
-                    <div className="settings-tab-group-title">Server settings</div>
-                  </div>
-                  <div className="settings-tab-group">
-                    <SettingsTab id={TabId.ServerQuota} activeTabId={activeTabId}>
-                      Quota
-                    </SettingsTab>
-                  </div>
-                </>
-              )}
             </div>
-            <div className="settings-content">
+            <div className={`settings-content ${autosizeContent ? "settings-content-autosize" : ""}`}>
               {activeTabId === "personal/preferences" && (
                 <>
                   <div className="settings-option-title">Dense mode</div>
@@ -204,6 +209,46 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                   <FilledButton className="settings-button" onClick={() => this.props.preferences.toggleDenseMode()}>
                     {this.props.preferences.denseModeEnabled ? "Disable" : "Enable"} dense mode
                   </FilledButton>
+                  {capabilities.config.darkModeEnabled && (
+                    <>
+                      <div className="settings-option-title">Theme</div>
+                      <div className="settings-option-description">
+                        Choose between light and dark mode for the BuildBuddy UI.
+                      </div>
+                      <div className="settings-option-warning">
+                        <AlertCircle />
+                        <span>
+                          Dark mode is experimental.{" "}
+                          <a
+                            href="https://github.com/buildbuddy-io/buildbuddy/issues/new?template=bug_report.md"
+                            target="_blank"
+                            rel="noopener noreferrer">
+                            Report issues
+                          </a>
+                        </span>
+                      </div>
+                      <div className="settings-button-group" role="group" aria-label="Theme selection">
+                        <FilledButton
+                          className={`settings-button ${this.props.preferences.themePreference === "light" ? "selected" : ""}`}
+                          onClick={() => this.props.preferences.setTheme("light")}
+                          aria-pressed={this.props.preferences.themePreference === "light"}>
+                          Light
+                        </FilledButton>
+                        <FilledButton
+                          className={`settings-button ${this.props.preferences.themePreference === "system" ? "selected" : ""}`}
+                          onClick={() => this.props.preferences.setTheme("system")}
+                          aria-pressed={this.props.preferences.themePreference === "system"}>
+                          System
+                        </FilledButton>
+                        <FilledButton
+                          className={`settings-button ${this.props.preferences.themePreference === "dark" ? "selected" : ""}`}
+                          onClick={() => this.props.preferences.setTheme("dark")}
+                          aria-pressed={this.props.preferences.themePreference === "dark"}>
+                          Dark
+                        </FilledButton>
+                      </div>
+                    </>
+                  )}
                   <div className="settings-option-title">Log viewer theme</div>
                   <div className="settings-option-description">
                     The log viewer theme allows you to switch between a light and dark log viewer.
@@ -237,14 +282,21 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                         <div className="settings-section-subtitle">{this.props.user.selectedGroupName()}</div>
                       )}
                       {capabilities.createOrg && <EditOrgComponent search={this.props.search} user={this.props.user} />}
+                      {this.props.user.isImpersonating && (
+                        <div className="settings-internal-section">
+                          <GroupStatusComponent user={this.props.user} />
+                        </div>
+                      )}
                     </>
                   )}
                   {activeTabId === TabId.OrgMembers && (
                     <>
+                      {capabilities.config.groupMembershipRequestsEnabled && <OrgJoinRequests user={this.props.user} />}
                       <div className="settings-option-title">Members of {this.props.user.selectedGroupName()}</div>
                       <OrgMembersComponent user={this.props.user} />
                     </>
                   )}
+                  {activeTabId === TabId.OrgUserLists && <OrgUserListsComponent user={this.props.user} />}
                   {activeTabId === TabId.OrgGitHub &&
                     (capabilities.github || capabilities.config.githubAppEnabled) &&
                     this.props.user.canCall("unlinkGitHubAccount") && (
@@ -262,6 +314,12 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                       <div className="settings-option-description">
                         API keys grant access to your BuildBuddy organization.
                       </div>
+                      {!apiKeyValueReadbackEnabled && (
+                        <div className="settings-option-description">
+                          API key secret values cannot be viewed from this page. If you've lost access to an API key
+                          value, you can delete and recreate the key with the same capabilities.
+                        </div>
+                      )}
                       {this.isCLILogin() && (
                         <>
                           <div className="settings-option-description" debug-id="cli-login-settings-banner">
@@ -297,6 +355,12 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                           Personal API keys associate builds with both your individual user account and your
                           organization.
                         </div>
+                        {!apiKeyValueReadbackEnabled && (
+                          <div className="settings-option-description">
+                            API key secret values cannot be viewed from this page. If you've lost access to an API key
+                            value, you can delete and recreate the key with the same capabilities.
+                          </div>
+                        )}
                         {this.isCLILogin() && (
                           <div className="settings-option-description">
                             <Banner type="info">
@@ -317,9 +381,6 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                   {activeTabId === TabId.OrgSecrets && capabilities.config.secretsEnabled && (
                     <SecretsComponent path={this.props.path} search={this.props.search} />
                   )}
-                  {activeTabId === TabId.ServerQuota && capabilities.config.quotaManagementEnabled && (
-                    <QuotaComponent path={this.props.path} search={this.props.search} />
-                  )}
                   {activeTabId == TabId.OrgCacheEncryption && (
                     <>
                       <div className="settings-option-title">Customer-managed encryption keys</div>
@@ -339,6 +400,7 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                       <IpRulesComponent user={this.props.user} />
                     </>
                   )}
+                  {activeTabId === TabId.OrgSSO && <SSOConfigComponent user={this.props.user} />}
                 </>
               )}
             </div>

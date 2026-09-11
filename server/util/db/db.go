@@ -49,7 +49,6 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	gopostgreserr "github.com/jackc/pgerrcode"
 	gopostgresconn "github.com/jackc/pgx/v5/pgconn"
-	gormutils "gorm.io/gorm/utils"
 )
 
 const (
@@ -365,6 +364,29 @@ func (dbh *DBHandle) gormHandleForOpts(ctx context.Context, opts interfaces.DBOp
 	return db
 }
 
+func (dbh *DBHandle) Close() error {
+	var errs []error
+	if dbh.db != nil {
+		db, err := dbh.db.DB()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error getting DB from gorm handle: %w", err))
+		}
+		if err := db.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing DB: %w", err))
+		}
+	}
+	if dbh.readReplicaDB != nil {
+		db, err := dbh.readReplicaDB.DB()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error getting read replica DB from gorm handle: %w", err))
+		}
+		if err := db.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing read replica DB: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func IsRecordNotFound(err error) bool {
 	return errors.Is(err, gorm.ErrRecordNotFound)
 }
@@ -497,15 +519,15 @@ func (c *connector) Driver() driver.Driver {
 	return c.d
 }
 
-func openDB(ctx context.Context, dataSource string, advancedConfig *AdvancedConfig) (*gorm.DB, string, error) {
+func openDB(ctx context.Context, dataSource string, advancedConfig *AdvancedConfig) (*gorm.DB, DataSource, error) {
 	ds, err := ParseDatasource(ctx, dataSource, advancedConfig)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 
 	drv, err := getDriver(ds)
 	if err != nil {
-		return nil, "", fmt.Errorf("unsupported database driver %s", ds.DriverName())
+		return nil, nil, fmt.Errorf("unsupported database driver %s", ds.DriverName())
 	}
 
 	// Use our own connector so that we can control the DSN for each new
@@ -524,10 +546,10 @@ func openDB(ctx context.Context, dataSource string, advancedConfig *AdvancedConf
 	case postgresDriver:
 		dialector = postgres.Dialector{Config: &postgres.Config{Conn: db}}
 	default:
-		return nil, "", fmt.Errorf("unsupported database driver %s", ds.DriverName())
+		return nil, nil, fmt.Errorf("unsupported database driver %s", ds.DriverName())
 	}
 
-	l := &sqlLogger{
+	l := &gormutil.Logger{
 		SlowThreshold: *slowQueryThreshold,
 		LogLevel:      logger.Warn,
 	}
@@ -537,12 +559,12 @@ func openDB(ctx context.Context, dataSource string, advancedConfig *AdvancedConf
 	config := gorm.Config{Logger: l, SkipDefaultTransaction: true}
 	gdb, err := gorm.Open(dialector, &config)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 
 	instrumentGORM(gdb)
 
-	return gdb, ds.DriverName(), nil
+	return gdb, ds, nil
 }
 
 // DataSource is responsible for generating the DSN for new sql connections.
@@ -687,70 +709,22 @@ func ParseDatasource(ctx context.Context, datasource string, advancedConfig *Adv
 	return nil, status.FailedPreconditionError("no database configured -- please specify at least one in the config")
 }
 
-// sqlLogger implements GORM's logger.Interface using zerolog.
-type sqlLogger struct {
-	SlowThreshold time.Duration
-	LogLevel      logger.LogLevel
-}
-
-func (l *sqlLogger) Info(ctx context.Context, format string, args ...any) {
-	log.CtxInfof(ctx, "%s: "+format, append([]any{gormutils.FileWithLineNum()}, args...))
-}
-func (l *sqlLogger) Warn(ctx context.Context, format string, args ...any) {
-	log.CtxWarningf(ctx, "%s: "+format, append([]any{gormutils.FileWithLineNum()}, args...))
-}
-func (l *sqlLogger) Error(ctx context.Context, format string, args ...any) {
-	log.CtxErrorf(ctx, "%s: "+format, append([]any{gormutils.FileWithLineNum()}, args...))
-}
-
-// Trace is called after every SQL query. If `database.log_queries` is true then
-// it will always log the query. Otherwise it will only log slow or failed
-// queries. NotFound errors are ignored.
-func (l *sqlLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
-	if l.LogLevel <= logger.Silent {
-		return
-	}
-	duration := time.Since(begin)
-	getInfo := func() string {
-		sql, rows := fc()
-		rowsVal := any(rows)
-		if rows <= 0 {
-			// rows < 0 means the query does not have an associated row count.
-			rowsVal = "-"
-		}
-		return fmt.Sprintf("(duration: %s) (rows: %v) %s", duration, rowsVal, sql)
-	}
-	switch {
-	case err != nil && l.LogLevel >= logger.Error && !IsRecordNotFound(err):
-		log.CtxErrorf(ctx, "SQL: error (%s): %s %s", gormutils.FileWithLineNum(), err, getInfo())
-	case duration > l.SlowThreshold && l.SlowThreshold != 0 && l.LogLevel >= logger.Warn:
-		log.CtxWarningf(ctx, "SQL: slow query (over %s) (%s): %s", l.SlowThreshold, gormutils.FileWithLineNum(), getInfo())
-	case l.LogLevel == logger.Info:
-		log.CtxInfof(ctx, "SQL: OK (%s) %s", gormutils.FileWithLineNum(), getInfo())
-	}
-}
-
-func (l *sqlLogger) LogMode(level logger.LogLevel) logger.Interface {
-	clone := *l
-	clone.LogLevel = level
-	return &clone
-}
-
-// ParamsFilter implements gorm's ParamsFilter interface, ensuring that queries
-// are logged without parameter values showing up in the logs.
-func (l *sqlLogger) ParamsFilter(ctx context.Context, sql string, params ...interface{}) (string, []interface{}) {
-	return sql, nil
-}
-
-func setDBOptions(driver string, gdb *gorm.DB) error {
+func setDBOptions(ds DataSource, gdb *gorm.DB) error {
 	db, err := gdb.DB()
 	if err != nil {
 		return err
 	}
 
 	// SQLITE Special! To avoid "database is locked errors":
-	if driver == sqliteDriver {
+	if ds.DriverName() == sqliteDriver {
 		db.SetMaxOpenConns(1)
+		if dsn, err := ds.DSN(); err == nil && strings.Contains(dsn, "mode=memory") {
+			// An in-memory sqlite DB lives and dies with this single
+			// connection, so keep it idle forever and never expire it.
+			db.SetMaxIdleConns(1)
+			db.SetConnMaxLifetime(0)
+			db.SetConnMaxIdleTime(0)
+		}
 		gdb.Exec("PRAGMA journal_mode=WAL;")
 	} else {
 		if *maxOpenConns != 0 {
@@ -825,12 +799,13 @@ func GetConfiguredDatabase(ctx context.Context, env environment.Env) (interfaces
 		return nil, err
 	}
 
-	primaryDB, driverName, err := openDB(ctx, *dataSource, advDataSource)
+	primaryDB, primaryDS, err := openDB(ctx, *dataSource, advDataSource)
 	if err != nil {
 		return nil, status.FailedPreconditionErrorf("could not configure primary database: %s", err)
 	}
+	driverName := primaryDS.DriverName()
 
-	err = setDBOptions(driverName, primaryDB)
+	err = setDBOptions(primaryDS, primaryDB)
 	if err != nil {
 		return nil, err
 	}
@@ -878,11 +853,11 @@ func GetConfiguredDatabase(ctx context.Context, env environment.Env) (interfaces
 
 	// Setup a read replica if one is configured.
 	if *readReplica != "" {
-		replicaDB, readDialect, err := openDB(ctx, *readReplica, advReadReplica)
+		replicaDB, replicaDS, err := openDB(ctx, *readReplica, advReadReplica)
 		if err != nil {
 			return nil, status.FailedPreconditionErrorf("could not configure read replica database: %s", err)
 		}
-		setDBOptions(readDialect, replicaDB)
+		setDBOptions(replicaDS, replicaDB)
 		log.Info("Read replica was present -- connecting to it.")
 		dbh.readReplicaDB = replicaDB
 
@@ -940,7 +915,7 @@ func (h *DBHandle) SelectForUpdateModifier() string {
 	if h.driver == sqliteDriver {
 		return ""
 	}
-	return "FOR UPDATE"
+	return " FOR UPDATE"
 }
 
 func (h *DBHandle) DialectName() string {
@@ -976,7 +951,7 @@ type rawQuery struct {
 	db     *gorm.DB
 	ctx    context.Context
 	sql    string
-	values []interface{}
+	values []any
 }
 
 func (r *rawQuery) Exec() interfaces.DBResult {
@@ -984,11 +959,11 @@ func (r *rawQuery) Exec() interfaces.DBResult {
 	return interfaces.DBResult{Error: rb.Error, RowsAffected: rb.RowsAffected}
 }
 
-func (r *rawQuery) Take(dest interface{}) error {
+func (r *rawQuery) Take(dest any) error {
 	return r.db.Raw(r.sql, r.values...).Take(dest).Error
 }
 
-func (r *rawQuery) Scan(dest interface{}) error {
+func (r *rawQuery) Scan(dest any) error {
 	return r.db.Raw(r.sql, r.values...).Scan(dest).Error
 }
 
@@ -1020,12 +995,12 @@ type query struct {
 	name string
 }
 
-func (q *query) Create(val interface{}) error {
+func (q *query) Create(val any) error {
 	db := q.db.WithContext(q.ctx).Set(gormQueryNameKey, q.name)
 	return db.Create(val).Error
 }
 
-func (q *query) Update(val interface{}) error {
+func (q *query) Update(val any) error {
 	db := q.db.WithContext(q.ctx).Set(gormQueryNameKey, q.name)
 	res := db.Updates(val)
 	if res.RowsAffected == 0 {
@@ -1034,7 +1009,7 @@ func (q *query) Update(val interface{}) error {
 	return nil
 }
 
-func (q *query) Raw(sql string, values ...interface{}) interfaces.DBRawQuery {
+func (q *query) Raw(sql string, values ...any) interfaces.DBRawQuery {
 	db := q.db.WithContext(q.ctx).Set(gormQueryNameKey, q.name)
 	return &rawQuery{db: db, ctx: q.ctx, sql: sql, values: values}
 }

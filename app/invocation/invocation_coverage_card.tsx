@@ -1,21 +1,23 @@
-import React from "react";
-import SetupCodeComponent from "../docs/setup_code";
-import rpcService from "../service/rpc_service";
-import InvocationModel from "./invocation_model";
-import Button from "../components/button/button";
 import { ListChecks } from "lucide-react";
-import errorService from "../errors/error_service";
+import React from "react";
 import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
-import { parseLcov } from "../util/lcov";
+import Button from "../components/button/button";
+import { TextLink } from "../components/link/link";
+import SetupCodeComponent from "../docs/setup_code";
+import errorService from "../errors/error_service";
 import format from "../format/format";
+import rpcService from "../service/rpc_service";
 import { percentageColor } from "../util/color";
+import { LcovItem, parseLcov } from "../util/lcov";
+import { tryParseURL } from "../util/url";
+import InvocationModel from "./invocation_model";
 
 interface Props {
   model: InvocationModel;
 }
 
 interface State {
-  report: any[] | null;
+  report: Array<LcovItem> | null;
   loading: boolean;
   sort: "file" | "most" | "least";
 }
@@ -127,12 +129,14 @@ export default class InvocationCoverageCardComponent extends React.Component<Pro
     this.setState({ sort: sort });
   }
 
-  sort(a: any, b: any) {
+  sort(a: LcovItem, b: LcovItem) {
+    let aratio = a.numLinesFound === 0 ? 0 : a.numLinesHit / a.numLinesFound;
+    let bratio = b.numLinesFound === 0 ? 0 : b.numLinesHit / b.numLinesFound;
     if (this.state.sort == "most") {
-      return b.numLinesHit / b.numLinesFound - a.numLinesHit / a.numLinesFound;
+      return bratio - aratio;
     }
     if (this.state.sort == "least") {
-      return a.numLinesHit / a.numLinesFound - b.numLinesHit / b.numLinesFound;
+      return aratio - bratio;
     }
 
     return a.sourceFile.localeCompare(b.sourceFile);
@@ -142,7 +146,7 @@ export default class InvocationCoverageCardComponent extends React.Component<Pro
     if (!this.state.report) {
       return (
         <div className="card">
-          <ListChecks className="icon" />
+          <ListChecks />
           <div className="content">
             <div className="header">
               <div className="title">Coverage</div>
@@ -156,7 +160,7 @@ export default class InvocationCoverageCardComponent extends React.Component<Pro
     let testCoverageUrl = this.getReportFile()?.uri;
 
     let repoPath = "";
-    if (this.props.model.getRepo()?.includes("github.com")) {
+    if (tryParseURL(this.props.model.getRepo())?.hostname.toLowerCase() === "github.com") {
       repoPath = `/code/${format.formatGitUrl(this.props.model.getRepo())}/`;
     }
 
@@ -173,7 +177,7 @@ export default class InvocationCoverageCardComponent extends React.Component<Pro
     return (
       <>
         <div className="card">
-          <ListChecks className="icon" />
+          <ListChecks />
           <div className="content">
             <div className="header">
               <div className="title">
@@ -225,29 +229,31 @@ export default class InvocationCoverageCardComponent extends React.Component<Pro
                     const percent = (record.numLinesHit * 1.0) / record.numLinesFound;
                     return (
                       <div className="coverage-record">
-                        <a
+                        <TextLink
+                          plain
                           href={
                             repoPath
                               ? `${repoPath}${
                                   record.sourceFile
                                 }?lcov=${testCoverageUrl}&invocation_id=${this.props.model.getInvocationId()}&commit=${this.props.model.getCommit()}`
                               : "#"
-                          }>
-                          <span className="coverage-source">{record.sourceFile}</span>:{" "}
-                          <span className="coverage-percent" style={{ color: percentageColor(percent) }}>
-                            {format.percent(percent)}%
-                          </span>{" "}
-                          <span className="coverage-details">
-                            ({format.formatWithCommas(record.numLinesHit)} hits /{" "}
-                            {format.formatWithCommas(record.numLinesFound)} lines)
-                          </span>
-                        </a>
+                          }
+                          className="coverage-source">
+                          {record.sourceFile}
+                        </TextLink>{" "}
+                        <span className="coverage-percent" style={{ color: percentageColor(percent) }}>
+                          {format.percent(percent)}%
+                        </span>{" "}
+                        <span className="coverage-details">
+                          ({format.formatWithCommas(record.numLinesHit)} hits /{" "}
+                          {format.formatWithCommas(record.numLinesFound)} lines)
+                        </span>
                       </div>
                     );
                   })}
             </div>
             <div className="coverage-record coverage-record-total">
-              <span className="coverage-source">Total</span>{" "}
+              <span className="coverage-total-label">Total</span>{" "}
               <span className="coverage-percent" style={{ color: percentageColor(totalPercent) }}>
                 {format.percent(totalPercent)}%
               </span>{" "}

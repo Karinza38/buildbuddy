@@ -2,14 +2,27 @@
 
 package main
 
-import "context"
+import (
+	"context"
 
-func setupCgroups() (string, error) {
-	return "", nil
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+)
+
+func setupCgroups() (*Cgroups, error) {
+	return &Cgroups{}, nil
 }
 
 func setupNetworking(rootContext context.Context) {
 }
 
 func cleanupFUSEMounts() {
+}
+
+func cleanBuildRoot(ctx context.Context, buildRoot string) error {
+	return disk.ForceRemove(ctx, buildRoot)
+}
+
+func migrateExt4ImagesToFileCache(fc interfaces.FileCache, cacheRoot string) error {
+	return nil
 }

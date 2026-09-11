@@ -10,6 +10,7 @@ go_library(
         "//proto:publish_build_event_go_proto",
         "//server/environment",
         "//server/interfaces",
+        "//server/metrics",
         "//server/real_environment",
         "//server/util/log",
         "//server/util/status",
@@ -24,8 +25,14 @@ go_test(
     srcs = ["build_event_server_test.go"],
     deps = [
         ":build_event_server",
+        "//proto:build_events_go_proto",
         "//proto:publish_build_event_go_proto",
+        "//server/interfaces",
+        "//server/testutil/testbes",
         "//server/testutil/testenv",
+        "//server/util/status",
+        "//server/util/uuid",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],
 )

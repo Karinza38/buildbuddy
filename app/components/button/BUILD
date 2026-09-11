@@ -8,9 +8,9 @@ ts_library(
     name = "button",
     srcs = ["button.tsx"],
     deps = [
-        "@npm//@types/react",
-        "@npm//react",
-        "@npm//tslib",
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
     ],
 )
 
@@ -18,9 +18,26 @@ ts_library(
     name = "button_group",
     srcs = ["button_group.tsx"],
     deps = [
-        "@npm//@types/react",
-        "@npm//react",
-        "@npm//tslib",
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
+    ],
+)
+
+ts_library(
+    name = "ai_button",
+    srcs = ["ai_button.tsx"],
+    deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/lucide-react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
+        "//app/components/button",
+        "//app/components/button:button_group",
+        "//app/components/menu",
+        "//app/components/popup",
+        "//app/components/spinner",
+        "//app/util:remote_runner",
     ],
 )
 
@@ -28,11 +45,11 @@ ts_library(
     name = "checkbox_button",
     srcs = ["checkbox_button.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
         "//app/components/button",
         "//app/components/checkbox",
-        "@npm//@types/react",
-        "@npm//react",
-        "@npm//tslib",
     ],
 )
 
@@ -40,9 +57,9 @@ ts_library(
     name = "link_button",
     srcs = ["link_button.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
         "//app/components/link",
-        "@npm//@types/react",
-        "@npm//react",
-        "@npm//tslib",
     ],
 )

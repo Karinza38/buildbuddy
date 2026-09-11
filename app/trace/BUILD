@@ -6,10 +6,21 @@ ts_library(
     name = "event_hovercard",
     srcs = ["event_hovercard.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
         "//app/trace:trace_events",
         "//app/util:math",
-        "@npm//@types/react",
-        "@npm//react",
+    ],
+)
+
+ts_library(
+    name = "timing_profile_drop_target",
+    srcs = ["timing_profile_drop_target.tsx"],
+    deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
+        "//app/trace:compact_trace",
     ],
 )
 
@@ -17,8 +28,13 @@ ts_library(
     name = "trace_viewer",
     srcs = ["trace_viewer.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/lucide-react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
         "//app/components/filter_input",
         "//app/router",
+        "//app/trace:compact_trace",
         "//app/trace:constants",
         "//app/trace:event_hovercard",
         "//app/trace:trace_events",
@@ -29,10 +45,7 @@ ts_library(
         "//app/util:dom",
         "//app/util:math",
         "//app/util:platform",
-        "@npm//@types/react",
-        "@npm//lucide-react",
-        "@npm//react",
-        "@npm//tslib",
+        "//app/util:typed_arrays",
     ],
 )
 
@@ -40,10 +53,11 @@ ts_library(
     name = "trace_viewer_model",
     srcs = ["trace_viewer_model.ts"],
     deps = [
+        "//:node_modules/tslib",
+        "//app/trace:compact_trace",
         "//app/trace:constants",
-        "//app/trace:trace_events",
         "//app/util:color",
-        "@npm//tslib",
+        "//app/util:typed_arrays",
     ],
 )
 
@@ -58,7 +72,8 @@ ts_library(
     name = "trace_events",
     srcs = ["trace_events.ts"],
     deps = [
-        "@npm//tslib",
+        "//:node_modules/tslib",
+        "//app/util:async",
     ],
 )
 
@@ -69,15 +84,36 @@ ts_jasmine_node_test(
 )
 
 ts_library(
+    name = "compact_trace",
+    srcs = ["compact_trace.ts"],
+    deps = [
+        "//:node_modules/tslib",
+        "//app/trace:trace_events",
+        "//app/util:intern",
+        "//app/util:typed_arrays",
+    ],
+)
+
+ts_jasmine_node_test(
+    name = "compact_trace_test",
+    srcs = ["compact_trace_test.ts"],
+    deps = [
+        ":compact_trace",
+        ":trace_events",
+    ],
+)
+
+ts_library(
     name = "trace_viewer_panel",
     srcs = ["trace_viewer_panel.ts"],
     deps = [
+        "//:node_modules/tslib",
         "//app/trace:constants",
         "//app/trace:trace_events",
         "//app/trace:trace_viewer_model",
         "//app/util:canvas",
+        "//app/util:color",
         "//app/util:dom",
         "//app/util:math",
-        "@npm//tslib",
     ],
 )

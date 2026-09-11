@@ -17,7 +17,7 @@ func TestValidGenericFilters(t *testing.T) {
 		filter        *stat_filter.GenericFilter
 		filterType    stat_filter.ObjectTypes
 		expectedQStr  string
-		expectedQArgs []interface{}
+		expectedQArgs []any
 	}{
 		{
 			filter: &stat_filter.GenericFilter{
@@ -29,7 +29,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
 			expectedQStr:  "duration_usec > ?",
-			expectedQArgs: []interface{}{int64(10000)},
+			expectedQArgs: []any{int64(10000)},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -41,7 +41,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
 			expectedQStr:  "repo_url IN ?",
-			expectedQArgs: []interface{}{[]string{"http://github.com/buildbuddy-io/buildbuddy"}},
+			expectedQArgs: []any{[]string{"http://github.com/buildbuddy-io/buildbuddy"}},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -53,7 +53,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
 			expectedQStr:  "\"user\" IN ?",
-			expectedQArgs: []interface{}{[]string{"siggisim", "tylerw"}},
+			expectedQArgs: []any{[]string{"siggisim", "tylerw"}},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -65,7 +65,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
 			expectedQStr:  "INSTR(\"user\", ?) > 0",
-			expectedQArgs: []interface{}{"sigg"},
+			expectedQArgs: []any{"sigg"},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -77,7 +77,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
 			expectedQStr:  "created_at_usec < ?",
-			expectedQArgs: []interface{}{int64(10001)},
+			expectedQArgs: []any{int64(10001)},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -89,7 +89,7 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
 			expectedQStr:  " (invocation_status = ? AND success = ?) OR (invocation_status = ? AND success = ?) ",
-			expectedQArgs: []interface{}{1, 1, 1, 0},
+			expectedQArgs: []any{1, 1, 1, 0},
 		},
 		{
 			filter: &stat_filter.GenericFilter{
@@ -102,7 +102,211 @@ func TestValidGenericFilters(t *testing.T) {
 			},
 			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
 			expectedQStr:  "NOT( invocation_status = ? OR invocation_status = ? )",
-			expectedQArgs: []interface{}{2, 3},
+			expectedQArgs: []any{2, 3},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_CAS_CACHE_MISSES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{0},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "cas_cache_misses > ?",
+			expectedQArgs: []any{int64(0)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_ACTION_CACHE_MISSES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{0},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "action_cache_misses > ?",
+			expectedQArgs: []any{int64(0)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_CAS_CACHE_DOWNLOAD_BYTES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_LESS_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{2001},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "total_download_size_bytes < ?",
+			expectedQArgs: []any{int64(2001)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_CAS_CACHE_DOWNLOAD_BPS_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{10_000},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "download_throughput_bytes_per_second > ?",
+			expectedQArgs: []any{int64(10_000)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_CAS_CACHE_UPLOAD_BYTES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_LESS_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{2001},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "total_upload_size_bytes < ?",
+			expectedQArgs: []any{int64(2001)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_CAS_CACHE_UPLOAD_BPS_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{10_000},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "upload_throughput_bytes_per_second > ?",
+			expectedQArgs: []any{int64(10_000)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INVOCATION_TIME_SAVED_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{456},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_INVOCATION_OBJECTS,
+			expectedQStr:  "total_cached_action_exec_usec > ?",
+			expectedQArgs: []any{int64(456)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_QUEUE_TIME_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_LESS_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{500},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "IF(worker_start_timestamp_usec < queued_timestamp_usec, 0, (worker_start_timestamp_usec - queued_timestamp_usec)) < ?",
+			expectedQArgs: []any{int64(500)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_INPUT_DOWNLOAD_TIME_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_LESS_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{1000},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "(input_fetch_completed_timestamp_usec - input_fetch_start_timestamp_usec) < ?",
+			expectedQArgs: []any{int64(1000)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_REAL_TIME_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_LESS_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{9090},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "(execution_completed_timestamp_usec - execution_start_timestamp_usec) < ?",
+			expectedQArgs: []any{int64(9090)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_OUTPUT_UPLOAD_TIME_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{100},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "(output_upload_completed_timestamp_usec - output_upload_start_timestamp_usec) > ?",
+			expectedQArgs: []any{int64(100)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_PEAK_MEMORY_BYTES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{250},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "peak_memory_bytes > ?",
+			expectedQArgs: []any{int64(250)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_INPUT_DOWNLOAD_SIZE_BYTES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{400},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "file_download_size_bytes > ?",
+			expectedQArgs: []any{int64(400)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_OUTPUT_UPLOAD_SIZE_BYTES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{500},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "file_upload_size_bytes > ?",
+			expectedQArgs: []any{int64(500)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_WALL_TIME_USEC_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{7500},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "IF(worker_completed_timestamp_usec < queued_timestamp_usec, 0, (worker_completed_timestamp_usec - queued_timestamp_usec)) > ?",
+			expectedQArgs: []any{int64(7500)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_CPU_NANOS_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{10_000},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "cpu_nanos > ?",
+			expectedQArgs: []any{int64(10_000)},
+		},
+		{
+			filter: &stat_filter.GenericFilter{
+				Type:    stat_filter.FilterType_EXECUTION_AVERAGE_MILLICORES_FILTER_TYPE,
+				Operand: stat_filter.FilterOperand_GREATER_THAN_OPERAND,
+				Value: &stat_filter.FilterValue{
+					IntValue: []int64{4000},
+				},
+			},
+			filterType:    stat_filter.ObjectTypes_EXECUTION_OBJECTS,
+			expectedQStr:  "IF(cpu_nanos <= 0 OR (execution_completed_timestamp_usec - execution_start_timestamp_usec) <= 0, 0, intDivOrZero(cpu_nanos*1000, (execution_completed_timestamp_usec - execution_start_timestamp_usec) * 1000)) > ?",
+			expectedQArgs: []any{int64(4000)},
 		},
 	}
 	for _, tc := range cases {
@@ -129,11 +333,11 @@ func TestTagGenericFilters(t *testing.T) {
 	qStr, qArgs, err := filter.ValidateAndGenerateGenericFilterQueryStringAndArgs(f, stat_filter.ObjectTypes_INVOCATION_OBJECTS, "clickhouse")
 	assert.Nil(t, err)
 	assert.Equal(t, "hasAny(tags, array(?))", qStr)
-	assert.ElementsMatch(t, []interface{}{[]string{"tag_one", "tag_two"}}, qArgs)
+	assert.ElementsMatch(t, []any{[]string{"tag_one", "tag_two"}}, qArgs)
 	qStr, qArgs, err = filter.ValidateAndGenerateGenericFilterQueryStringAndArgs(f, stat_filter.ObjectTypes_INVOCATION_OBJECTS, "mysql")
 	assert.Nil(t, err)
 	assert.Equal(t, " INSTR(tags, ?) OR INSTR(tags, ?) ", qStr)
-	assert.ElementsMatch(t, []interface{}{"tag_one", "tag_two"}, qArgs)
+	assert.ElementsMatch(t, []any{"tag_one", "tag_two"}, qArgs)
 }
 
 func TestInvalidGenericFilters(t *testing.T) {

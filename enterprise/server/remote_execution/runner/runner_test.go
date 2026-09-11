@@ -9,22 +9,30 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/bare"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor/oomkiller"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testmetrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
@@ -34,6 +42,8 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	rnpb "github.com/buildbuddy-io/buildbuddy/proto/runner"
+	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 	wkpb "github.com/buildbuddy-io/buildbuddy/proto/worker"
 )
 
@@ -42,6 +52,8 @@ const (
 
 	sysMemoryBytes = tasksize.DefaultMemEstimate * 10
 	sysMilliCPU    = tasksize.DefaultCPUEstimate * 10
+
+	recycleRunnerPropertyName = "recycle-runner"
 )
 
 var (
@@ -72,9 +84,11 @@ type fakeContainer struct {
 	CreateError                error
 	Removed                    chan struct{}
 	Result                     *interfaces.CommandResult
+	ExecFunc                   func(context.Context) *interfaces.CommandResult
 	Isolation                  string // Fake isolation type name
 	ImageCached                bool   // Return value for IsImageCached
 	BlockPull                  bool   // PullImage blocks forever if true.
+	FakeStats                  *repb.UsageStats
 }
 
 func NewFakeContainer() *fakeContainer {
@@ -112,11 +126,25 @@ func (c *fakeContainer) Create(ctx context.Context, workdir string) error {
 }
 
 func (c *fakeContainer) Exec(ctx context.Context, cmd *repb.Command, stdio *interfaces.Stdio) *interfaces.CommandResult {
+	if c.ExecFunc != nil {
+		return c.ExecFunc(ctx)
+	}
 	return c.Result
+}
+
+func (c *fakeContainer) Stats(ctx context.Context) (*repb.UsageStats, error) {
+	return c.FakeStats, nil
 }
 
 func (c *fakeContainer) Remove(ctx context.Context) error {
 	close(c.Removed)
+	return nil
+}
+
+func (c *fakeContainer) Pause(ctx context.Context) error {
+	return nil
+}
+func (c *fakeContainer) Unpause(ctx context.Context) error {
 	return nil
 }
 
@@ -134,11 +162,25 @@ func (*fakeFirecrackerContainer) Stats(context.Context) (*repb.UsageStats, error
 	return &repb.UsageStats{}, nil
 }
 
+type fakeOOMKiller struct {
+	task oomkiller.KillableTask
+}
+
+func (k *fakeOOMKiller) Register(ctx context.Context, task oomkiller.KillableTask) func() {
+	k.task = task
+	return func() {
+		if k.task == task {
+			k.task = nil
+		}
+	}
+}
+
 type RunnerPoolOptions struct {
 	*PoolOptions
-	MaxRunnerCount            int
-	MaxRunnerDiskSizeBytes    int64
-	MaxRunnerMemoryUsageBytes int64
+	MaxRunnerCount                 int
+	MaxTotalRunnerMemoryUsageBytes int64
+	MaxRunnerDiskSizeBytes         int64
+	MaxRunnerMemoryUsageBytes      int64
 }
 
 func newTask() *repb.ScheduledTask {
@@ -147,7 +189,7 @@ func newTask() *repb.ScheduledTask {
 			Arguments: []string{"pwd"},
 			Platform: &repb.Platform{
 				Properties: []*repb.Platform_Property{
-					{Name: platform.RecycleRunnerPropertyName, Value: "true"},
+					{Name: recycleRunnerPropertyName, Value: "true"},
 				},
 			},
 		},
@@ -193,10 +235,10 @@ func newUUID(t *testing.T) string {
 func newTestEnv(t *testing.T) *real_environment.RealEnv {
 	env := testenv.GetTestEnv(t)
 	var userGroups []string
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		userGroups = append(userGroups, fmt.Sprintf("US%d", i), fmt.Sprintf("GR%d", i))
 	}
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers(userGroups...)))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers(userGroups...)))
 	return env
 }
 
@@ -208,7 +250,7 @@ func withAuthenticatedUser(t *testing.T, ctx context.Context, env *testenv.TestE
 }
 
 func mustRun(t *testing.T, r *taskRunner) {
-	res := r.Run(context.Background())
+	res := r.Run(context.Background(), &repb.IOStats{})
 	require.NoError(t, res.Error)
 }
 
@@ -216,6 +258,7 @@ func newRunnerPool(t *testing.T, env *testenv.TestEnv, cfg *RunnerPoolOptions) *
 	flags.Set(t, "executor.runner_pool.max_runner_count", cfg.MaxRunnerCount)
 	flags.Set(t, "executor.runner_pool.max_runner_disk_size_bytes", cfg.MaxRunnerDiskSizeBytes)
 	flags.Set(t, "executor.runner_pool.max_runner_memory_usage_bytes", cfg.MaxRunnerMemoryUsageBytes)
+	flags.Set(t, "executor.runner_pool.max_total_memory_usage_bytes", cfg.MaxTotalRunnerMemoryUsageBytes)
 	if cfg.PoolOptions == nil {
 		cfg.PoolOptions = &PoolOptions{}
 	}
@@ -312,6 +355,60 @@ func sleepRandMicros(max int64) {
 	time.Sleep(time.Duration(rand.Int63n(max) * int64(time.Microsecond)))
 }
 
+func TestRunnerOOMKiller_KillDuringTaskExecution_ReturnsOOMError(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := noLimitsCfg()
+	ctx := withAuthenticatedUser(t, t.Context(), env, "US1")
+	oomKiller := &fakeOOMKiller{}
+	cfg.OOMKiller = oomKiller
+	cfg.ContainerProvider = providerFunc(func(ctx context.Context, args *container.Init) (container.CommandContainer, error) {
+		ctr := NewFakeContainer()
+		ctr.FakeStats = &repb.UsageStats{MemoryBytes: 800}
+		ctr.ExecFunc = func(ctx context.Context) *interfaces.CommandResult {
+			state, err := oomKiller.task.State(ctx)
+			require.NoError(t, err)
+			oomKiller.task.Kill(ctx, oom.Error(oom.Details{
+				EstimatedMemoryBytes: state.EstimatedMemoryBytes,
+				ObservedMemoryBytes:  state.UsageStats.GetMemoryBytes(),
+			}))
+			<-ctx.Done()
+			return &interfaces.CommandResult{
+				ExitCode:   commandutil.KilledExitCode,
+				Error:      ctx.Err(),
+				UsageStats: &repb.UsageStats{MemoryBytes: 100},
+			}
+		}
+		return ctr, nil
+	})
+	pool := newRunnerPool(t, env, cfg)
+	task := newTask()
+	task.ExecutionTask.ExecutionId = "execution-id"
+	task.SchedulingMetadata = &scpb.SchedulingMetadata{
+		TaskSize: &scpb.TaskSize{
+			EstimatedMemoryBytes: 100,
+		},
+	}
+
+	r, err := get(ctx, pool, task)
+	require.NoError(t, err)
+	defer func() {
+		pool.TryRecycle(ctx, r, false /*=finishedCleanly*/)
+		pool.Wait()
+	}()
+
+	res := r.Run(ctx, &repb.IOStats{})
+
+	require.True(t, oom.IsError(res.Error))
+	require.Equal(t, commandutil.NoExitCode, res.ExitCode)
+	require.True(t, res.DoNotRecycle)
+	require.Equal(t, int64(100), res.UsageStats.GetMemoryBytes())
+	require.Equal(t, int64(0), res.UsageStats.GetPeakMemoryBytes())
+	details, ok := oom.DetailsFromError(res.Error)
+	require.True(t, ok)
+	require.Equal(t, int64(100), details.EstimatedMemoryBytes)
+	require.Equal(t, int64(800), details.ObservedMemoryBytes)
+}
+
 func TestRunnerPool_CanAddAndGetBackSameRunner(t *testing.T) {
 	env := newTestEnv(t)
 	pool := newRunnerPool(t, env, noLimitsCfg())
@@ -322,6 +419,34 @@ func TestRunnerPool_CanAddAndGetBackSameRunner(t *testing.T) {
 	mustAddWithoutEviction(t, ctx, pool, r1)
 
 	r2 := mustGetPausedRunner(t, ctx, pool, newTask())
+
+	assert.Same(t, r1, r2)
+	assert.Equal(t, 0, pool.PausedRunnerCount())
+}
+
+func TestRunnerPool_CanAddAndGetBackSameRunner_DockerReuseAlias(t *testing.T) {
+	env := newTestEnv(t)
+	pool := newRunnerPool(t, env, noLimitsCfg())
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+	t1 := &repb.ScheduledTask{
+		ExecutionTask: &repb.ExecutionTask{
+			Command: &repb.Command{
+				Arguments: []string{"pwd"},
+				Platform: &repb.Platform{
+					Properties: []*repb.Platform_Property{
+						{Name: "dockerReuse", Value: "true"},
+					},
+				},
+			},
+		},
+	}
+	r1 := mustGetNewRunner(t, ctx, pool, t1)
+
+	mustAddWithoutEviction(t, ctx, pool, r1)
+
+	t2 := t1.CloneVT()
+	r2 := mustGetPausedRunner(t, ctx, pool, t2)
 
 	assert.Same(t, r1, r2)
 	assert.Equal(t, 0, pool.PausedRunnerCount())
@@ -407,7 +532,7 @@ func TestRunnerPool_Shutdown_RunnersReturnRetriableOrNilError(t *testing.T) {
 	// Run 30 trials where we create a pool that runs 50 tasks using runner
 	// recycling, shutting down the pool after roughly half of the tasks have been
 	// started.
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		pool := newRunnerPool(t, env, noLimitsCfg())
 		numTasks := 50
 		tasksStarted := make(chan struct{}, numTasks)
@@ -420,7 +545,7 @@ func TestRunnerPool_Shutdown_RunnersReturnRetriableOrNilError(t *testing.T) {
 			// Random delay to simulate downloading inputs
 			sleepRandMicros(10)
 			tasksStarted <- struct{}{}
-			if result := r.Run(ctx); result.Error != nil {
+			if result := r.Run(ctx, &repb.IOStats{}); result.Error != nil {
 				return result.Error
 			}
 			// Random delay to simulate uploading outputs
@@ -432,12 +557,10 @@ func TestRunnerPool_Shutdown_RunnersReturnRetriableOrNilError(t *testing.T) {
 		}
 
 		var wg sync.WaitGroup
-		for i := 0; i < numTasks; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range numTasks {
+			wg.Go(func() {
 				errs <- runTask()
-			}()
+			})
 			// Random, tiny delay to stagger the tasks a bit more.
 			sleepRandMicros(1)
 		}
@@ -492,6 +615,30 @@ func (f providerFunc) New(ctx context.Context, args *container.Init) (container.
 	return f(ctx, args)
 }
 
+func TestNewRunner_FirecrackerConfiguresGuestVFSWorkspace(t *testing.T) {
+	env := newTestEnv(t)
+	p := &pool{
+		env:       env,
+		buildRoot: testfs.MakeTempDir(t),
+		overrideProvider: providerFunc(func(ctx context.Context, args *container.Init) (container.CommandContainer, error) {
+			return bare.NewBareCommandContainer(&bare.Opts{}), nil
+		}),
+	}
+	props := &platform.Properties{
+		EnableVFS:             true,
+		VFSPrefetchMode:       platform.VFSPrefetchModeAll,
+		WorkloadIsolationType: string(platform.FirecrackerContainerType),
+	}
+	r, err := p.newRunner(t.Context(), &rnpb.RunnerKey{Platform: &repb.Platform{}}, props, newTask())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, r.Remove(context.Background()))
+	})
+
+	require.False(t, r.Workspace.Opts.UseVFS)
+	require.Equal(t, workspace.VFSPrefetchModeAll, r.Workspace.Opts.VFSPrefetchMode)
+}
+
 // Returns containers that only consume disk resources when paused (like firecracker).
 type DiskOnlyContainerProvider struct{}
 
@@ -517,12 +664,12 @@ func TestRunnerPool_DiskOnlyContainer_CanAddMultiple(t *testing.T) {
 
 	// Make sure we can add up to `maxRunnerCount` runners without eviction.
 	ctx := context.Background()
-	for i := 0; i < maxRunnerCount; i++ {
+	for i := range maxRunnerCount {
 		ctx = withAuthenticatedUser(t, ctx, env, fmt.Sprintf("US%d", i))
 		r := mustGetNewRunner(t, ctx, pool, newTask())
 		mustAddWithoutEviction(t, ctx, pool, r)
 	}
-	for i := 0; i < maxRunnerCount; i++ {
+	for i := range maxRunnerCount {
 		ctx = withAuthenticatedUser(t, ctx, env, fmt.Sprintf("US%d", i))
 		_ = mustGetPausedRunner(t, ctx, pool, newTask())
 	}
@@ -557,6 +704,43 @@ func TestRunnerPool_ExceedMaxRunnerCount_OldestRunnerEvicted(t *testing.T) {
 	mustGetNewRunner(t, ctxUser2, pool, newTask())
 }
 
+func TestRunnerPool_ExceedMaxRunnerPoolTotalMemoryUsage_OldestRunnerEvicted(t *testing.T) {
+	env := newTestEnv(t)
+	// Set up a container provider that lets us fake memory usage
+	var nextProvidedContainer container.CommandContainer
+	provider := providerFunc(func(ctx context.Context, args *container.Init) (container.CommandContainer, error) {
+		return nextProvidedContainer, nil
+	})
+	// Set up a pool with the fake provider and a 4GiB total memory limit
+	pool := newRunnerPool(t, env, &RunnerPoolOptions{
+		PoolOptions: &PoolOptions{
+			ContainerProvider: provider,
+		},
+		MaxRunnerCount:                 1_000_000,              // ~unlimited
+		MaxTotalRunnerMemoryUsageBytes: 4 * 1024 * 1024 * 1024, // 4GiB
+		MaxRunnerDiskSizeBytes:         unlimited,
+		MaxRunnerMemoryUsageBytes:      unlimited,
+	})
+	ctxUser1 := withAuthenticatedUser(t, context.Background(), env, "US1")
+	ctxUser2 := withAuthenticatedUser(t, context.Background(), env, "US2")
+
+	c1 := NewFakeContainer()
+	nextProvidedContainer = c1
+	r1 := mustGetNewRunner(t, ctxUser1, pool, newTask())
+
+	c2 := NewFakeContainer()
+	nextProvidedContainer = c2
+	r2 := mustGetNewRunner(t, ctxUser2, pool, newTask())
+
+	// Add c1 (should take up the entire 4GiB limit)
+	c1.FakeStats = &repb.UsageStats{MemoryBytes: 4 * 1024 * 1024 * 1024} // 4Gi
+	mustAddWithoutEviction(t, ctxUser1, pool, r1)
+
+	// Add c2 (should evict c1 even though it only takes up 1 byte of memory)
+	c2.FakeStats = &repb.UsageStats{MemoryBytes: 1}
+	mustAddWithEviction(t, ctxUser2, pool, r2)
+}
+
 func TestRunnerPool_DiskLimitExceeded_CannotAdd(t *testing.T) {
 	env := newTestEnv(t)
 	pool := newRunnerPool(t, env, &RunnerPoolOptions{
@@ -568,9 +752,10 @@ func TestRunnerPool_DiskLimitExceeded_CannotAdd(t *testing.T) {
 	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
 
 	r := mustGetNewRunner(t, ctx, pool, newTask())
+	err := os.WriteFile(path.Join(r.Workspace.Path(), "disk-usage"), []byte("disk limit"), 0o600)
+	require.NoError(t, err)
 
-	err := pool.Add(context.Background(), r)
-
+	err = pool.Add(context.Background(), r)
 	assert.True(t, status.IsResourceExhaustedError(err), "should exceed disk limit")
 	assert.Equal(t, 0, pool.PausedRunnerCount())
 }
@@ -680,6 +865,7 @@ func TestRunnerPool_TaskSize(t *testing.T) {
 func newPersistentRunnerTask(t *testing.T, key, arg, protocol string, resp *wkpb.WorkResponse) *repb.ScheduledTask {
 	workerPath := testfs.RunfilePath(t, testworkerRunfilePath)
 	task := &repb.ExecutionTask{
+		Action: &repb.Action{},
 		Command: &repb.Command{
 			Arguments: []string{
 				workerPath,
@@ -690,7 +876,7 @@ func newPersistentRunnerTask(t *testing.T, key, arg, protocol string, resp *wkpb
 				Properties: []*repb.Platform_Property{
 					{Name: "persistentWorkerKey", Value: key},
 					{Name: "persistentWorkerProtocol", Value: protocol},
-					{Name: platform.RecycleRunnerPropertyName, Value: "true"},
+					// Note: we don't need to explicitly set recycle-runner=true.
 				},
 			},
 		},
@@ -749,7 +935,7 @@ func TestRunnerPool_PersistentWorker(t *testing.T) {
 
 			r, err := pool.Get(ctx, newPersistentRunnerTask(t, "abc", "", testCase.protocol, resp))
 			require.NoError(t, err)
-			res := r.Run(ctx)
+			res := r.Run(ctx, &repb.IOStats{})
 			require.NoError(t, res.Error)
 			assert.Equal(t, 0, res.ExitCode)
 			assert.Equal(t, []byte(resp.Output), res.Stderr)
@@ -764,7 +950,7 @@ func TestRunnerPool_PersistentWorker(t *testing.T) {
 
 			r, err := pool.Get(ctx, newPersistentRunnerTask(t, "abc", "", testCase.protocol, resp))
 			require.NoError(t, err)
-			res := r.Run(ctx)
+			res := r.Run(ctx, &repb.IOStats{})
 			require.NoError(t, res.Error)
 			assert.Equal(t, 0, res.ExitCode)
 			assert.Equal(t, []byte(resp.Output), res.Stderr)
@@ -779,7 +965,7 @@ func TestRunnerPool_PersistentWorker(t *testing.T) {
 
 			r, err := pool.Get(ctx, newPersistentRunnerTask(t, "def", "", testCase.protocol, resp))
 			require.NoError(t, err)
-			res := r.Run(ctx)
+			res := r.Run(ctx, &repb.IOStats{})
 			require.NoError(t, res.Error)
 			assert.Equal(t, 0, res.ExitCode)
 			assert.Equal(t, []byte(resp.Output), res.Stderr)
@@ -801,7 +987,7 @@ func TestRunnerPool_PersistentWorkerUnknownProtocol(t *testing.T) {
 	// Make a new persistent worker
 	r, err := pool.Get(ctx, newPersistentRunnerTask(t, "abc", "", "unknown", resp))
 	require.NoError(t, err)
-	res := r.Run(context.Background())
+	res := r.Run(context.Background(), &repb.IOStats{})
 	require.Error(t, res.Error)
 }
 
@@ -813,13 +999,41 @@ func TestRunnerPool_PersistentWorker_UnknownFlagFileError(t *testing.T) {
 	// Persistent worker with unknown flagfile
 	r, err := pool.Get(ctx, newPersistentRunnerTask(t, "abc", "@flagfile", "", &wkpb.WorkResponse{}))
 	require.NoError(t, err)
-	res := r.Run(context.Background())
+	res := r.Run(context.Background(), &repb.IOStats{})
 	require.Error(t, res.Error)
 
 	// Make sure that after the error, trying to recycle doesn't put the worker
 	// back in the pool.
 	pool.TryRecycle(ctx, r, true)
 	assert.Equal(t, 0, pool.PausedRunnerCount())
+}
+
+func TestRunnerPool_PersistentWorker_LargeFlagFile(t *testing.T) {
+	env := newTestEnv(t)
+	_, runServer, lis := testenv.RegisterLocalGRPCServer(t, env)
+	testcache.Setup(t, env, lis)
+	go runServer()
+	pool := newRunnerPool(t, env, noLimitsCfg())
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+	// Write a large flag (100KB) to the flag file and upload it as an input.
+	tmp := testfs.MakeTempDir(t)
+	testfs.WriteFile(t, tmp, "flags", strings.Repeat("a", 100*1024))
+	task := newPersistentRunnerTask(t, "abc", "@flags", "", &wkpb.WorkResponse{})
+	inputRootDigest, _, err := cachetools.UploadDirectoryToCAS(ctx, env, "", repb.DigestFunction_SHA256, tmp)
+	require.NoError(t, err)
+	task.ExecutionTask.Action.InputRootDigest = inputRootDigest
+
+	r, err := pool.Get(ctx, task)
+	require.NoError(t, err)
+	err = r.DownloadInputs(ctx)
+	require.NoError(t, err)
+	res := r.Run(context.Background(), &repb.IOStats{})
+	require.NoError(t, res.Error)
+
+	// Make sure that recycling succeeds.
+	pool.TryRecycle(ctx, r, true)
+	assert.Equal(t, 1, pool.PausedRunnerCount())
 }
 
 func TestRunnerPool_PersistentWorker_Crash_ShowsWorkerStderrInOutput(t *testing.T) {
@@ -830,7 +1044,7 @@ func TestRunnerPool_PersistentWorker_Crash_ShowsWorkerStderrInOutput(t *testing.
 	// Persistent worker with runner that crashes
 	r, err := pool.Get(ctx, newPersistentRunnerTask(t, "abc", "--fail_with_stderr=TestStderrMessage", "", &wkpb.WorkResponse{}))
 	require.NoError(t, err)
-	res := r.Run(context.Background())
+	res := r.Run(context.Background(), &repb.IOStats{})
 	require.Error(t, res.Error)
 	assert.Contains(t, res.Error.Error(), "persistent worker stderr:", res.Error.Error())
 	assert.Contains(t, res.Error.Error(), "TestStderrMessage")
@@ -858,7 +1072,7 @@ func TestRunnerPool_RecycleAfterCreateFailed_CallsRemove(t *testing.T) {
 	require.NoError(t, err)
 	// Try running a task; Create() should fail with our fixed error, and be
 	// surfaced in the command result.
-	res := r.Run(ctx)
+	res := r.Run(ctx, &repb.IOStats{})
 	require.Equal(t, fakeCreateError, res.Error)
 	pool.TryRecycle(ctx, r, false /*=finishedCleanly*/)
 	// Remove should be called, closing this channel.
@@ -879,7 +1093,7 @@ func TestDoNotRecycleSpecialFile(t *testing.T) {
 			}
 			r, err := pool.Get(ctx, task)
 			require.NoError(t, err)
-			res := r.Run(ctx)
+			res := r.Run(ctx, &repb.IOStats{})
 			assert.Equal(t, createFile, res.DoNotRecycle)
 			pool.TryRecycle(ctx, r, false)
 		})
@@ -915,4 +1129,189 @@ func TestImagePullTimeout(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, status.IsUnavailableError(err), "expected Unavailable, got %T", err)
 	assert.Contains(t, err.Error(), "deadline exceeded")
+}
+
+func TestCreateThenRecycleWithoutRun(t *testing.T) {
+	metrics.UnexpectedEvent.Reset()
+
+	env := newTestEnv(t)
+	cfg := noLimitsCfg()
+	pool := newRunnerPool(t, env, cfg)
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+	task := newTask()
+	// Get a runner then try to recycle it without running anything. We should
+	// not call Pause() since Run() is responsible for creating the container,
+	// which puts it in the ready state (which makes it possible to pause it).
+	r, err := pool.Get(ctx, task)
+	require.NoError(t, err)
+	err = r.PrepareForTask(ctx)
+	require.NoError(t, err)
+	pool.TryRecycle(ctx, r, true)
+	assert.Equal(t, 0, pool.PausedRunnerCount(), "runner should not be added to the pool")
+
+	require.Empty(t, testmetrics.CounterValues(t, metrics.UnexpectedEvent), "unexpected events logged")
+}
+
+func TestUnpauseThenRecycleWithoutRun(t *testing.T) {
+	metrics.UnexpectedEvent.Reset()
+
+	env := newTestEnv(t)
+	cfg := noLimitsCfg()
+	pool := newRunnerPool(t, env, cfg)
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+	task := newTask()
+	// Create a runner, execute a task, and pause it.
+	r, err := pool.Get(ctx, task)
+	require.NoError(t, err)
+	err = r.PrepareForTask(ctx)
+	require.NoError(t, err)
+	res := r.Run(ctx, &repb.IOStats{})
+	require.NoError(t, res.Error)
+	pool.TryRecycle(ctx, r, true)
+	assert.Equal(t, 1, pool.PausedRunnerCount(), "runner should be added to the pool")
+
+	// Get the paused runner then try to recycle it without running anything. We
+	// should call pause since the runner should be created and it may have
+	// useful contents from the previous run.
+	r, err = pool.Get(ctx, task)
+	require.NoError(t, err)
+	err = r.PrepareForTask(ctx)
+	require.NoError(t, err)
+	pool.TryRecycle(ctx, r, true)
+	assert.Equal(t, 1, pool.PausedRunnerCount(), "runner should be added to the pool")
+
+	require.Empty(t, testmetrics.CounterValues(t, metrics.UnexpectedEvent), "unexpected events logged")
+}
+
+func TestRunnerCrashedExitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		runnerCrashedExitCodesProp string
+		script                     string
+		wantDoNotRecycle           bool
+	}{
+		{
+			name:                       "PropEmpty/Exit0/ShouldRecyle",
+			runnerCrashedExitCodesProp: "",
+			script:                     "exit 0",
+			wantDoNotRecycle:           false,
+		},
+		{
+			name:                       "PropEmpty/Exit11/ShouldRecyle",
+			runnerCrashedExitCodesProp: "",
+			script:                     "exit 11",
+			wantDoNotRecycle:           false,
+		},
+		{
+			name:                       "PropSetTo11/Exit11/ShouldNotRecycle",
+			runnerCrashedExitCodesProp: "11",
+			script:                     "exit 11",
+			wantDoNotRecycle:           true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			pool := newRunnerPool(t, env, noLimitsCfg())
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			task := newTask()
+			cmd := task.ExecutionTask.Command
+			cmd.Platform.Properties = append(cmd.Platform.Properties, &repb.Platform_Property{
+				Name:  "runner-crashed-exit-codes",
+				Value: tc.runnerCrashedExitCodesProp,
+			})
+			task.ExecutionTask.Command.Arguments = []string{
+				"sh", "-c", tc.script,
+			}
+			r, err := pool.Get(ctx, task)
+			require.NoError(t, err)
+			res := r.Run(ctx, &repb.IOStats{})
+			assert.Equal(t, tc.wantDoNotRecycle, res.DoNotRecycle)
+		})
+	}
+}
+
+func TestRunUnder_WithRealWrapperScript(t *testing.T) {
+	// Create a wrapper script that records it was called and then exec's the wrapped command.
+	wrapperDir := testfs.MakeTempDir(t)
+	wrapperPath := testfs.WriteFile(t, wrapperDir, "wrapper.sh", "#!/bin/sh\nprintf 'WRAPPER_CALLED\\n'\nexec \"$@\"\n")
+	testfs.MakeExecutable(t, wrapperDir, "wrapper.sh")
+
+	env := newTestEnv(t)
+	pool := newRunnerPool(t, env, noLimitsCfg())
+	ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+
+	task := newTask()
+	task.ExecutionTask.Command.Arguments = []string{"sh", "-c", "printf 'ORIGINAL_CALLED\\n'"}
+	task.ExecutionTask.Command.Platform.Properties = append(
+		task.ExecutionTask.Command.Platform.Properties,
+		&repb.Platform_Property{
+			Name:  platform.RunUnderPropertyName,
+			Value: wrapperPath,
+		},
+	)
+
+	r, err := pool.Get(ctx, task)
+	require.NoError(t, err)
+	res := r.Run(ctx, &repb.IOStats{})
+
+	require.NoError(t, res.Error)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, "WRAPPER_CALLED\nORIGINAL_CALLED\n", string(res.Stdout),
+		"wrapper should be invoked first, then the original command")
+}
+
+func TestTransientErrorExitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		transientErrorExitCodesProp string
+		script                      string
+		wantExitCode                int
+		wantUnavailableError        bool
+	}{
+		{
+			name:                        "PropEmpty/Exit0/NoError",
+			transientErrorExitCodesProp: "",
+			script:                      "exit 0",
+			wantExitCode:                0,
+			wantUnavailableError:        false,
+		},
+		{
+			name:                        "PropEmpty/Exit11/NoError",
+			transientErrorExitCodesProp: "",
+			script:                      "exit 11",
+			wantExitCode:                11,
+			wantUnavailableError:        false,
+		},
+		{
+			name:                        "PropSetTo11/Exit11/UnavailableError",
+			transientErrorExitCodesProp: "11",
+			script:                      "exit 11",
+			wantExitCode:                commandutil.NoExitCode,
+			wantUnavailableError:        true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			pool := newRunnerPool(t, env, noLimitsCfg())
+			ctx := withAuthenticatedUser(t, context.Background(), env, "US1")
+			task := newTask()
+			cmd := task.ExecutionTask.Command
+			cmd.Platform.Properties = append(cmd.Platform.Properties, &repb.Platform_Property{
+				Name:  "transient-error-exit-codes",
+				Value: tc.transientErrorExitCodesProp,
+			})
+			task.ExecutionTask.Command.Arguments = []string{
+				"sh", "-c", tc.script,
+			}
+			r, err := pool.Get(ctx, task)
+			require.NoError(t, err)
+			res := r.Run(ctx, &repb.IOStats{})
+			require.Equal(t, tc.wantExitCode, res.ExitCode)
+			if tc.wantUnavailableError {
+				require.True(t, status.IsUnavailableError(res.Error), "want Unavailable, got %+#v", res.Error)
+			} else {
+				require.Nil(t, res.Error)
+			}
+		})
+	}
 }

@@ -43,8 +43,8 @@ class BazelBinResolverPlugin {
       if (request?.request?.includes("/bazel-bin/")) {
         // For now just try all supported config dirs and see if the file exists there.
         for (const configDir of configDirs) {
-          // Note: ROOTDIR (execution root dir) is set by the yarn() rule in
-          // //rules/yarn:index.bzl
+          // Note: ROOTDIR (execution root dir) is set by the pnpm() rule in
+          // //rules/pnpm:index.bzl
           const binPath = request.request.replace(/.*?\/bazel-bin\//, process.env["ROOTDIR"] + "/" + configDir + "/");
           let exists = false;
           try {
@@ -70,6 +70,29 @@ const bazelBinPlugin = function (context, options) {
     configureWebpack() {
       return {
         resolve: { plugins: [new BazelBinResolverPlugin()] },
+      };
+    },
+  };
+};
+
+// Guard analytics globals so route transitions don't crash when analytics scripts
+// are blocked or unavailable (for example, ad blockers in local/dev environments).
+const analyticsShimPlugin = function () {
+  return {
+    name: "docusaurus-analytics-shim-plugin",
+    injectHtmlTags() {
+      return {
+        headTags: [
+          {
+            tagName: "script",
+            innerHTML: `
+              window.ga = window.ga || function() { (window.ga.q = window.ga.q || []).push(arguments); };
+              window.ga.l = window.ga.l || +new Date();
+              window.dataLayer = window.dataLayer || [];
+              window.gtag = window.gtag || function() { window.dataLayer.push(arguments); };
+            `,
+          },
+        ],
       };
     },
   };
@@ -192,9 +215,8 @@ module.exports = {
           position: "left",
           type: "dropdown",
           items: [
-            { label: "Blog", href: "/blog" },
-            { label: "GitHub", href: "https://github.com/buildbuddy-io/buildbuddy" },
-            { label: "Community", href: "http://community.buildbuddy.io/" },
+            { label: "GitHub", to: "https://github.com/buildbuddy-io/buildbuddy" },
+            { label: "Community", to: "http://community.buildbuddy.io/" },
             { label: "Security", href: "/security" },
             { label: "Plugins", href: "/plugins" },
             { label: "Team", href: "/team" },
@@ -214,25 +236,31 @@ module.exports = {
           position: "left",
         },
         {
+          label: "Blog",
+          href: "/blog/",
+          target: "_self",
+          position: "left",
+        },
+        {
+          label: "Changelog",
+          href: "/changelog/",
+          target: "_self",
+          position: "left",
+        },
+        {
           href: "/pricing",
           target: "_self",
           label: "Pricing",
           position: "left",
         },
         {
-          href: "/contact",
-          target: "_self",
-          label: "Contact",
-          position: "right",
-        },
-        {
-          href: "https://app.buildbuddy.io/",
+          to: "https://app.buildbuddy.io/",
           target: "_self",
           label: "Login",
           position: "right",
         },
         {
-          href: "https://app.buildbuddy.io/",
+          to: "https://app.buildbuddy.io/",
           target: "_self",
           label: "Sign up",
           position: "right",
@@ -280,12 +308,12 @@ module.exports = {
             },
             {
               label: "Get Started",
-              href: "https://app.buildbuddy.io",
+              to: "https://app.buildbuddy.io",
               target: "_self",
             },
             {
               label: "Login",
-              href: "https://app.buildbuddy.io/",
+              to: "https://app.buildbuddy.io/",
               target: "_self",
             },
           ],
@@ -301,11 +329,6 @@ module.exports = {
             {
               label: "Pricing",
               href: "/pricing",
-              target: "_self",
-            },
-            {
-              label: "Blog",
-              href: "/blog/",
               target: "_self",
             },
             {
@@ -345,7 +368,7 @@ module.exports = {
             },
             {
               label: "Report an Issue",
-              href: "https://github.com/buildbuddy-io/buildbuddy/issues/new",
+              to: "https://github.com/buildbuddy-io/buildbuddy/issues/new",
             },
             {
               label: "Privacy Policy",
@@ -364,19 +387,19 @@ module.exports = {
           items: [
             {
               label: "Slack",
-              href: "http://community.buildbuddy.io/",
+              to: "http://community.buildbuddy.io/",
             },
             {
               label: "Twitter",
-              href: "https://twitter.com/buildbuddy_io",
+              to: "https://twitter.com/buildbuddy",
             },
             {
               label: "LinkedIn",
-              href: "http://linkedin.com/company/buildbuddy",
+              to: "http://linkedin.com/company/buildbuddy",
             },
             {
               label: "GitHub",
-              href: "https://github.com/buildbuddy-io",
+              to: "https://github.com/buildbuddy-io",
             },
           ],
         },
@@ -439,6 +462,22 @@ module.exports = {
       },
     ],
     [
+      "@docusaurus/plugin-content-blog",
+      {
+        id: "changelog",
+        routeBasePath: "changelog",
+        path: "changelog",
+        postsPerPage: 25,
+        showReadingTime: false,
+        blogSidebarCount: 0,
+        authorsMapPath: "../blog/authors.yaml",
+        blogListComponent: "../theme/ChangelogListPage",
+        blogTagsPostsComponent: "../theme/FilteredChangelogListPage",
+        blogPostComponent: "../theme/ChangelogPostPage",
+        editUrl: "https://github.com/buildbuddy-io/buildbuddy/edit/master/website/changelog/",
+      },
+    ],
+    [
       "@docusaurus/plugin-client-redirects",
       {
         redirects: [
@@ -453,6 +492,7 @@ module.exports = {
         ],
       },
     ],
+    analyticsShimPlugin,
     bazelBinPlugin,
   ],
 };

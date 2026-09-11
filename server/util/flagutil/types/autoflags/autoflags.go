@@ -19,7 +19,7 @@ import (
 // output, or use `DeprecatedTag(migrationPlan)` to mark a flag that has been
 // deprecated and provide its migration plan.
 func New[T any](flagset *flag.FlagSet, name string, defaultValue T, usage string, tags ...flagtags.Taggable) *T {
-	value := reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Interface().(*T)
+	value := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
 	Var(flagset, value, name, defaultValue, usage, tags...)
 	return value
 }
@@ -71,6 +71,11 @@ func Var[T any](flagset *flag.FlagSet, value *T, name string, defaultValue T, us
 		if reflect.TypeOf(value).Elem().Kind() == reflect.Struct {
 			flagtypes.JSONStructVar(flagset, value, name, defaultValue, usage)
 			Tag[T, *flagtypes.JSONStructFlag[T]](flagset, name, tags...)
+			break
+		}
+		if reflect.TypeOf(value).Elem().Kind() == reflect.Map {
+			flagtypes.JSONMapVar(flagset, value, name, defaultValue, usage)
+			Tag[T, *flagtypes.JSONMapFlag[T]](flagset, name, tags...)
 			break
 		}
 		log.Fatalf("Var was called from flag registry for flag %s with value %v of unrecognized type %T.", name, defaultValue, defaultValue)

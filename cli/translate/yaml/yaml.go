@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/cli/add"
@@ -33,7 +34,7 @@ func New() *yamlTranslator {
 func (y *yamlTranslator) Translate(path, input string) (string, error) {
 	isModule := strings.HasPrefix(strings.ToUpper(path), "MODULE")
 	rules := splitRegex.Split(string(input), -1)
-	output := ""
+	var output strings.Builder
 	for _, rule := range rules {
 		rule = strings.TrimSpace(rule)
 		if rule == "" {
@@ -48,9 +49,9 @@ func (y *yamlTranslator) Translate(path, input string) (string, error) {
 		if s == "" {
 			continue
 		}
-		output += s
+		output.WriteString(s)
 	}
-	return output, nil
+	return output.String(), nil
 }
 
 func (y *yamlTranslator) translateRule(m yaml.MapSlice, isModule bool) string {
@@ -65,7 +66,7 @@ func (y *yamlTranslator) translateRule(m yaml.MapSlice, isModule bool) string {
 				log.Warnf("load: must be a list")
 			}
 		case "rules":
-			if rules, ok := i.Value.([]interface{}); ok {
+			if rules, ok := i.Value.([]any); ok {
 				for _, rule := range rules {
 					s = s + y.translateRule(rule.(yaml.MapSlice), isModule) + newLineSeparator
 				}
@@ -73,7 +74,7 @@ func (y *yamlTranslator) translateRule(m yaml.MapSlice, isModule bool) string {
 				log.Warnf("rules: must be a list")
 			}
 		case "deps":
-			if load, ok := i.Value.([]interface{}); ok {
+			if load, ok := i.Value.([]any); ok {
 				s = s + y.translateDeps(load, isModule) + newLineSeparator
 			} else {
 				log.Warnf("deps: must be a list, instead it was %T", i.Value)
@@ -93,7 +94,7 @@ func (y *yamlTranslator) translateRule(m yaml.MapSlice, isModule bool) string {
 		case "templates":
 			if load, ok := i.Value.(yaml.MapSlice); ok {
 				y.translateTemplateMap(load)
-			} else if load, ok := i.Value.([]interface{}); ok {
+			} else if load, ok := i.Value.([]any); ok {
 				y.translateTemplate(load)
 			} else {
 				log.Warnf("template: must be a list or a map, instead it was %T", i.Value)
@@ -122,7 +123,7 @@ func (y *yamlTranslator) translateMap(m yaml.MapSlice) string {
 	return strings.Join(values, commaSeparator)
 }
 
-func (y *yamlTranslator) translateList(l []interface{}) string {
+func (y *yamlTranslator) translateList(l []any) string {
 	values := []string{}
 	for _, i := range l {
 		values = append(values, y.translateValue(i, ""))
@@ -130,7 +131,7 @@ func (y *yamlTranslator) translateList(l []interface{}) string {
 	return strings.Join(values, commaSeparator)
 }
 
-func (y *yamlTranslator) translateValue(v interface{}, ruleName string) string {
+func (y *yamlTranslator) translateValue(v any, ruleName string) string {
 	switch i := v.(type) {
 	case yaml.MapSlice:
 		m := y.translateMap(i)
@@ -138,7 +139,7 @@ func (y *yamlTranslator) translateValue(v interface{}, ruleName string) string {
 			return fmt.Sprintf("%s(%s)", ruleName, m)
 		}
 		return fmt.Sprintf("{%s}", m)
-	case []interface{}:
+	case []any:
 		if ruleName != "" {
 			s := []string{}
 			for _, i := range i {
@@ -153,10 +154,8 @@ func (y *yamlTranslator) translateValue(v interface{}, ruleName string) string {
 				return i
 			}
 		}
-		for _, l := range y.loadList {
-			if l == fmt.Sprintf(`"%s"`, i) {
-				return i
-			}
+		if slices.Contains(y.loadList, fmt.Sprintf(`"%s"`, i)) {
+			return i
 		}
 		return fmt.Sprintf(`"%s"`, i)
 	case bool:
@@ -177,7 +176,7 @@ func (y *yamlTranslator) translateLoad(m yaml.MapSlice) string {
 	for _, i := range m {
 		value := ""
 		switch i := i.Value.(type) {
-		case []interface{}:
+		case []any:
 			value = y.translateList(i)
 			y.loadList = append(y.loadList, strings.Split(value, commaSeparator)...)
 		case string:
@@ -193,26 +192,27 @@ func (y *yamlTranslator) translateLoad(m yaml.MapSlice) string {
 	return strings.Join(values, newLineSeparator)
 }
 
-func (y *yamlTranslator) translateDeps(m []interface{}, isModule bool) string {
-	output := ""
+func (y *yamlTranslator) translateDeps(m []any, isModule bool) string {
+	var output strings.Builder
 	for _, dep := range m {
 		depString, ok := dep.(string)
 		if !ok {
 			log.Warnf("unknown dep type: %T", dep)
 			continue
 		}
-		module, version, resp, err := add.FetchModuleOrDisambiguate(strings.Split(depString, "@")[0])
+		moduleString, _, _ := strings.Cut(depString, "@")
+		module, version, resp, err := add.FetchModuleOrDisambiguate(moduleString)
 		if err != nil {
 			log.Warnf("error fetching module: %s", err)
 			continue
 		}
 		if isModule {
-			output += add.GenerateModuleSnippet(module, version, resp)
+			output.WriteString(add.GenerateModuleSnippet(module, version, resp))
 		} else {
-			output += add.GenerateWorkspaceSnippet(module, version, resp)
+			output.WriteString(add.GenerateWorkspaceSnippet(module, version, resp))
 		}
 	}
-	return output
+	return output.String()
 }
 
 func (y *yamlTranslator) translateBazel(m yaml.MapSlice) {
@@ -237,12 +237,12 @@ func (y *yamlTranslator) translateBazel(m yaml.MapSlice) {
 }
 
 func (y *yamlTranslator) translateSettings(m yaml.MapSlice) {
-	bazelrc := ""
+	var bazelrc strings.Builder
 	for _, s := range m {
-		bazelrc += "common --" + s.Key.(string) + "=" + s.Value.(string) + "\n"
+		bazelrc.WriteString("common --" + s.Key.(string) + "=" + s.Value.(string) + "\n")
 	}
 
-	err := os.WriteFile(".bazelrc", []byte(bazelrc), 0644)
+	err := os.WriteFile(".bazelrc", []byte(bazelrc.String()), 0644)
 	if err != nil {
 		log.Warnf("error writing .bazelrc file: %s", err)
 	}
@@ -254,7 +254,7 @@ func (y *yamlTranslator) translateTemplateMap(m yaml.MapSlice) {
 	}
 }
 
-func (y *yamlTranslator) translateTemplate(m []interface{}) {
+func (y *yamlTranslator) translateTemplate(m []any) {
 	for _, s := range m {
 		from := ""
 		into := ""
@@ -300,8 +300,8 @@ func renderTemplate(from, into string) {
 	log.Debugf("grabbing template from %s and putting it into %q", from, into)
 
 	repo := from
-	if strings.HasPrefix(from, "github/") {
-		repo = "https://github.com/" + strings.TrimPrefix(from, "github/")
+	if after, ok := strings.CutPrefix(from, "github/"); ok {
+		repo = "https://github.com/" + after
 	} else if strings.HasPrefix(from, "github.com/") {
 		repo = "https://" + from
 	} else if !strings.HasPrefix(from, "https://github.com/") {

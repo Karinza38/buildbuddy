@@ -12,11 +12,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/endpoint_urls/build_buddy_url"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
+	"github.com/buildbuddy-io/buildbuddy/server/http/httpclient"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
@@ -24,10 +24,17 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/cookie"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/samlsp"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v4"
+	"github.com/jonboulle/clockwork"
+)
+
+const (
+	samlProviderCacheSize = 10_000
+	samlProviderCacheTTL  = 2 * time.Minute
 )
 
 var (
@@ -57,6 +64,14 @@ var (
 	samlEmailAttributes     = []string{"email", "mail", "emailAddress", "Email", "emailaddress", "email_address"}
 	samlSubjectAttributes   = append([]string{"urn:oasis:names:tc:SAML:attribute:subject-id", "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent", "user_id", "username"}, samlEmailAttributes...)
 )
+
+func SubIDPrefixForGroup(slug string) string {
+	return build_buddy_url.WithPath("saml/metadata").String() + "?slug=" + slug + "/"
+}
+
+func SubIDForUserName(userName string, g *tables.Group) string {
+	return SubIDPrefixForGroup(g.URLIdentifier) + userName
+}
 
 // CookieRequestTracker tracks requests by setting a uniquely named
 // cookie for each request.
@@ -200,9 +215,9 @@ func (p cookieSessionProvider) GetSession(r *http.Request) (samlsp.Session, erro
 }
 
 type SAMLAuthenticator struct {
-	env           environment.Env
-	mu            sync.Mutex
-	samlProviders map[string]*samlsp.Middleware
+	env                environment.Env
+	samlProviders      lru.LRU[*samlsp.Middleware]
+	metadataHTTPClient *http.Client
 }
 
 func IsEnabled(env environment.Env) bool {
@@ -219,10 +234,29 @@ func NewSAMLAuthenticator(env environment.Env) (*SAMLAuthenticator, error) {
 	if *key != "" && *keyFile != "" {
 		return nil, status.FailedPreconditionError("only one of SAML 'key' and 'key_file' may be set")
 	}
+	cache, err := newSAMLProviderCache(env.GetClock())
+	if err != nil {
+		return nil, err
+	}
 	return &SAMLAuthenticator{
-		env:           env,
-		samlProviders: make(map[string]*samlsp.Middleware),
+		env:                env,
+		samlProviders:      cache,
+		metadataHTTPClient: httpclient.New(nil /*=allowedPrivateIPNets*/, "saml_metadata"),
 	}, nil
+}
+
+func newSAMLProviderCache(clock clockwork.Clock) (lru.LRU[*samlsp.Middleware], error) {
+	cache, err := lru.New[*samlsp.Middleware](&lru.Config[*samlsp.Middleware]{
+		MaxSize:    samlProviderCacheSize,
+		SizeFn:     func(*samlsp.Middleware) int64 { return 1 },
+		TTL:        samlProviderCacheTTL,
+		ThreadSafe: true,
+		Clock:      clock,
+	})
+	if err != nil {
+		return nil, status.InternalErrorf("error initializing SAML provider cache: %s", err)
+	}
+	return cache, nil
 }
 
 func (a *SAMLAuthenticator) SSOEnabled() bool {
@@ -268,7 +302,18 @@ func (a *SAMLAuthenticator) AuthenticatedHTTPContext(w http.ResponseWriter, r *h
 			ctx = context.WithValue(ctx, contextSamlSessionKey, sa)
 			ctx = context.WithValue(ctx, contextSamlEntityIDKey, sp.ServiceProvider.EntityID)
 			ctx = context.WithValue(ctx, contextSamlSlugKey, a.getSlugFromRequest(r))
-			return ctx
+
+			s, _, err := a.subjectIDAndSessionFromContext(ctx)
+			if err != nil {
+				return authutil.AuthContextWithError(ctx, err)
+			}
+			c, err := claims.ClaimsFromSubID(ctx, a.env, s)
+			if err != nil {
+				return authutil.AuthContextWithError(ctx, status.PermissionDeniedErrorf("error getting SAML claims: %s", err.Error()))
+			}
+			c.SAML = true
+
+			return claims.AuthContextWithJWT(ctx, c, err)
 		}
 	} else if slug := cookie.GetCookie(r, slugCookie); slug != "" {
 		return authutil.AuthContextWithError(ctx, status.PermissionDeniedErrorf("Error getting service provider for slug %s: %s", slug, err.Error()))
@@ -281,21 +326,22 @@ func (a *SAMLAuthenticator) FillUser(ctx context.Context, user *tables.User) err
 	if err != nil {
 		return err
 	}
-	if subjectID, session := a.subjectIDAndSessionFromContext(ctx); subjectID != "" && session != nil {
-		attributes := session.GetAttributes()
-		user.UserID = pk
-		user.SubID = subjectID
-		user.FirstName = firstSet(attributes, samlFirstNameAttributes)
-		user.LastName = firstSet(attributes, samlLastNameAttributes)
-		user.Email = firstSet(attributes, samlEmailAttributes)
-		if slug, ok := ctx.Value(contextSamlSlugKey).(string); ok && slug != "" {
-			user.Groups = []*tables.GroupRole{
-				{Group: tables.Group{URLIdentifier: slug}},
-			}
-		}
-		return nil
+	subjectID, session, err := a.subjectIDAndSessionFromContext(ctx)
+	if err != nil {
+		return err
 	}
-	return status.UnauthenticatedError("No SAML User found")
+	attributes := session.GetAttributes()
+	user.UserID = pk
+	user.SubID = subjectID
+	user.FirstName = firstSet(attributes, samlFirstNameAttributes)
+	user.LastName = firstSet(attributes, samlLastNameAttributes)
+	user.Email = firstSet(attributes, samlEmailAttributes)
+	if slug, ok := ctx.Value(contextSamlSlugKey).(string); ok && slug != "" {
+		user.Groups = []*tables.GroupRole{
+			{URLIdentifier: slug},
+		}
+	}
+	return nil
 }
 
 func (a *SAMLAuthenticator) Logout(w http.ResponseWriter, r *http.Request) error {
@@ -303,19 +349,21 @@ func (a *SAMLAuthenticator) Logout(w http.ResponseWriter, r *http.Request) error
 	if sp, err := a.serviceProviderFromRequest(r); err == nil {
 		sp.Session.DeleteSession(w, r)
 	}
-	return status.UnauthenticatedError("Logged out!")
+	return nil
 }
 
 func (a *SAMLAuthenticator) AuthenticatedUser(ctx context.Context) (interfaces.UserInfo, error) {
-	if s, _ := a.subjectIDAndSessionFromContext(ctx); s != "" {
-		claims, err := claims.ClaimsFromSubID(ctx, a.env, s)
-		if err != nil {
-			return nil, status.UnauthenticatedErrorf(authutil.UserNotFoundMsg)
-		}
-		claims.SAML = true
-		return claims, nil
+	s, _, err := a.subjectIDAndSessionFromContext(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return nil, status.UnauthenticatedError("No SAML User found")
+	c, err := claims.ClaimsFromSubID(ctx, a.env, s)
+	if err != nil {
+		return nil, status.UnauthenticatedErrorf(authutil.UserNotFoundMsg)
+	}
+	c.SAML = true
+	c.CustomerSSO = true
+	return c, nil
 }
 
 func (a *SAMLAuthenticator) Auth(w http.ResponseWriter, r *http.Request) error {
@@ -340,9 +388,7 @@ func (a *SAMLAuthenticator) serviceProviderFromRequest(r *http.Request) (*samlsp
 	if slug == "" {
 		return nil, status.FailedPreconditionError("Organization slug not set")
 	}
-	a.mu.Lock()
-	provider, ok := a.samlProviders[slug]
-	a.mu.Unlock()
+	provider, ok := a.samlProviders.Get(slug)
 	if ok {
 		return provider, nil
 	}
@@ -387,7 +433,7 @@ func (a *SAMLAuthenticator) serviceProviderFromRequest(r *http.Request) (*samlsp
 	if err != nil {
 		return nil, err
 	}
-	idpMetadata, err := samlsp.FetchMetadata(context.Background(), http.DefaultClient,
+	idpMetadata, err := samlsp.FetchMetadata(r.Context(), a.metadataHTTPClient,
 		*idpMetadataURL)
 	if err != nil {
 		return nil, err
@@ -455,9 +501,7 @@ func (a *SAMLAuthenticator) serviceProviderFromRequest(r *http.Request) (*samlsp
 		csp.oldDomain = opts.URL.Host
 	}
 	samlSP.Session = csp
-	a.mu.Lock()
-	a.samlProviders[slug] = samlSP
-	a.mu.Unlock()
+	a.samlProviders.Add(slug, samlSP)
 	return samlSP, nil
 }
 
@@ -495,15 +539,24 @@ func (a *SAMLAuthenticator) groupForSlug(ctx context.Context, slug string) (*tab
 	return userDB.GetGroupByURLIdentifier(ctx, slug)
 }
 
-func (a *SAMLAuthenticator) subjectIDAndSessionFromContext(ctx context.Context) (string, samlsp.SessionWithAttributes) {
+func (a *SAMLAuthenticator) subjectIDAndSessionFromContext(ctx context.Context) (string, samlsp.SessionWithAttributes, error) {
 	entityID, ok := ctx.Value(contextSamlEntityIDKey).(string)
 	if !ok || entityID == "" {
-		return "", nil
+		return "", nil, status.UnauthenticatedError("No SAML User found")
 	}
-	if sa, ok := ctx.Value(contextSamlSessionKey).(samlsp.SessionWithAttributes); ok {
-		return fmt.Sprintf("%s/%s", entityID, firstSet(sa.GetAttributes(), samlSubjectAttributes)), sa
+	sa, ok := ctx.Value(contextSamlSessionKey).(samlsp.SessionWithAttributes)
+	if !ok {
+		return "", nil, status.UnauthenticatedError("No SAML User found")
 	}
-	return "", nil
+	subject := firstSet(sa.GetAttributes(), samlSubjectAttributes)
+	if subject == "" {
+		return "", sa, status.PermissionDeniedError(
+			"SAML assertion does not contain a subject identifier. " +
+				"Configure your identity provider to include a SAML AttributeStatement " +
+				"with one of: 'email', 'username', 'user_id', or " +
+				"'urn:oasis:names:tc:SAML:attribute:subject-id'.")
+	}
+	return fmt.Sprintf("%s/%s", entityID, subject), sa, nil
 }
 
 func firstSet(attributes samlsp.Attributes, keys []string) string {

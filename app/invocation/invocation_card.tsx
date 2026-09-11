@@ -1,7 +1,7 @@
 import {
   CheckCircle,
+  Circle,
   Clock,
-  Github,
   GitBranch,
   GitCommit,
   HardDrive,
@@ -12,15 +12,16 @@ import {
   User,
   Wrench,
   XCircle,
-  Circle,
 } from "lucide-react";
 import React from "react";
-import format from "../format/format";
-import router from "../router/router";
-import Link from "../components/link/link";
-import { invocation } from "../../proto/invocation_ts_proto";
 import { invocation_status } from "../../proto/invocation_status_ts_proto";
+import { invocation } from "../../proto/invocation_ts_proto";
+import Link from "../components/link/link";
+import format from "../format/format";
+import { Github } from "../icons/github_lucide";
+import router from "../router/router";
 import { exitCode } from "../util/exit_codes";
+import InvocationCompareButton from "./invocation_compare_button";
 
 const durationRefreshIntervalMillis = 3000;
 
@@ -112,6 +113,20 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
   }
 
   getStatusClass() {
+    if (this.hasRunStatus()) {
+      switch (this.props.invocation.runStatus) {
+        case invocation_status.OverallStatus.SUCCESS:
+          return "card-success";
+        case invocation_status.OverallStatus.FAILURE:
+          return "card-failure";
+        case invocation_status.OverallStatus.IN_PROGRESS:
+          return "card-in-progress";
+        case invocation_status.OverallStatus.DISCONNECTED:
+          return "card-disconnected";
+        default:
+      }
+    }
+
     if (this.isInProgress()) {
       return "card-in-progress";
     }
@@ -128,19 +143,33 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
   }
 
   renderStatusIcon() {
+    if (this.hasRunStatus()) {
+      switch (this.props.invocation.runStatus) {
+        case invocation_status.OverallStatus.SUCCESS:
+          return <CheckCircle className="green" />;
+        case invocation_status.OverallStatus.FAILURE:
+          return <XCircle className="red" />;
+        case invocation_status.OverallStatus.IN_PROGRESS:
+          return <PlayCircle className="blue" />;
+        case invocation_status.OverallStatus.DISCONNECTED:
+          return <HelpCircle />;
+        default:
+      }
+    }
+
     if (this.isInProgress()) {
-      return <PlayCircle className="icon blue" />;
+      return <PlayCircle className="blue" />;
     }
 
     if (this.isDisconnected()) {
-      return <HelpCircle className="icon" />;
+      return <HelpCircle />;
     }
 
     if (this.props.invocation.bazelExitCode == "NO_TESTS_FOUND") {
-      return <Circle className="icon gray" />;
+      return <Circle className="gray" />;
     }
 
-    return this.props.invocation.success ? <CheckCircle className="icon green" /> : <XCircle className="icon red" />;
+    return this.props.invocation.success ? <CheckCircle className="green" /> : <XCircle className="red" />;
   }
 
   getStatusLabel() {
@@ -180,9 +209,8 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
         : "Disconnected build";
     }
 
-    return `${this.props.invocation.user || "Unknown user"}'s ${this.props.invocation.command} ${format.truncateList(
-      this.props.invocation.pattern
-    )}`;
+    const userPrefix = this.props.invocation.user ? `${this.props.invocation.user}'s ` : "";
+    return userPrefix + `${this.props.invocation.command} ${format.truncateList(this.props.invocation.pattern)}`;
   }
 
   getDuration() {
@@ -191,6 +219,18 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
     }
 
     return format.durationUsec(this.props.invocation.durationUsec);
+  }
+
+  hasRunStatus(): boolean {
+    switch (this.props.invocation.runStatus) {
+      case invocation_status.OverallStatus.SUCCESS:
+      case invocation_status.OverallStatus.FAILURE:
+      case invocation_status.OverallStatus.IN_PROGRESS:
+      case invocation_status.OverallStatus.DISCONNECTED:
+        return true;
+      default:
+        return false;
+    }
   }
 
   render() {
@@ -219,6 +259,9 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
             <div className="title">{this.getTitle()}</div>
             {roleLabel && <div className={`role-badge ${this.props.invocation.role}`}>{roleLabel}</div>}
             <div className="subtitle">{format.formatTimestampUsec(this.props.invocation.createdAtUsec)}</div>
+            {!this.props.hover && (
+              <InvocationCompareButton mini={true} invocationId={this.props.invocation.invocationId} />
+            )}
           </div>
           <div className="details">
             {!this.props.hover && (
@@ -229,7 +272,7 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
             )}
             {!this.props.hover && (
               <div className="detail">
-                <Clock className="icon" />
+                <Clock />
                 {this.getDuration()}
               </div>
             )}
@@ -239,7 +282,7 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
                 onClick={(e) => {
                   this.handleUserClicked(e, this.props.invocation);
                 }}>
-                <User className="icon" />
+                <User />
                 {this.props.invocation.user}
               </div>
             )}
@@ -249,19 +292,19 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
                 onClick={(e) => {
                   this.handleHostClicked(e, this.props.invocation);
                 }}>
-                <HardDrive className="icon" />
+                <HardDrive />
                 {this.props.invocation.host}
               </div>
             )}
             {!this.props.hover && this.props.invocation.command && (
               <div className="detail">
-                <Wrench className="icon" />
+                <Wrench />
                 {this.props.invocation.command}
               </div>
             )}
             {!this.props.hover && this.props.invocation.pattern.length > 0 && (
               <div className="detail">
-                <LayoutGrid className="icon" />
+                <LayoutGrid />
                 {format.truncateList(this.props.invocation.pattern)}
               </div>
             )}
@@ -271,7 +314,7 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
                 onClick={(e) => {
                   this.handleRepoClicked(e, this.props.invocation);
                 }}>
-                <Github className="icon" />
+                <Github />
                 {format.formatGitUrl(this.props.invocation.repoUrl)}
               </div>
             )}
@@ -281,13 +324,13 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
                 onClick={(e) => {
                   this.handleBranchClicked(e, this.props.invocation);
                 }}>
-                <GitBranch className="icon" />
+                <GitBranch />
                 {this.props.invocation.branchName}
               </div>
             )}
             {tags && (
               <div className="detail clickable">
-                <Tag className="icon" />
+                <Tag />
                 {tags}
               </div>
             )}
@@ -297,7 +340,7 @@ export default class InvocationCardComponent extends React.Component<Props, Stat
                 onClick={(e) => {
                   this.handleCommitClicked(e, this.props.invocation);
                 }}>
-                <GitCommit className="icon" />
+                <GitCommit />
                 {format.formatCommitHash(this.props.invocation.commitSha)}
               </div>
             )}

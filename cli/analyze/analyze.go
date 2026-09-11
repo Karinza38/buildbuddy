@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -30,6 +32,9 @@ const (
 
 var (
 	flags = flag.NewFlagSet("analyze", flag.ContinueOnError)
+	Flags = flags
+
+	keepGoingFlag = flags.Bool("keep_going", true, "Continue querying the dependency graph even after encountering errors.")
 
 	longestPathFlag = flags.Bool("longest_path", false, "Show the longest path in the build graph.")
 
@@ -229,7 +234,7 @@ func computeTargetMetrics(graph *DependencyGraph) (map[string]*TargetMetrics, er
 	resultsCh := make(chan *targetResult, numWorkers)
 	eg := errgroup.Group{}
 	rulesCh := bufferedChanOf(mapValues(graph.Rules))
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		eg.Go(func() error {
 			for rule := range rulesCh {
 				res := compute(rule)
@@ -325,7 +330,12 @@ func queryGraph(target string) (*DependencyGraph, error) {
 	// workspace. Tracking changes to external repos is complicated, so we're
 	// excluding them for now.
 	q := fmt.Sprintf("deps(%s) intersect //...", target)
-	bazelArgs := []string{"query", "--output=proto", q}
+	bazelArgs := []string{
+		"query",
+		fmt.Sprintf("--keep_going=%t", *keepGoingFlag),
+		"--output=proto",
+		q,
+	}
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	opts := &bazelisk.RunOpts{
@@ -336,9 +346,16 @@ func queryGraph(target string) (*DependencyGraph, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if exitCode != 0 {
-		fmt.Print(stderr.String())
-		return nil, fmt.Errorf("bazelisk query failed (exit code %d)", exitCode)
+		fmt.Fprint(os.Stderr, stderr.String())
+		// When --keep_going is set, Bazel can produce some output even when it
+		// exits with a non-zero exit code. So, we just log a warning on
+		// non-zero exits unless Bazel produced no output at all.
+		if !*keepGoingFlag || stdout.Len() == 0 {
+			return nil, fmt.Errorf("bazelisk query failed (exit code %d)", exitCode)
+		}
+		log.Warnf("Query returned non-zero exit code %d; analysis may be incomplete", exitCode)
 	}
 
 	res := &bqpb.QueryResult{}
@@ -407,39 +424,35 @@ func (g *DependencyGraph) AffectedTargetCount(name string) int {
 // LongestPath returns the longest dependency path from one node in the graph to
 // any other node.
 func (g *DependencyGraph) LongestPath() []string {
-	longestPathLength := 0
-	var longestPathEnd *string
-
 	length := map[string]int{}
-	pred := map[string]*string{}
+	next := map[string]string{}
+	longestPathLength := 0
+	longestPathStart := ""
+
 	e := g.EdgeSet()
-	for _, m := range g.TopologicalSort() {
-		for n := range e.Incoming[m] {
-			l := length[n] + 1
-			if l > length[m] {
-				length[m] = l
-				n := n
-				pred[m] = &n
-			}
-			if l > longestPathLength {
-				longestPathLength = l
-				m := m
-				longestPathEnd = &m
+	nodes := g.TopologicalSort()
+	for _, n := range slices.Backward(nodes) {
+		for dep := range e.Outgoing[n] {
+			candidateLength := length[dep] + 1
+			if candidateLength > length[n] ||
+				(candidateLength == length[n] && dep < next[n]) {
+				length[n] = candidateLength
+				next[n] = dep
 			}
 		}
+		if length[n] > longestPathLength ||
+			(length[n] == longestPathLength && n < longestPathStart) {
+			longestPathLength = length[n]
+			longestPathStart = n
+		}
 	}
-	if longestPathEnd == nil {
+	if longestPathStart == "" {
 		return nil
 	}
-	path := []string{*longestPathEnd}
-	for {
-		p := pred[path[len(path)-1]]
-		if p == nil {
-			break
-		}
-		path = append(path, *p)
+	path := make([]string, 0, longestPathLength+1)
+	for n := longestPathStart; n != ""; n = next[n] {
+		path = append(path, n)
 	}
-	reverseSlice(path)
 	return path
 }
 
@@ -548,14 +561,6 @@ func makeSet[T comparable](values []T) map[T]bool {
 		set[v] = true
 	}
 	return set
-}
-
-// reverseSlice reverses the order of the elements in the given slice.
-func reverseSlice[T any](a []T) {
-	for i := 0; i < len(a)/2; i++ {
-		j := len(a) - i - 1
-		a[i], a[j] = a[j], a[i]
-	}
 }
 
 // bufferedChanOf returns a channel pre-populated with the list of values from

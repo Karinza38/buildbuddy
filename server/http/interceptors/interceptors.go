@@ -31,9 +31,12 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/region"
 	"github.com/buildbuddy-io/buildbuddy/server/util/subdomain"
+	"github.com/buildbuddy-io/buildbuddy/server/util/useragent"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 
+	apipb "github.com/buildbuddy-io/buildbuddy/proto/api/v1"
+	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
 	ctxpb "github.com/buildbuddy-io/buildbuddy/proto/context"
 	requestcontext "github.com/buildbuddy-io/buildbuddy/server/util/request_context"
 )
@@ -44,6 +47,14 @@ var (
 )
 
 const contentSecurityPolicyReportingEndpointName = "csp-endpoint"
+
+var (
+	rpcNameContextKey       = struct{}{}
+	buildBuddyHTTPPrefix    = "/rpc/BuildBuddyService/"
+	buildBuddyServicePrefix = "/" + bbspb.BuildBuddyService_ServiceDesc.ServiceName + "/"
+	apiHTTPPrefix           = "/api/v1/"
+	apiServicePrefix        = "/" + apipb.ApiService_ServiceDesc.ServiceName + "/"
+)
 
 func getContentSecurityPolicyHeaderValue(nonce string) string {
 	var regionConnectSrcs []string
@@ -78,7 +89,7 @@ func getContentSecurityPolicyHeaderValue(nonce string) string {
 		"base-uri 'none'",
 		"block-all-mixed-content",
 		// libsodium.js requires data: for wasm.
-		"connect-src 'self' data: https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com " + strings.Join(regionConnectSrcs, " "),
+		"connect-src 'self' data: https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com https://registry.build " + strings.Join(regionConnectSrcs, " "),
 		"report-to " + contentSecurityPolicyReportingEndpointName,
 		"report-uri " + csp.ReportingEndpoint,
 		// libsodium.js requires 'wasm-unsafe-eval' to avoid a fallback to asm.js.
@@ -113,6 +124,57 @@ func SetSecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// BasicMIMETypeFromExtension returns a safe MIME type guessed from the given
+// extension. Only some basic media formats are supported. This function may be
+// useful in some cases where the user has requested to view their uploaded file
+// contents, but our default strict `X-Content-Type-Options: nosniff` header is
+// preventing the content from being displayed.
+//
+// The returned MIME types are all "inert" - executable contents such as JS, SVG
+// (which can contain embedded <script> tags), and PDF, are treated as generic
+// octet streams.
+func BasicMIMETypeFromExtension(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg", ".jfif":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".bmp":
+		return "image/bmp"
+	case ".webp":
+		return "image/webp"
+	case ".ico":
+		return "image/x-icon"
+	case ".tif", ".tiff":
+		return "image/tiff"
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".webm":
+		return "video/webm"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	case ".m4a", ".m4b", ".m4p", ".m4r":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	}
+	return "application/octet-stream"
+}
+
 func RedirectIfNotForwardedHTTPS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		protocol := r.Header.Get("X-Forwarded-Proto") // Set by load balancer
@@ -128,7 +190,7 @@ func RedirectIfNotForwardedHTTPS(next http.Handler) http.Handler {
 
 // gzip, courtesy of https://gist.github.com/CJEnright/bc2d8b8dc0c1389a9feeddb110f822d7
 var gzPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		w := gzip.NewWriter(io.Discard)
 		return w
 	},
@@ -225,10 +287,40 @@ func Authenticate(env environment.Env, next http.Handler) http.Handler {
 	})
 }
 
+// parseProtoletRPCName converts a protolet HTTP route to the canonical full RPC
+// name and stores it in the request context for later interceptors (e.g. quota,
+// capabilities filter).
+//
+// Examples:
+//
+//	/rpc/BuildBuddyService/SearchInvocation -> /buildbuddy.service.BuildBuddyService/SearchInvocation
+//	/api/v1/Run -> /api.v1.ApiService/Run
+func parseProtoletRPCName(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, buildBuddyHTTPPrefix):
+			r = r.WithContext(context.WithValue(r.Context(), rpcNameContextKey, buildBuddyServicePrefix+strings.TrimPrefix(r.URL.Path, buildBuddyHTTPPrefix)))
+		case strings.HasPrefix(r.URL.Path, apiHTTPPrefix):
+			r = r.WithContext(context.WithValue(r.Context(), rpcNameContextKey, apiServicePrefix+strings.TrimPrefix(r.URL.Path, apiHTTPPrefix)))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func rpcNameFromContext(ctx context.Context) (string, bool) {
+	rpcName, ok := ctx.Value(rpcNameContextKey).(string)
+	return rpcName, ok
+}
+
 func AuthorizeSelectedGroupRole(env environment.Env, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		if err := capabilities_filter.AuthorizeRPC(ctx, env, r.URL.Path); err != nil {
+		rpcName, ok := rpcNameFromContext(ctx)
+		if !ok {
+			http.Error(w, "unsupported RPC path", http.StatusForbidden)
+			return
+		}
+		if err := capabilities_filter.AuthorizeRPC(ctx, env, rpcName); err != nil {
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
@@ -238,11 +330,13 @@ func AuthorizeSelectedGroupRole(env environment.Env, next http.Handler) http.Han
 
 func AuthorizeIP(env environment.Env, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if irs := env.GetIPRulesService(); irs != nil {
-			if err := irs.AuthorizeHTTPRequest(r.Context(), r); err != nil {
+		if irs := env.GetIPRulesEnforcer(); irs != nil {
+			newCtx, err := irs.AuthorizeHTTPRequest(r.Context(), r)
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
+			r = r.WithContext(newCtx)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -250,18 +344,25 @@ func AuthorizeIP(env environment.Env, next http.Handler) http.Handler {
 
 func ClientIP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerIP := r.RemoteAddr
+		if ip, _, err := net.SplitHostPort(peerIP); err == nil {
+			peerIP = ip
+		}
 		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			ctx, ok := clientip.SetFromXForwardedForHeader(r.Context(), v)
+			ctx, ok := clientip.SetFromXForwardedForHeader(r.Context(), v, peerIP)
 			if ok {
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 		}
-		clientIP := r.RemoteAddr
-		if ip, _, err := net.SplitHostPort(clientIP); err == nil {
-			clientIP = ip
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientip.ContextKey, clientIP)))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientip.ContextKey, peerIP)))
+	})
+}
+
+func ClientUserAgent(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := useragent.SetFromHeader(r.Context(), r.Header.Get(useragent.HTTPHeader))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -382,6 +483,9 @@ func routeLabel(r *http.Request) string {
 	if path == "" || path == "/" {
 		return "/"
 	}
+	if path == "/readyz" || path == "/healthz" || path == "/file/download" || path == "/file/view" {
+		return path
+	}
 	if strings.HasPrefix(path, "/image/") {
 		return "/image/[...]"
 	}
@@ -396,6 +500,23 @@ func routeLabel(r *http.Request) string {
 	}
 	if path == "/api/v1/metrics" {
 		return "/api/v1/metrics"
+	} else if strings.HasPrefix(path, "/api/v1/") {
+		return "/api/v1/[...]"
+	}
+	if path == "/mcp" {
+		return "/mcp"
+	}
+	// OCI registry
+	if strings.HasPrefix(path, "/v2/") {
+		if strings.Contains(path, "/blobs/") {
+			return "/v2/[...]/blobs/[...]"
+		} else if strings.Contains(path, "/manifests/") {
+			return "/v2/[...]/manifests/[...]"
+		} else if path == "/v2/" {
+			return "/v2/"
+		} else {
+			return "/v2/[...]"
+		}
 	}
 	return "[OTHER]"
 }
@@ -438,6 +559,7 @@ func WrapAuthenticatedExternalProtoletHandler(env environment.Env, httpPrefix st
 	return wrapHandler(env, handlers.RequestHandler, &[]wrapFn{
 		Gzip,
 		func(h http.Handler) http.Handler { return AuthorizeSelectedGroupRole(env, h) },
+		parseProtoletRPCName,
 		func(h http.Handler) http.Handler { return AuthorizeIP(env, h) },
 		func(h http.Handler) http.Handler { return Authenticate(env, h) },
 		// The request message is parsed before authentication since the request_context
@@ -447,6 +569,7 @@ func WrapAuthenticatedExternalProtoletHandler(env environment.Env, httpPrefix st
 		LogRequest,
 		RequestID,
 		ClientIP,
+		ClientUserAgent,
 		Subdomain,
 		region.CORS,
 		RecoverAndAlert,
@@ -494,4 +617,30 @@ func (f RedirectOnError) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Warning(err.Error())
 		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusTemporaryRedirect)
 	}
+}
+
+// captureStatusWriter is like http.ResponseWriter but captures any status code
+// written with WriteHeader.
+type captureStatusWriter struct {
+	http.ResponseWriter
+	Status int
+}
+
+func (rw *captureStatusWriter) WriteHeader(status int) {
+	rw.ResponseWriter.WriteHeader(status)
+	rw.Status = status
+}
+
+// DefaultRedirect invokes an HTTP handler and redirects to the given URL if the
+// handler function did not call WriteHeader to write a response.
+func DefaultRedirect(h http.Handler, url string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wrapper := &captureStatusWriter{ResponseWriter: w}
+		h.ServeHTTP(wrapper, r)
+		if wrapper.Status == 0 {
+			// Wrapped handler did not write a status code; perform the redirect
+			// to the provided url.
+			http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+		}
+	})
 }

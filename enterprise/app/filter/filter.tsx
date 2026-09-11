@@ -1,81 +1,81 @@
-import React from "react";
-import capabilities from "../../../app/capabilities/capabilities";
-import FilledButton, { OutlinedButton } from "../../../app/components/button/button";
-import Popup from "../../../app/components/popup/popup";
-import Slider from "../../../app/components/slider/slider";
 import {
-  Filter,
-  X,
+  CircleDot,
   Clock,
-  User,
-  Github,
+  Cloud,
+  Filter,
   GitBranch,
   GitCommit,
   HardDrive,
   LayoutGrid,
-  Wrench,
-  Tag,
   SortAsc,
   SortDesc,
-  Cloud,
   Sparkles,
+  Tag,
+  Target,
+  User,
+  Wrench,
+  X,
 } from "lucide-react";
+import React from "react";
+import capabilities from "../../../app/capabilities/capabilities";
+import FilledButton, { OutlinedButton } from "../../../app/components/button/button";
 import Checkbox from "../../../app/components/checkbox/checkbox";
+import TextInput from "../../../app/components/input/input";
+import Popup from "../../../app/components/popup/popup";
 import Radio from "../../../app/components/radio/radio";
+import Slider from "../../../app/components/slider/slider";
 import { compactDurationSec } from "../../../app/format/format";
+import { Github } from "../../../app/icons/github_lucide";
 import router from "../../../app/router/router";
 import {
-  DIMENSION_PARAM_NAME,
-  GENERIC_FILTER_PARAM_NAME,
-  ROLE_PARAM_NAME,
-  STATUS_PARAM_NAME,
-  USER_PARAM_NAME,
-  REPO_PARAM_NAME,
   BRANCH_PARAM_NAME,
-  COMMIT_PARAM_NAME,
-  HOST_PARAM_NAME,
   COMMAND_PARAM_NAME,
-  PATTERN_PARAM_NAME,
-  TAG_PARAM_NAME,
-  MINIMUM_DURATION_PARAM_NAME,
-  MAXIMUM_DURATION_PARAM_NAME,
-  SORT_BY_PARAM_NAME,
-  SORT_ORDER_PARAM_NAME,
+  COMMIT_PARAM_NAME,
   DEFAULT_SORT_BY_VALUE,
   DEFAULT_SORT_ORDER_VALUE,
+  DIMENSION_PARAM_NAME,
+  GENERIC_FILTER_PARAM_NAME,
+  HOST_PARAM_NAME,
+  MAXIMUM_DURATION_PARAM_NAME,
+  MINIMUM_DURATION_PARAM_NAME,
+  PATTERN_PARAM_NAME,
+  REPO_PARAM_NAME,
+  ROLE_PARAM_NAME,
+  SORT_BY_PARAM_NAME,
+  SORT_ORDER_PARAM_NAME,
+  STATUS_PARAM_NAME,
+  TAG_PARAM_NAME,
+  USER_PARAM_NAME,
 } from "../../../app/router/router_params";
 import { invocation_status } from "../../../proto/invocation_status_ts_proto";
 import { stat_filter } from "../../../proto/stat_filter_ts_proto";
+import DateRangePickerButton from "./date_range_picker_button";
 import {
-  parseRoleParam,
-  toRoleParam,
-  parseStatusParam,
-  toStatusParam,
-  statusToString,
-  isAnyNonDateFilterSet,
-  SortBy,
-  SortOrder,
-  DURATION_SLIDER_VALUES,
-  DURATION_SLIDER_MIN_INDEX,
-  DURATION_SLIDER_MIN_VALUE,
   DURATION_SLIDER_MAX_INDEX,
   DURATION_SLIDER_MAX_VALUE,
-  getFiltersFromDimensionParam,
+  DURATION_SLIDER_MIN_INDEX,
+  DURATION_SLIDER_MIN_VALUE,
+  DURATION_SLIDER_VALUES,
   getDimensionName,
+  getDimensionParamFromFilters,
+  getFiltersFromDimensionParam,
+  isAnyNonDateFilterSet,
+  parseRoleParam,
+  parseStatusParam,
+  SortBy,
+  SortOrder,
+  statusToString,
+  toRoleParam,
+  toStatusParam,
 } from "./filter_util";
-import TextInput from "../../../app/components/input/input";
-import DatePickerButton from "./date_picker_button";
 
 export interface FilterProps {
   search: URLSearchParams;
 }
 
 interface State {
-  isDatePickerOpen: boolean;
   isFilterMenuOpen: boolean;
   isSortMenuOpen: boolean;
-
-  isAdvancedFilterOpen: boolean;
 
   user?: string;
   repo?: string;
@@ -88,6 +88,7 @@ interface State {
   minimumDuration?: number;
   maximumDuration?: number;
 
+  dimensions?: string;
   genericFilterString?: string;
 
   sortBy?: SortBy;
@@ -103,29 +104,10 @@ export default class FilterComponent extends React.Component<FilterProps, State>
     }
   }
 
-  isAdvancedFilterOpen(search: URLSearchParams): boolean {
-    return Boolean(
-      search.get(USER_PARAM_NAME) ||
-        search.get(REPO_PARAM_NAME) ||
-        search.get(BRANCH_PARAM_NAME) ||
-        search.get(COMMIT_PARAM_NAME) ||
-        search.get(HOST_PARAM_NAME) ||
-        search.get(COMMAND_PARAM_NAME) ||
-        (capabilities.config.patternFilterEnabled && search.get(PATTERN_PARAM_NAME)) ||
-        search.get(GENERIC_FILTER_PARAM_NAME) ||
-        (capabilities.config.tagsUiEnabled && search.get(TAG_PARAM_NAME)) ||
-        search.get(MINIMUM_DURATION_PARAM_NAME) ||
-        search.get(MAXIMUM_DURATION_PARAM_NAME) ||
-        search.get(GENERIC_FILTER_PARAM_NAME)
-    );
-  }
-
   newFilterState(search: URLSearchParams): State {
     return {
-      isDatePickerOpen: false,
       isFilterMenuOpen: false,
       isSortMenuOpen: false,
-      isAdvancedFilterOpen: this.isAdvancedFilterOpen(search),
       user: search.get(USER_PARAM_NAME) || undefined,
       repo: search.get(REPO_PARAM_NAME) || undefined,
       branch: search.get(BRANCH_PARAM_NAME) || undefined,
@@ -138,13 +120,13 @@ export default class FilterComponent extends React.Component<FilterProps, State>
       maximumDuration: Number(search.get(MAXIMUM_DURATION_PARAM_NAME)) || undefined,
       sortBy: (search.get(SORT_BY_PARAM_NAME) as SortBy) || undefined,
       sortOrder: (search.get(SORT_ORDER_PARAM_NAME) as SortOrder) || undefined,
+      dimensions: search.get(DIMENSION_PARAM_NAME) || undefined,
       genericFilterString: search.get(GENERIC_FILTER_PARAM_NAME) || undefined,
     };
   }
 
   updateFilterState(search: URLSearchParams) {
     return {
-      isAdvancedFilterOpen: this.isAdvancedFilterOpen(search),
       user: search.get(USER_PARAM_NAME) || undefined,
       repo: search.get(REPO_PARAM_NAME) || undefined,
       branch: search.get(BRANCH_PARAM_NAME) || undefined,
@@ -157,6 +139,7 @@ export default class FilterComponent extends React.Component<FilterProps, State>
       maximumDuration: Number(search.get(MAXIMUM_DURATION_PARAM_NAME)) || undefined,
       sortBy: (search.get(SORT_BY_PARAM_NAME) as SortBy) || undefined,
       sortOrder: (search.get(SORT_ORDER_PARAM_NAME) as SortOrder) || undefined,
+      dimensions: search.get(DIMENSION_PARAM_NAME) || undefined,
       genericFilterString: search.get(GENERIC_FILTER_PARAM_NAME) || undefined,
     };
   }
@@ -270,6 +253,7 @@ export default class FilterComponent extends React.Component<FilterProps, State>
       [COMMAND_PARAM_NAME]: this.state.command || "",
       [PATTERN_PARAM_NAME]: this.state.pattern || "",
       [TAG_PARAM_NAME]: this.state.tag || "",
+      [DIMENSION_PARAM_NAME]: this.state.dimensions || "",
       [MINIMUM_DURATION_PARAM_NAME]: this.state.minimumDuration?.toString() || "",
       [MAXIMUM_DURATION_PARAM_NAME]: this.state.maximumDuration?.toString() || "",
       [GENERIC_FILTER_PARAM_NAME]: this.state.genericFilterString || "",
@@ -292,6 +276,47 @@ export default class FilterComponent extends React.Component<FilterProps, State>
         <span>{label}</span>
       </label>
     );
+  }
+
+  updateDimensionFilters(dimension: stat_filter.Dimension, value: string) {
+    const filters = getFiltersFromDimensionParam(this.props.search.get(DIMENSION_PARAM_NAME) ?? "")
+      .map((f) => {
+        if (f.dimension?.execution === dimension.execution && f.dimension?.invocation === dimension.invocation) {
+          if (!value) {
+            return undefined;
+          }
+          return new stat_filter.DimensionFilter({ dimension, value });
+        }
+        return f;
+      })
+      .filter((f) => f !== undefined);
+    this.setState({ dimensions: getDimensionParamFromFilters(filters) });
+  }
+
+  maybeRenderDimensionFilterInputs() {
+    const existingFilters = getFiltersFromDimensionParam(this.props.search.get(DIMENSION_PARAM_NAME) ?? "");
+    const pendingFilters = getFiltersFromDimensionParam(this.state.dimensions ?? "");
+    return existingFilters.map((f) => {
+      const dimension = f.dimension;
+      if (!dimension) {
+        return <></>;
+      }
+      const pendingFilter = pendingFilters.find(
+        (f) => f.dimension?.execution === dimension.execution && f.dimension?.invocation === dimension.invocation
+      );
+      return (
+        <>
+          <div className="option-group-title">{getDimensionName(dimension)}</div>
+          <div className="option-group-input">
+            <TextInput
+              placeholder={""}
+              value={pendingFilter?.value ?? ""}
+              onChange={(e) => this.updateDimensionFilters(dimension, e.target.value)}
+            />
+          </div>
+        </>
+      );
+    });
   }
 
   render() {
@@ -324,14 +349,14 @@ export default class FilterComponent extends React.Component<FilterProps, State>
       <div className={`global-filter ${isFiltering ? "is-filtering" : ""}`}>
         {(isFiltering || isSorting) && (
           <FilledButton className="square" title="Clear filters" onClick={this.onClickClearFiltersAndSort.bind(this)}>
-            <X className="icon white" />
+            <X className="white" />
           </FilledButton>
         )}
         <div className="popup-wrapper">
           <OutlinedButton
             className={`filter-menu-button icon-text-button ${isFiltering ? "" : "square"}`}
             onClick={this.onOpenFilterMenu.bind(this)}>
-            <Filter className="icon" />
+            <Filter />
             {selectedStatuses.has(invocation_status.OverallStatus.SUCCESS) && <span className="status-block success" />}
             {selectedStatuses.has(invocation_status.OverallStatus.FAILURE) && <span className="status-block failure" />}
             {selectedStatuses.has(invocation_status.OverallStatus.IN_PROGRESS) && (
@@ -405,10 +430,102 @@ export default class FilterComponent extends React.Component<FilterProps, State>
             )}
           </OutlinedButton>
           <Popup
+            anchor="center-right"
             isOpen={this.state.isFilterMenuOpen}
             onRequestClose={this.onCloseFilterMenu.bind(this)}
             className="filter-menu-popup">
-            <div className="option-groups-row">
+            <form className="option-groups-row">
+              <div className="option-group">
+                <div className="option-group-title">User</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. tylerw"}
+                    value={this.state.user}
+                    onChange={(e) => this.setState({ user: e.target.value })}
+                  />
+                </div>
+                <div className="option-group-title">Repo</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. github.com/buildbuddy-io/buildbuddy"}
+                    value={this.state.repo}
+                    onChange={(e) => this.setState({ repo: e.target.value })}
+                  />
+                </div>
+                <div className="option-group-title">Branch</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. main"}
+                    value={this.state.branch}
+                    onChange={(e) => this.setState({ branch: e.target.value })}
+                  />
+                </div>
+                <div className="option-group-title">Commit</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. 115a0cdbe816b8cb80089dd200247752fef723fe"}
+                    value={this.state.commit}
+                    onChange={(e) => this.setState({ commit: e.target.value })}
+                  />
+                </div>
+                <div className="option-group-title">Host</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. lunchbox"}
+                    value={this.state.host}
+                    onChange={(e) => this.setState({ host: e.target.value })}
+                  />
+                </div>
+                <div className="option-group-title">Command</div>
+                <div className="option-group-input">
+                  <TextInput
+                    placeholder={"e.g. test"}
+                    value={this.state.command}
+                    onChange={(e) => this.setState({ command: e.target.value })}
+                  />
+                </div>
+
+                {capabilities.config.patternFilterEnabled && (
+                  <>
+                    <div className="option-group-title">Pattern</div>
+                    <div className="option-group-input">
+                      <TextInput
+                        placeholder={"e.g. //foo/..."}
+                        value={this.state.pattern}
+                        onChange={(e) => this.setState({ pattern: e.target.value })}
+                      />
+                    </div>
+                  </>
+                )}
+                {capabilities.config.tagsUiEnabled && (
+                  <>
+                    <div className="option-group-title">Tag</div>
+                    <div className="option-group-input">
+                      <TextInput
+                        placeholder={"e.g. coverage-build"}
+                        value={this.state.tag}
+                        onChange={(e) => this.setState({ tag: e.target.value })}
+                      />
+                    </div>
+                  </>
+                )}
+                {this.maybeRenderDimensionFilterInputs()}
+                {genericFilterString && (
+                  <>
+                    <div className="option-group-title">Advanced</div>
+                    <div className="option-group-input">
+                      <TextInput
+                        placeholder={"e.g., branch:main -command:test"}
+                        value={this.state.genericFilterString}
+                        onChange={(e) => this.setState({ genericFilterString: e.target.value })}
+                      />
+                    </div>
+                  </>
+                )}
+                <div className="option-group-input">
+                  <FilledButton onClick={this.handleFilterApplyClicked.bind(this)}>Apply</FilledButton>
+                </div>
+              </div>
               <div className="option-group">
                 <div className="option-group-title">Role</div>
                 <div className="option-group-options">
@@ -417,9 +534,7 @@ export default class FilterComponent extends React.Component<FilterProps, State>
                   {this.renderRoleCheckbox("Workflow", "CI_RUNNER", selectedRoles)}
                   {this.renderRoleCheckbox("Remote Bazel", "HOSTED_BAZEL", selectedRoles)}
                 </div>
-              </div>
-              <div className="option-group">
-                <div className="option-group-title">Status</div>
+                <div className="option-group-section-title">Status</div>
                 <div className="option-group-options">
                   {this.renderStatusCheckbox("Succeeded", invocation_status.OverallStatus.SUCCESS, selectedStatuses)}
                   {this.renderStatusCheckbox("Failed", invocation_status.OverallStatus.FAILURE, selectedStatuses)}
@@ -434,142 +549,43 @@ export default class FilterComponent extends React.Component<FilterProps, State>
                     selectedStatuses
                   )}
                 </div>
-              </div>
-            </div>
-            <div
-              className="filter-menu-advanced-filter-toggle"
-              onClick={() => this.setState({ isAdvancedFilterOpen: !this.state.isAdvancedFilterOpen })}>
-              {this.state.isAdvancedFilterOpen ? "Hide advanced filters" : "Show advanced filters"}
-            </div>
-            {this.state.isAdvancedFilterOpen && (
-              <form className="option-groups-row">
-                <div className="option-group">
-                  <div className="option-group-title">User</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. tylerw"}
-                      value={this.state.user}
-                      onChange={(e) => this.setState({ user: e.target.value })}
-                    />
-                  </div>
-                  <div className="option-group-title">Repo</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. github.com/buildbuddy-io/buildbuddy"}
-                      value={this.state.repo}
-                      onChange={(e) => this.setState({ repo: e.target.value })}
-                    />
-                  </div>
-                  <div className="option-group-title">Branch</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. main"}
-                      value={this.state.branch}
-                      onChange={(e) => this.setState({ branch: e.target.value })}
-                    />
-                  </div>
-                  <div className="option-group-title">Commit</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. 115a0cdbe816b8cb80089dd200247752fef723fe"}
-                      value={this.state.commit}
-                      onChange={(e) => this.setState({ commit: e.target.value })}
-                    />
-                  </div>
-                  <div className="option-group-title">Host</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. lunchbox"}
-                      value={this.state.host}
-                      onChange={(e) => this.setState({ host: e.target.value })}
-                    />
-                  </div>
-                  <div className="option-group-title">Command</div>
-                  <div className="option-group-input">
-                    <TextInput
-                      placeholder={"e.g. test"}
-                      value={this.state.command}
-                      onChange={(e) => this.setState({ command: e.target.value })}
-                    />
-                  </div>
-
-                  {capabilities.config.patternFilterEnabled && (
-                    <>
-                      <div className="option-group-title">Pattern</div>
-                      <div className="option-group-input">
-                        <TextInput
-                          placeholder={"e.g. //foo/..."}
-                          value={this.state.pattern}
-                          onChange={(e) => this.setState({ pattern: e.target.value })}
-                        />
-                      </div>
-                    </>
-                  )}
-                  {capabilities.config.tagsUiEnabled && (
-                    <>
-                      <div className="option-group-title">Tag</div>
-                      <div className="option-group-input">
-                        <TextInput
-                          placeholder={"e.g. coverage-build"}
-                          value={this.state.tag}
-                          onChange={(e) => this.setState({ tag: e.target.value })}
-                        />
-                      </div>
-                    </>
-                  )}
-                  <div className="option-group-title">Duration</div>
-                  <div className="option-group-input">
-                    <Slider
-                      value={[
-                        DURATION_SLIDER_VALUES.indexOf(this.state.minimumDuration || DURATION_SLIDER_MIN_VALUE),
-                        DURATION_SLIDER_VALUES.indexOf(this.state.maximumDuration || DURATION_SLIDER_MAX_VALUE),
-                      ]}
-                      renderThumb={(props, state) => (
-                        <div {...props}>
-                          <div className="slider-thumb-circle"></div>
-                          <div className="slider-thumb-value">
-                            {compactDurationSec(DURATION_SLIDER_VALUES[state.valueNow])}
-                          </div>
+                <div className="option-group-section-title">Duration</div>
+                <div className="option-group-input">
+                  <Slider
+                    value={[
+                      DURATION_SLIDER_VALUES.indexOf(this.state.minimumDuration || DURATION_SLIDER_MIN_VALUE),
+                      DURATION_SLIDER_VALUES.indexOf(this.state.maximumDuration || DURATION_SLIDER_MAX_VALUE),
+                    ]}
+                    renderThumb={(props, state) => (
+                      <div {...props}>
+                        <div className="slider-thumb-circle"></div>
+                        <div className="slider-thumb-value">
+                          {compactDurationSec(DURATION_SLIDER_VALUES[state.valueNow])}
                         </div>
-                      )}
-                      min={DURATION_SLIDER_MIN_INDEX}
-                      max={DURATION_SLIDER_MAX_INDEX}
-                      pearling
-                      minDistance={1}
-                      onChange={(e) =>
-                        this.setState({
-                          minimumDuration: DURATION_SLIDER_VALUES[e[0]],
-                          maximumDuration: DURATION_SLIDER_VALUES[e[1]],
-                        })
-                      }
-                    />
-                  </div>
-                  {genericFilterString && (
-                    <>
-                      <div className="option-group-title">Advanced</div>
-                      <div className="option-group-input">
-                        <TextInput
-                          placeholder={"e.g., branch:main -command:test"}
-                          value={this.state.genericFilterString}
-                          onChange={(e) => this.setState({ genericFilterString: e.target.value })}
-                        />
                       </div>
-                    </>
-                  )}
-                  <div className="option-group-input">
-                    <FilledButton onClick={this.handleFilterApplyClicked.bind(this)}>Apply</FilledButton>
-                  </div>
+                    )}
+                    min={DURATION_SLIDER_MIN_INDEX}
+                    max={DURATION_SLIDER_MAX_INDEX}
+                    pearling
+                    minDistance={1}
+                    onChange={(e) =>
+                      this.setState({
+                        minimumDuration: DURATION_SLIDER_VALUES[e[0]],
+                        maximumDuration: DURATION_SLIDER_VALUES[e[1]],
+                      })
+                    }
+                  />
                 </div>
-              </form>
-            )}
+              </div>
+            </form>
           </Popup>
         </div>
         <div className="popup-wrapper">
           <OutlinedButton
             className={`sort-button icon-text-button ${sortByValue !== DEFAULT_SORT_BY_VALUE ? "" : "square"}`}
             onClick={this.onOpenSortMenu.bind(this)}>
-            {sortOrderValue === "asc" && <SortAsc className="icon" />}
-            {sortOrderValue === "desc" && <SortDesc className="icon" />}
+            {sortOrderValue === "asc" && <SortAsc />}
+            {sortOrderValue === "desc" && <SortDesc />}
             {sortByValue !== DEFAULT_SORT_BY_VALUE && (
               <span>
                 {sortByValue === "start-time" && "Start time"}
@@ -610,7 +626,7 @@ export default class FilterComponent extends React.Component<FilterProps, State>
             </div>
           </Popup>
         </div>
-        <DatePickerButton search={this.props.search}></DatePickerButton>
+        <DateRangePickerButton search={this.props.search} />
       </div>
     );
   }
@@ -621,6 +637,10 @@ function getDimensionIcon(f: stat_filter.Dimension) {
     switch (f.execution) {
       case stat_filter.ExecutionDimensionType.WORKER_EXECUTION_DIMENSION:
         return <Cloud />;
+      case stat_filter.ExecutionDimensionType.TARGET_LABEL_EXECUTION_DIMENSION:
+        return <Target />;
+      case stat_filter.ExecutionDimensionType.ACTION_MNEMONIC_EXECUTION_DIMENSION:
+        return <CircleDot />;
     }
   } else if (f.invocation) {
     switch (f.invocation) {

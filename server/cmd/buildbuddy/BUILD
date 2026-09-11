@@ -1,6 +1,7 @@
 load("@io_bazel_rules_docker//container:container.bzl", "container_image")
 load("@io_bazel_rules_docker//go:image.bzl", "go_image")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("//rules:utils.bzl", "runfiles_directory")
 
 # Use the go_binary rule to create an executable from our main file. Depend on
 # the static_content we created above so they are included.
@@ -28,9 +29,19 @@ go_binary(
 
 container_image(
     name = "base_image",
-    base = "@buildbuddy_go_image_base//image",
+    architecture = select({
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
+    # Base layers (libc, dynamic linker, etc.) are architecture-specific, so the
+    # base image must match the target architecture. Setting `architecture`
+    # above only stamps the image config metadata; it does not swap these layers.
+    base = select({
+        "@platforms//cpu:arm64": "@buildbuddy_go_image_base_arm64//image",
+        "//conditions:default": "@buildbuddy_go_image_base//image",
+    }),
     symlinks = {
-        "config.yaml": "app/server/cmd/buildbuddy/buildbuddy.runfiles/buildbuddy/config/buildbuddy.release.yaml",
+        "config.yaml": "app/server/cmd/buildbuddy/buildbuddy.runfiles/%s/config/buildbuddy.release.yaml" % runfiles_directory(),
         "buildbuddy": "tmp",
     },
     tags = [
@@ -53,6 +64,10 @@ go_image(
 
 container_image(
     name = "buildbuddy_image",
+    architecture = select({
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
     base = ":buildbuddy_go_image",
     tags = ["manual"],
     visibility = ["//visibility:public"],
@@ -68,9 +83,12 @@ go_library(
         "//server/config",
         "//server/janitor",
         "//server/libmain",
+        "//server/remote_cache/capabilities_server",
         "//server/telemetry",
+        "//server/util/grpc_server",
         "//server/util/healthcheck",
         "//server/util/log",
         "//server/version",
+        "@org_golang_google_grpc//xds",
     ],
 )

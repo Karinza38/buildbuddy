@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,13 +16,21 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testolapdb"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testusage"
+	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/protofile"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	bspb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	bepb "github.com/buildbuddy-io/buildbuddy/proto/build_events"
@@ -80,11 +89,12 @@ func (s *besSequence) NextRequest(event *bspb.BuildEvent) *pepb.PublishBuildTool
 }
 
 type FakeGitHubStatusService struct {
-	Clients []*FakeGitHubStatusClient
+	Clients                []*FakeGitHubStatusClient
+	StatusReportingEnabled bool
 }
 
-func (s *FakeGitHubStatusService) GetStatusClient(accessToken string) interfaces.GitHubStatusClient {
-	client := &FakeGitHubStatusClient{AccessToken: accessToken}
+func (s *FakeGitHubStatusService) GetStatusClient() interfaces.GitHubStatusClient {
+	client := &FakeGitHubStatusClient{StatusReportingEnabled: s.StatusReportingEnabled}
 	s.Clients = append(s.Clients, client)
 	return client
 }
@@ -94,9 +104,22 @@ func (s *FakeGitHubStatusService) GetCreatedClient(t *testing.T) *FakeGitHubStat
 	return s.Clients[0]
 }
 
+func (c *FakeGitHubStatusService) HasNoStatuses() bool {
+	if len(c.Clients) == 0 {
+		return true
+	}
+	for _, c := range c.Clients {
+		if len(c.Statuses) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 type FakeGitHubStatusClient struct {
-	AccessToken string
-	Statuses    []*FakeGitHubStatus
+	AccessToken            string
+	Statuses               []*FakeGitHubStatus
+	StatusReportingEnabled bool
 }
 
 type FakeGitHubStatus struct {
@@ -105,7 +128,7 @@ type FakeGitHubStatus struct {
 	RepoStatus *github.GithubStatusPayload
 }
 
-func (c *FakeGitHubStatusClient) CreateStatus(ctx context.Context, ownerRepo, commitSHA string, p *github.GithubStatusPayload) error {
+func (c *FakeGitHubStatusClient) CreateStatus(ctx context.Context, groupID, ownerRepo, commitSHA string, p *github.GithubStatusPayload) error {
 	s := &FakeGitHubStatus{
 		OwnerRepo:  ownerRepo,
 		CommitSHA:  commitSHA,
@@ -113,6 +136,10 @@ func (c *FakeGitHubStatusClient) CreateStatus(ctx context.Context, ownerRepo, co
 	}
 	c.Statuses = append(c.Statuses, s)
 	return nil
+}
+
+func (c *FakeGitHubStatusClient) IsStatusReportingEnabled(ctx context.Context, groupID, repoURL string) (bool, error) {
+	return c.StatusReportingEnabled, nil
 }
 
 func (c *FakeGitHubStatusClient) ConsumeStatuses() []*FakeGitHubStatus {
@@ -253,6 +280,21 @@ func finishedEvent() *anypb.Any {
 	return finishedAny
 }
 
+func gitFetchCompletedEvent(totalBytes int64, duration time.Duration, retryCount int64) *anypb.Any {
+	gitFetchAny := &anypb.Any{}
+	gitFetchAny.MarshalFrom(&bspb.BuildEvent{
+		Payload: &bspb.BuildEvent_GitFetchCompleted{
+			GitFetchCompleted: &bspb.GitFetchCompleted{
+				TotalBytes: totalBytes,
+				Duration:   durationpb.New(duration),
+				RetryCount: retryCount,
+			},
+		},
+		Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_GitFetchCompleted{}},
+	})
+	return gitFetchAny
+}
+
 func assertAPIKeyRedacted(t *testing.T, invocation *inpb.Invocation, apiKey string) {
 	txt, err := prototext.Marshal(invocation)
 	require.NoError(t, err)
@@ -260,21 +302,9 @@ func assertAPIKeyRedacted(t *testing.T, invocation *inpb.Invocation, apiKey stri
 	assert.NotContains(t, string(txt), "x-buildbuddy-api-key", "All remote headers should be redacted")
 }
 
-type FakeUsageTracker struct {
-	invocations int64
-}
-
-func (t *FakeUsageTracker) Increment(ctx context.Context, labels *tables.UsageLabels, usage *tables.UsageCounts) error {
-	t.invocations += usage.Invocations
-	return nil
-}
-
-func (t *FakeUsageTracker) StartDBFlush() {}
-func (t *FakeUsageTracker) StopDBFlush()  {}
-
 func TestUnauthenticatedHandleEventWithStartedFirst(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -282,7 +312,9 @@ func TestUnauthenticatedHandleEventWithStartedFirst(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send unauthenticated started event without an api key
 	request := streamRequest(startedEvent("--remote_upload_local_results"), testInvocationID, 1)
@@ -300,7 +332,7 @@ func TestAuthenticatedHandleEventWithStartedFirst(t *testing.T) {
 	testUsers := testauth.TestUsers("USER1", "GROUP1")
 	// Map "APIKEY1" to User1.
 	testUsers["APIKEY1"] = testUsers["USER1"]
-	auth := testauth.NewTestAuthenticator(testUsers)
+	auth := testauth.NewTestAuthenticator(t, testUsers)
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -308,10 +340,12 @@ func TestAuthenticatedHandleEventWithStartedFirst(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send authenticated started event with api key
-	request := streamRequest(startedEvent("--remote_upload_local_results --remote_header='"+testauth.APIKeyHeader+"=APIKEY1' --remote_instance_name=foo --should_be_redacted=APIKEY1", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_upload_local_results --remote_header='"+authutil.APIKeyHeader+"=APIKEY1' --remote_instance_name=foo --should_be_redacted=APIKEY1", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -340,7 +374,7 @@ func TestAuthenticatedHandleEventWithOptionlessStartedEvent(t *testing.T) {
 	testUsers := testauth.TestUsers("USER1", "GROUP1")
 	// Map "APIKEY1" to User1.
 	testUsers["APIKEY1"] = testUsers["USER1"]
-	auth := testauth.NewTestAuthenticator(testUsers)
+	auth := testauth.NewTestAuthenticator(t, testUsers)
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -348,13 +382,15 @@ func TestAuthenticatedHandleEventWithOptionlessStartedEvent(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	request := streamRequest(startedEvent("", &bspb.BuildEventId_WorkspaceStatus{}, &bspb.BuildEventId_OptionsParsed{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
-	request = streamRequest(optionsParsedEvent("--remote_upload_local_results --remote_header='"+testauth.APIKeyHeader+"=APIKEY1' --remote_instance_name=foo --should_be_redacted=APIKEY1"), testInvocationID, 2)
+	request = streamRequest(optionsParsedEvent("--remote_upload_local_results --remote_header='"+authutil.APIKeyHeader+"=APIKEY1' --remote_instance_name=foo --should_be_redacted=APIKEY1"), testInvocationID, 2)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -382,7 +418,7 @@ func TestAuthenticatedHandleEventWithRedactedStartedEvent(t *testing.T) {
 	testUsers := testauth.TestUsers("USER1", "GROUP1")
 	// Map "APIKEY1" to User1.
 	testUsers["APIKEY1"] = testUsers["USER1"]
-	auth := testauth.NewTestAuthenticator(testUsers)
+	auth := testauth.NewTestAuthenticator(t, testUsers)
 	te.SetAuthenticator(auth)
 	ctx := testauth.WithAuthenticatedUserInfo(context.Background(), testUsers["USER1"])
 	testUUID, err := uuid.NewRandom()
@@ -390,13 +426,15 @@ func TestAuthenticatedHandleEventWithRedactedStartedEvent(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	request := streamRequest(startedEvent("", &bspb.BuildEventId_WorkspaceStatus{}, &bspb.BuildEventId_OptionsParsed{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
-	request = streamRequest(optionsParsedEvent("--remote_upload_local_results --remote_header='"+testauth.APIKeyHeader+"=' --remote_instance_name=foo"), testInvocationID, 2)
+	request = streamRequest(optionsParsedEvent("--remote_upload_local_results --remote_header='"+authutil.APIKeyHeader+"=' --remote_instance_name=foo"), testInvocationID, 2)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -424,7 +462,7 @@ func TestAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 	testUsers := testauth.TestUsers("USER1", "GROUP1")
 	// Map "APIKEY1" to User1.
 	testUsers["APIKEY1"] = testUsers["USER1"]
-	auth := testauth.NewTestAuthenticator(testUsers)
+	auth := testauth.NewTestAuthenticator(t, testUsers)
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -432,7 +470,9 @@ func TestAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send progress event
 	request := streamRequest(progressEvent(), testInvocationID, 1)
@@ -444,7 +484,7 @@ func TestAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 	assert.Error(t, err)
 
 	// Send started event with api key
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=APIKEY1' --should_be_redacted=APIKEY1", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 2)
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=APIKEY1' --should_be_redacted=APIKEY1", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 2)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -470,7 +510,7 @@ func TestAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 
 func TestUnAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -478,7 +518,9 @@ func TestUnAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send progress event
 	request := streamRequest(progressEvent(), testInvocationID, 1)
@@ -502,7 +544,7 @@ func TestUnAuthenticatedHandleEventWithProgressFirst(t *testing.T) {
 
 func TestHandleEventOver100ProgressEventsBeforeStarted(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -510,7 +552,9 @@ func TestHandleEventOver100ProgressEventsBeforeStarted(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send 104 progress events
 	for i := 1; i < 105; i++ {
@@ -524,7 +568,7 @@ func TestHandleEventOver100ProgressEventsBeforeStarted(t *testing.T) {
 	assert.Error(t, err)
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), testInvocationID, 105)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'"), testInvocationID, 105)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -536,7 +580,7 @@ func TestHandleEventOver100ProgressEventsBeforeStarted(t *testing.T) {
 
 func TestHandleEventWithWorkspaceStatusBeforeStarted(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -544,7 +588,9 @@ func TestHandleEventWithWorkspaceStatusBeforeStarted(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send progress event
 	request := streamRequest(progressEvent(), testInvocationID, 1)
@@ -561,7 +607,7 @@ func TestHandleEventWithWorkspaceStatusBeforeStarted(t *testing.T) {
 	assert.Error(t, err)
 
 	// Send started event with api key
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 3)
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 3)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -590,7 +636,7 @@ func TestHandleEventWithWorkspaceStatusBeforeStarted(t *testing.T) {
 
 func TestHandleEventWithEnvAndMetadataRedaction(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -598,7 +644,9 @@ func TestHandleEventWithEnvAndMetadataRedaction(t *testing.T) {
 
 	testInvocationID := testUUID.String()
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send unauthenticated started event without an api key
 	request := streamRequest(startedEvent(
@@ -650,11 +698,102 @@ func TestHandleEventWithEnvAndMetadataRedaction(t *testing.T) {
 	assert.Contains(t, string(txt), "--client_env=FOO_SECRET=<REDACTED>", "Values of non-allowed env vars should be redacted")
 }
 
+func TestHandleEventRedactsMultilineEnvVar(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	ctx := context.Background()
+	testUUID, err := uuid.NewRandom()
+	assert.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	request := streamRequest(startedEvent("", &bspb.BuildEventId_OptionsParsed{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	const multiLineValue = `this value has spaces
+and multiple
+lines,
+oddly.
+it even has a
+-----BEGIN OPENSSH PRIVATE KEY-----
+PRIVATEKEYDATA
+-----END OPENSSH PRIVATE KEY-----`
+	flagValue := "--action_env=MULTILINE_VAR=" + multiLineValue
+	optionsParsed := &bspb.OptionsParsed{
+		CmdLine: []string{
+			"bazel",
+			"build",
+			flagValue,
+		},
+		ExplicitCmdLine: []string{
+			"bazel",
+			"build",
+			flagValue,
+		},
+	}
+	optionsParsedAny := &anypb.Any{}
+	err = optionsParsedAny.MarshalFrom(&bspb.BuildEvent{
+		Payload: &bspb.BuildEvent_OptionsParsed{OptionsParsed: optionsParsed},
+		Id:      &bspb.BuildEventId{Id: &bspb.BuildEventId_OptionsParsed{}},
+	})
+	require.NoError(t, err)
+
+	request = &pepb.PublishBuildToolEventStreamRequest{
+		OrderedBuildEvent: &pepb.OrderedBuildEvent{
+			StreamId:       &bepb.StreamId{InvocationId: testInvocationID},
+			SequenceNumber: 2,
+			Event: &bepb.BuildEvent{
+				Event: &bepb.BuildEvent_BazelEvent{BazelEvent: optionsParsedAny},
+			},
+		},
+	}
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	err = channel.FinalizeInvocation(testInvocationID)
+	assert.NoError(t, err)
+
+	invocation, err := build_event_handler.LookupInvocation(te, ctx, testInvocationID)
+	assert.NoError(t, err)
+
+	const expected = "--action_env=MULTILINE_VAR=<REDACTED>"
+	var actual *bspb.OptionsParsed
+	for _, event := range invocation.Event {
+		if optionsParsed := event.GetBuildEvent().GetOptionsParsed(); optionsParsed != nil {
+			actual = optionsParsed
+			break
+		}
+	}
+	require.NotNil(t, actual, "expected an OptionsParsed event in invocation")
+
+	require.Len(t, actual.CmdLine, 3)
+	require.Len(t, actual.ExplicitCmdLine, 3)
+
+	expectedOptions := &bspb.OptionsParsed{
+		CmdLine: []string{"bazel", "build", expected},
+		ExplicitCmdLine: []string{
+			"bazel",
+			"build",
+			expected,
+		},
+	}
+	require.Empty(t, cmp.Diff(expectedOptions, actual, protocmp.Transform()))
+
+	txt, err := prototext.Marshal(invocation)
+	require.NoError(t, err)
+	assert.NotContains(t, string(txt), "OPENSSH PRIVATE KEY")
+	assert.Contains(t, string(txt), expected)
+}
+
 func TestHandleEventWithUsageTracking(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	ut := &FakeUsageTracker{}
+	ut := testusage.NewTracker()
 	te.SetUsageTracker(ut)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -662,27 +801,64 @@ func TestHandleEventWithUsageTracking(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1' --should_be_redacted=USER1"), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1' --should_be_redacted=USER1"), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
-	assert.Equal(t, int64(1), ut.invocations)
+	assert.ElementsMatch(t, []testusage.Total{
+		{
+			GroupID: "GROUP1",
+			Labels:  tables.UsageLabels{},
+			Counts: tables.UsageCounts{
+				Invocations: 1,
+			},
+		},
+	}, ut.Totals())
+	assert.ElementsMatch(t, []testusage.OLAPTotal{
+		{
+			GroupID: "GROUP1",
+			Labels:  sku.Labels{},
+			Counts: map[sku.SKU]int64{
+				sku.BuildEventsBESCount: 1,
+			},
+		},
+	}, ut.OLAPTotals())
 
 	// Send another started event for good measure; we should still only count 1
 	// invocation since it's the same stream.
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1' --should_be_redacted=USER1"), testInvocationID, 2)
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1' --should_be_redacted=USER1"), testInvocationID, 2)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
-	assert.Equal(t, int64(1), ut.invocations)
+	// Totals should remain the same (1 invocation total)
+	assert.ElementsMatch(t, []testusage.Total{
+		{
+			GroupID: "GROUP1",
+			Labels:  tables.UsageLabels{},
+			Counts: tables.UsageCounts{
+				Invocations: 1,
+			},
+		},
+	}, ut.Totals())
+	assert.ElementsMatch(t, []testusage.OLAPTotal{
+		{
+			GroupID: "GROUP1",
+			Labels:  sku.Labels{},
+			Counts: map[sku.SKU]int64{
+				sku.BuildEventsBESCount: 1,
+			},
+		},
+	}, ut.OLAPTotals())
 }
 
 func TestFinishedFinalizeWithCanceledContext(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx, cancel := context.WithCancel(context.Background())
 	testUUID, err := uuid.NewRandom()
@@ -690,10 +866,12 @@ func TestFinishedFinalizeWithCanceledContext(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -730,7 +908,7 @@ func TestFinishedFinalizeWithCanceledContext(t *testing.T) {
 
 func TestFinishedFinalize(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx, cancel := context.WithCancel(context.Background())
 	testUUID, err := uuid.NewRandom()
@@ -738,10 +916,12 @@ func TestFinishedFinalize(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -774,9 +954,61 @@ func TestFinishedFinalize(t *testing.T) {
 	assert.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, invocation.InvocationStatus)
 }
 
+func TestGitFetchStatsFlushedToOLAPDB(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	olapDB := testolapdb.NewHandle()
+	te.SetOLAPDBHandle(olapDB)
+	ctx := context.Background()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send a started event announcing a workspace status event.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	// Send the workspace status event to complete the metadata.
+	request = streamRequest(workspaceStatusEvent("COMMIT_SHA", "abc123"), testInvocationID, 2)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	// Send a GitFetchCompleted event reporting git fetch stats, as published
+	// by the remote runner after setting up the git repo.
+	request = streamRequest(gitFetchCompletedEvent(9_000_000, 3*time.Second, 2), testInvocationID, 3)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	// Complete and finalize the invocation, which triggers the flush to the
+	// OLAP DB.
+	request = streamRequest(finishedEvent(), testInvocationID, 4)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+	err = channel.FinalizeInvocation(testInvocationID)
+	require.NoError(t, err)
+
+	// The stats recorder flushes asynchronously; wait for the invocation to
+	// show up in the OLAP DB and expect the git fetch stats to be set on it.
+	var inv *tables.Invocation
+	require.Eventually(t, func() bool {
+		inv = olapDB.GetFlushedInvocation(testInvocationID)
+		return inv != nil
+	}, 30*time.Second, 50*time.Millisecond)
+	assert.Equal(t, int64(9_000_000), inv.GitFetchTotalBytes)
+	assert.Equal(t, (3 * time.Second).Microseconds(), inv.GitFetchDurationUsec)
+	assert.Equal(t, int64(2), inv.GitFetchRetryCount)
+}
+
 func TestUnfinishedFinalizeWithCanceledContext(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx, cancel := context.WithCancel(context.Background())
 	testUUID, err := uuid.NewRandom()
@@ -784,10 +1016,12 @@ func TestUnfinishedFinalizeWithCanceledContext(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -817,9 +1051,103 @@ func TestUnfinishedFinalizeWithCanceledContext(t *testing.T) {
 	assert.Equal(t, inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
 }
 
+// failingBlobstore wraps a Blobstore and fails all blob writes when
+// failWrites is set.
+type failingBlobstore struct {
+	interfaces.Blobstore
+	failWrites atomic.Bool
+}
+
+func (b *failingBlobstore) WriteBlob(ctx context.Context, blobName string, data []byte) (int, error) {
+	if b.failWrites.Load() {
+		return 0, fmt.Errorf("blobstore write failed")
+	}
+	return b.Blobstore.WriteBlob(ctx, blobName, data)
+}
+
+func TestUnfinishedFinalizeWithBlobstoreWriteFailure(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	bs := &failingBlobstore{Blobstore: te.GetBlobstore()}
+	te.SetBlobstore(bs)
+	ctx := t.Context()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key. The event is buffered in the
+	// invocation event stream and not yet flushed to blobstore.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make blobstore writes fail, then finalize the invocation without a
+	// finished event, as happens when the client disconnects. Flushing the
+	// buffered events fails, but there is no connected client left to receive
+	// an error and retry, so finalization should proceed anyway.
+	bs.failWrites.Store(true)
+	err = channel.FinalizeInvocation(testInvocationID)
+	require.NoError(t, err)
+
+	// Make sure the invocation was marked disconnected in the DB so that
+	// bazel may retry it.
+	authCtx := auth.AuthContextFromAPIKey(t.Context(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS), ti.InvocationStatus)
+}
+
+func TestFinishedFinalizeWithBlobstoreWriteFailure(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	bs := &failingBlobstore{Blobstore: te.GetBlobstore()}
+	te.SetBlobstore(bs)
+	ctx := t.Context()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key. The event is buffered in the
+	// invocation event stream and not yet flushed to blobstore.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event, so that the invocation finalizes as complete
+	// rather than disconnected.
+	request = streamRequest(finishedEvent(), testInvocationID, 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make blobstore writes fail, then finalize the invocation. The client is
+	// still connected, so the error from flushing the buffered events should
+	// be returned, which lets the client retry sending the events.
+	bs.failWrites.Store(true)
+	err = channel.FinalizeInvocation(testInvocationID)
+	require.Error(t, err)
+
+	// Make sure the invocation was not finalized in the DB.
+	authCtx := auth.AuthContextFromAPIKey(t.Context(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS), ti.InvocationStatus)
+}
+
 func TestUnfinishedFinalize(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx, cancel := context.WithCancel(context.Background())
 	testUUID, err := uuid.NewRandom()
@@ -827,10 +1155,12 @@ func TestUnfinishedFinalize(t *testing.T) {
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -858,9 +1188,65 @@ func TestUnfinishedFinalize(t *testing.T) {
 	assert.Equal(t, inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
 }
 
+func TestPeriodicInvocationRowUpdateWhileStreaming(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	clock := clockwork.NewFakeClock()
+	te.SetClock(clock)
+	ctx := context.Background()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	// Make DB writes stamp a fixed time so that we can tell when the
+	// invocation row gets written.
+	t0 := time.Unix(1000, 0)
+	te.GetInvocationDB().SetNowFunc(func() time.Time { return t0 })
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key, which creates the invocation row.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	authCtx := auth.AuthContextFromAPIKey(context.Background(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	require.Equal(t, t0.UnixMicro(), ti.UpdatedAtUsec)
+
+	// Advance the DB clock. An event that arrives before the periodic update
+	// period has elapsed should not update the invocation row.
+	t1 := time.Unix(2000, 0)
+	te.GetInvocationDB().SetNowFunc(func() time.Time { return t1 })
+	request = streamRequest(progressEventWithOutput("hello", ""), testInvocationID, 2)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	ti, err = te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, t0.UnixMicro(), ti.UpdatedAtUsec)
+
+	// Advance the stream's clock past half the reconnect window. The next
+	// event should update the invocation row, keeping the invocation
+	// retryable in case it gets disconnected later.
+	clock.Advance(te.GetInvocationDB().GetInvocationReconnectWindow()/2 + time.Second)
+	request = streamRequest(progressEventWithOutput("world", ""), testInvocationID, 3)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	ti, err = te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, t1.UnixMicro(), ti.UpdatedAtUsec)
+}
+
 func TestRetryOnComplete(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -870,10 +1256,12 @@ func TestRetryOnComplete(t *testing.T) {
 	flags.Set(t, "storage.chunk_file_size_bytes", chunkSize)
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -917,8 +1305,10 @@ func TestRetryOnComplete(t *testing.T) {
 	assert.True(t, exists)
 
 	// Attempt to start a new invocation with the same id
-	channel = handler.OpenChannel(ctx, testInvocationID)
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'"), testInvocationID, 1)
+	channel, err = handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'"), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -934,7 +1324,7 @@ func TestRetryOnComplete(t *testing.T) {
 
 func TestRetryOnDisconnect(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -944,10 +1334,12 @@ func TestRetryOnDisconnect(t *testing.T) {
 	flags.Set(t, "storage.chunk_file_size_bytes", chunkSize)
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -986,8 +1378,10 @@ func TestRetryOnDisconnect(t *testing.T) {
 	assert.True(t, exists)
 
 	// Attempt to start a new invocation with the same id
-	channel = handler.OpenChannel(ctx, testInvocationID)
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	channel, err = handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1041,7 +1435,7 @@ func TestRetryOnDisconnect(t *testing.T) {
 
 func TestRetryTwiceOnDisconnect(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -1051,10 +1445,12 @@ func TestRetryTwiceOnDisconnect(t *testing.T) {
 	flags.Set(t, "storage.chunk_file_size_bytes", chunkSize)
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1093,8 +1489,10 @@ func TestRetryTwiceOnDisconnect(t *testing.T) {
 	assert.True(t, exists)
 
 	// Attempt to start a new invocation with the same id
-	channel = handler.OpenChannel(ctx, testInvocationID)
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	channel, err = handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1143,8 +1541,10 @@ func TestRetryTwiceOnDisconnect(t *testing.T) {
 	assert.True(t, exists)
 
 	// Attempt to start a new invocation with the same id
-	channel = handler.OpenChannel(ctx, testInvocationID)
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	channel, err = handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1219,7 +1619,7 @@ func TestRetryTwiceOnDisconnect(t *testing.T) {
 
 func TestRetryOnOldDisconnect(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(auth)
 	ctx := context.Background()
 	testUUID, err := uuid.NewRandom()
@@ -1229,7 +1629,9 @@ func TestRetryOnOldDisconnect(t *testing.T) {
 	flags.Set(t, "storage.chunk_file_size_bytes", chunkSize)
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
 
 	// Say that it occurred 5 hours ago
 	te.GetInvocationDB().SetNowFunc(func() time.Time {
@@ -1237,7 +1639,7 @@ func TestRetryOnOldDisconnect(t *testing.T) {
 	})
 
 	// Send started event with api key
-	request := streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1279,8 +1681,10 @@ func TestRetryOnOldDisconnect(t *testing.T) {
 	te.GetInvocationDB().SetNowFunc(time.Now)
 
 	// Attempt to start a new invocation with the same id
-	channel = handler.OpenChannel(ctx, testInvocationID)
-	request = streamRequest(startedEvent("--remote_header='"+testauth.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	channel, err = handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+	request = streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
 	err = channel.HandleEvent(request)
 	assert.NoError(t, err)
 
@@ -1297,9 +1701,11 @@ func TestBuildStatusReporting(t *testing.T) {
 	for _, test := range []struct {
 		name           string
 		metadataEvents []*bspb.BuildEvent
+		statusContext  string
 	}{
 		{
-			name: "BuildMetadataThenWorkspaceStatus",
+			name:          "BuildMetadataThenWorkspaceStatus",
+			statusContext: "bazel build //...",
 			metadataEvents: []*bspb.BuildEvent{
 				&bspb.BuildEvent{
 					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_Pattern{Pattern: &bspb.BuildEventId_PatternExpandedId{
@@ -1325,7 +1731,8 @@ func TestBuildStatusReporting(t *testing.T) {
 			},
 		},
 		{
-			name: "WorkspaceStatusThenBuildMetadata",
+			name:          "WorkspaceStatusThenBuildMetadataWithCommitStatusLabel",
+			statusContext: "Build and test",
 			metadataEvents: []*bspb.BuildEvent{
 				&bspb.BuildEvent{
 					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_Pattern{Pattern: &bspb.BuildEventId_PatternExpandedId{
@@ -1345,7 +1752,10 @@ func TestBuildStatusReporting(t *testing.T) {
 					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_BuildMetadata{}},
 					Payload: &bspb.BuildEvent_BuildMetadata{BuildMetadata: &bspb.BuildMetadata{
 						// Status reporting is only enabled for CI builds.
-						Metadata: map[string]string{"ROLE": "CI"},
+						Metadata: map[string]string{
+							"ROLE":                "CI",
+							"COMMIT_STATUS_LABEL": "Build and test",
+						},
 					}},
 				},
 			},
@@ -1353,16 +1763,30 @@ func TestBuildStatusReporting(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			te := testenv.GetTestEnv(t)
-			fakeGH := &FakeGitHubStatusService{}
+			fakeGH := &FakeGitHubStatusService{StatusReportingEnabled: true}
 			te.SetGitHubStatusService(fakeGH)
-			auth := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+			auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 			te.SetAuthenticator(auth)
-			ctx := context.Background()
+			ctx, err := auth.WithAuthenticatedUser(context.Background(), "USER1")
+			require.NoError(t, err)
 			handler := build_event_handler.NewBuildEventHandler(te)
+
+			// Initialize a github app installation to report statuses for.
+			dbh := te.GetDBHandle()
+			require.NotNil(t, dbh)
+			gh := &tables.GitHubAppInstallation{
+				GroupID:                         "GROUP1",
+				Owner:                           "testowner",
+				ReportCommitStatusesForCIBuilds: true,
+			}
+			err = dbh.NewQuery(context.Background(), "create_github_app_installation_for_test").Create(gh)
+			require.NoError(t, err)
 
 			// Start an invocation
 			seq := NewBESSequence(t)
-			channel := handler.OpenChannel(ctx, seq.InvocationID)
+			channel, err := handler.OpenChannel(ctx, seq.InvocationID)
+			require.NoError(t, err)
+			defer channel.Close()
 
 			// Handle Started event referencing the metadata events as children.
 			var metadataEventIDs []*bspb.BuildEventId
@@ -1379,12 +1803,12 @@ func TestBuildStatusReporting(t *testing.T) {
 					OptionsDescription: "--some_build_options",
 				}},
 			}
-			err := channel.HandleEvent(seq.NextRequest(started))
+			err = channel.HandleEvent(seq.NextRequest(started))
 			require.NoError(t, err)
 
 			// Should not have reported any statuses yet, since we haven't
 			// handled any metadata events.
-			require.Empty(t, fakeGH.Clients)
+			require.True(t, fakeGH.HasNoStatuses())
 
 			// Handle *all but the last* metadata event - no statuses should be
 			// reported yet. We should only report a status once *all* of the
@@ -1395,7 +1819,7 @@ func TestBuildStatusReporting(t *testing.T) {
 				md = md[1:]
 				err := channel.HandleEvent(seq.NextRequest(event))
 				require.NoError(t, err)
-				require.Empty(t, fakeGH.Clients)
+				require.True(t, fakeGH.HasNoStatuses())
 			}
 
 			// Now handle the last metadata event - should report a status,
@@ -1409,10 +1833,10 @@ func TestBuildStatusReporting(t *testing.T) {
 					OwnerRepo: "testowner/testrepo",
 					CommitSHA: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2",
 					RepoStatus: &github.GithubStatusPayload{
-						TargetURL:   pointer("http://localhost:8080/invocation/" + seq.InvocationID),
-						State:       pointer("pending"),
-						Description: pointer("Running..."),
-						Context:     pointer("bazel build //..."),
+						TargetURL:   new("http://localhost:8080/invocation/" + seq.InvocationID),
+						State:       new("pending"),
+						Description: new("Running..."),
+						Context:     new(test.statusContext),
 					},
 				},
 			}, client.ConsumeStatuses())
@@ -1434,10 +1858,292 @@ func TestBuildStatusReporting(t *testing.T) {
 					OwnerRepo: "testowner/testrepo",
 					CommitSHA: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2",
 					RepoStatus: &github.GithubStatusPayload{
-						TargetURL:   pointer("http://localhost:8080/invocation/" + seq.InvocationID),
-						State:       pointer("success"),
-						Description: pointer("Success"),
-						Context:     pointer("bazel build //..."),
+						TargetURL:   new("http://localhost:8080/invocation/" + seq.InvocationID),
+						State:       new("success"),
+						Description: new("Success"),
+						Context:     new(test.statusContext),
+					},
+				},
+			}, client.ConsumeStatuses())
+		})
+	}
+}
+
+func TestBuildStatusReportingDisabled(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		enableReportingForRepo   bool
+		role                     string
+		disableReportingForBuild string
+	}{
+		{
+			name:                     "status reporting disabled for the repo",
+			enableReportingForRepo:   false,
+			role:                     "CI",
+			disableReportingForBuild: "false",
+		},
+		{
+			name:                     "status reporting disabled for the build",
+			enableReportingForRepo:   true,
+			role:                     "CI",
+			disableReportingForBuild: "true",
+		},
+		{
+			name:                     "not CI build",
+			enableReportingForRepo:   true,
+			role:                     "default",
+			disableReportingForBuild: "false",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			fakeGH := &FakeGitHubStatusService{StatusReportingEnabled: test.enableReportingForRepo}
+			te.SetGitHubStatusService(fakeGH)
+			auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+			te.SetAuthenticator(auth)
+			ctx, err := auth.WithAuthenticatedUser(context.Background(), "USER1")
+			require.NoError(t, err)
+			handler := build_event_handler.NewBuildEventHandler(te)
+
+			// Initialize a git repo to report statuses for.
+			dbh := te.GetDBHandle()
+			require.NotNil(t, dbh)
+			gh := &tables.GitHubAppInstallation{
+				GroupID: "GROUP1",
+				Owner:   "testowner",
+			}
+			err = dbh.NewQuery(context.Background(), "create_github_app_installation_for_test").Create(gh)
+			require.NoError(t, err)
+			// Gorm `Create` will ignore the value of `report_commit_statuses_for_ci_builds`
+			// if it is set to false in the struct. To override its default value of true,
+			// you have to explicitly update the value of the field.
+			rsp := dbh.NewQuery(context.Background(), "create_github_app_installation_for_test").Raw(`UPDATE "GitHubAppInstallations" SET report_commit_statuses_for_ci_builds = ?`, test.enableReportingForRepo).Exec()
+			require.NoError(t, rsp.Error)
+
+			buildEvents := []*bspb.BuildEvent{
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_Pattern{Pattern: &bspb.BuildEventId_PatternExpandedId{
+						Pattern: []string{"//..."},
+					}}},
+				},
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_BuildMetadata{}},
+					Payload: &bspb.BuildEvent_BuildMetadata{BuildMetadata: &bspb.BuildMetadata{
+						Metadata: map[string]string{
+							"ROLE":                            test.role,
+							"DISABLE_COMMIT_STATUS_REPORTING": test.disableReportingForBuild,
+						},
+					}},
+				},
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_WorkspaceStatus{}},
+					Payload: &bspb.BuildEvent_WorkspaceStatus{WorkspaceStatus: &bspb.WorkspaceStatus{
+						Item: []*bspb.WorkspaceStatus_Item{
+							{Key: "REPO_URL", Value: "https://github.com/testowner/testrepo.git"},
+							{Key: "COMMIT_SHA", Value: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2"},
+						},
+					}},
+				},
+			}
+
+			// Start an invocation
+			seq := NewBESSequence(t)
+			channel, err := handler.OpenChannel(ctx, seq.InvocationID)
+			require.NoError(t, err)
+			defer channel.Close()
+
+			// Handle Started event referencing the metadata events as children.
+			var metadataEventIDs []*bspb.BuildEventId
+			for _, e := range buildEvents {
+				metadataEventIDs = append(metadataEventIDs, e.GetId())
+			}
+			started := &bspb.BuildEvent{
+				Id:       &bspb.BuildEventId{Id: &bspb.BuildEventId_Started{}},
+				Children: metadataEventIDs,
+				Payload: &bspb.BuildEvent_Started{Started: &bspb.BuildStarted{
+					Command: "build",
+					// TODO: the test fails unless OptionsDescription is set,
+					// which seems error-prone.
+					OptionsDescription: "--some_build_options",
+				}},
+			}
+			err = channel.HandleEvent(seq.NextRequest(started))
+			require.NoError(t, err)
+
+			// Handle metadata events.
+			for _, event := range buildEvents {
+				err := channel.HandleEvent(seq.NextRequest(event))
+				require.NoError(t, err)
+				require.True(t, fakeGH.HasNoStatuses())
+			}
+			// No statuses should've been reported.
+			require.True(t, fakeGH.HasNoStatuses())
+
+			// Handle the Finished event - should not report a status.
+			fin := &bspb.BuildEvent{
+				Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_BuildFinished{}},
+				Payload: &bspb.BuildEvent_Finished{Finished: &bspb.BuildFinished{
+					ExitCode: &bspb.BuildFinished_ExitCode{
+						Name: "SUCCESS",
+						Code: 0,
+					},
+				}},
+			}
+			err = channel.HandleEvent(seq.NextRequest(fin))
+			require.NoError(t, err)
+			require.True(t, fakeGH.HasNoStatuses())
+		})
+	}
+}
+
+func TestBuildStatusReporting_LegacyMethods(t *testing.T) {
+	for _, test := range []struct {
+		name                       string
+		legacyWorkflow             bool
+		legacyGroupLevelOauthToken bool
+	}{
+		{
+			name:                       "Legacy workflow",
+			legacyWorkflow:             true,
+			legacyGroupLevelOauthToken: false,
+		},
+		{
+			name:                       "Legacy group level oauth token",
+			legacyWorkflow:             false,
+			legacyGroupLevelOauthToken: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			te := testenv.GetTestEnv(t)
+			fakeGH := &FakeGitHubStatusService{StatusReportingEnabled: true}
+			te.SetGitHubStatusService(fakeGH)
+			auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+			te.SetAuthenticator(auth)
+			ctx, err := auth.WithAuthenticatedUser(context.Background(), "USER1")
+			require.NoError(t, err)
+			handler := build_event_handler.NewBuildEventHandler(te)
+
+			dbh := te.GetDBHandle()
+			require.NotNil(t, dbh)
+			if test.legacyWorkflow {
+				wf := &tables.Workflow{
+					RepoURL: "https://github.com/testowner/testrepo",
+				}
+				err := dbh.NewQuery(context.Background(), "create_workflow_for_test").Create(wf)
+				require.NoError(t, err)
+			}
+			if test.legacyGroupLevelOauthToken {
+				token := "token"
+				g := &tables.Group{
+					GroupID:     "GROUP1",
+					GithubToken: &token,
+				}
+				err := dbh.NewQuery(context.Background(), "create_group_for_test").Create(g)
+				require.NoError(t, err)
+			}
+
+			buildEvents := []*bspb.BuildEvent{
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_Pattern{Pattern: &bspb.BuildEventId_PatternExpandedId{
+						Pattern: []string{"//..."},
+					}}},
+				},
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_BuildMetadata{}},
+					Payload: &bspb.BuildEvent_BuildMetadata{BuildMetadata: &bspb.BuildMetadata{
+						Metadata: map[string]string{"ROLE": "CI"},
+					}},
+				},
+				{
+					Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_WorkspaceStatus{}},
+					Payload: &bspb.BuildEvent_WorkspaceStatus{WorkspaceStatus: &bspb.WorkspaceStatus{
+						Item: []*bspb.WorkspaceStatus_Item{
+							{Key: "REPO_URL", Value: "https://github.com/testowner/testrepo.git"},
+							{Key: "COMMIT_SHA", Value: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2"},
+						},
+					}},
+				},
+			}
+
+			// Start an invocation
+			seq := NewBESSequence(t)
+			channel, err := handler.OpenChannel(ctx, seq.InvocationID)
+			require.NoError(t, err)
+			defer channel.Close()
+
+			// Handle Started event referencing the metadata events as children.
+			var metadataEventIDs []*bspb.BuildEventId
+			for _, e := range buildEvents {
+				metadataEventIDs = append(metadataEventIDs, e.GetId())
+			}
+			started := &bspb.BuildEvent{
+				Id:       &bspb.BuildEventId{Id: &bspb.BuildEventId_Started{}},
+				Children: metadataEventIDs,
+				Payload: &bspb.BuildEvent_Started{Started: &bspb.BuildStarted{
+					Command: "build",
+					// TODO: the test fails unless OptionsDescription is set,
+					// which seems error-prone.
+					OptionsDescription: "--some_build_options",
+				}},
+			}
+			err = channel.HandleEvent(seq.NextRequest(started))
+			require.NoError(t, err)
+
+			// Should not have reported any statuses yet, since we haven't
+			// handled any metadata events.
+			require.True(t, fakeGH.HasNoStatuses())
+
+			// Handle *all but the last* metadata event - no statuses should be
+			// reported yet. We should only report a status once *all* of the
+			// metadata events declared in the Started event have been handled.
+			md := buildEvents
+			for len(md) > 1 {
+				event := md[0]
+				md = md[1:]
+				err := channel.HandleEvent(seq.NextRequest(event))
+				require.NoError(t, err)
+				require.True(t, fakeGH.HasNoStatuses())
+			}
+
+			// Now handle the last metadata event - should report a status,
+			// since all metadata events have been handled.
+			err = channel.HandleEvent(seq.NextRequest(md[0]))
+			require.NoError(t, err)
+			client := fakeGH.GetCreatedClient(t)
+			require.Equal(t, []*FakeGitHubStatus{
+				{
+					OwnerRepo: "testowner/testrepo",
+					CommitSHA: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2",
+					RepoStatus: &github.GithubStatusPayload{
+						TargetURL:   new("http://localhost:8080/invocation/" + seq.InvocationID),
+						State:       new("pending"),
+						Description: new("Running..."),
+						Context:     new("bazel build //..."),
+					},
+				},
+			}, client.ConsumeStatuses())
+
+			// Handle the Finished event - should report another status.
+			fin := &bspb.BuildEvent{
+				Id: &bspb.BuildEventId{Id: &bspb.BuildEventId_BuildFinished{}},
+				Payload: &bspb.BuildEvent_Finished{Finished: &bspb.BuildFinished{
+					ExitCode: &bspb.BuildFinished_ExitCode{
+						Name: "SUCCESS",
+						Code: 0,
+					},
+				}},
+			}
+			err = channel.HandleEvent(seq.NextRequest(fin))
+			require.NoError(t, err)
+			require.Equal(t, []*FakeGitHubStatus{
+				{
+					OwnerRepo: "testowner/testrepo",
+					CommitSHA: "0c894fe31c2e91d59cb1a59bb25aaa78089919c2",
+					RepoStatus: &github.GithubStatusPayload{
+						TargetURL:   new("http://localhost:8080/invocation/" + seq.InvocationID),
+						State:       new("success"),
+						Description: new("Success"),
+						Context:     new("bazel build //..."),
 					},
 				},
 			}, client.ConsumeStatuses())
@@ -1524,8 +2230,4 @@ func TestTruncateStringSlice(t *testing.T) {
 			assert.Equal(t, test.Truncated, truncated, "truncated should be %t", test.Truncated)
 		})
 	}
-}
-
-func pointer[T any](value T) *T {
-	return &value
 }

@@ -1,40 +1,40 @@
+import { addDays, startOfDay } from "date-fns";
+import Long from "long";
+import moment from "moment";
 import capabilities from "../../../app/capabilities/capabilities";
 import { differenceInCalendarDays, durationMillis, formatDateRange } from "../../../app/format/format";
-import * as proto from "../../../app/util/proto";
-import { google as google_duration } from "../../../proto/duration_ts_proto";
-import { google as google_timestamp } from "../../../proto/timestamp_ts_proto";
-import { invocation_status } from "../../../proto/invocation_status_ts_proto";
-import { stat_filter } from "../../../proto/stat_filter_ts_proto";
-import moment from "moment";
 import {
-  DIMENSION_PARAM_NAME,
-  GENERIC_FILTER_PARAM_NAME,
-  ROLE_PARAM_NAME,
-  START_DATE_PARAM_NAME,
-  END_DATE_PARAM_NAME,
-  STATUS_PARAM_NAME,
-  LAST_N_DAYS_PARAM_NAME,
-  USER_PARAM_NAME,
-  REPO_PARAM_NAME,
   BRANCH_PARAM_NAME,
-  COMMIT_PARAM_NAME,
-  HOST_PARAM_NAME,
   COMMAND_PARAM_NAME,
-  PATTERN_PARAM_NAME,
-  TAG_PARAM_NAME,
-  MINIMUM_DURATION_PARAM_NAME,
+  COMMIT_PARAM_NAME,
+  DIMENSION_PARAM_NAME,
+  END_DATE_PARAM_NAME,
+  GENERIC_FILTER_PARAM_NAME,
+  HOST_PARAM_NAME,
+  LAST_N_DAYS_PARAM_NAME,
   MAXIMUM_DURATION_PARAM_NAME,
+  MINIMUM_DURATION_PARAM_NAME,
+  PATTERN_PARAM_NAME,
+  REPO_PARAM_NAME,
+  ROLE_PARAM_NAME,
   SORT_BY_PARAM_NAME,
   SORT_ORDER_PARAM_NAME,
+  START_DATE_PARAM_NAME,
+  STATUS_PARAM_NAME,
+  TAG_PARAM_NAME,
+  USER_PARAM_NAME,
 } from "../../../app/router/router_params";
-import Long from "long";
+import * as proto from "../../../app/util/proto";
+import { google as google_duration } from "../../../proto/duration_ts_proto";
+import { invocation_status } from "../../../proto/invocation_status_ts_proto";
+import { stat_filter } from "../../../proto/stat_filter_ts_proto";
+import { google as google_timestamp } from "../../../proto/timestamp_ts_proto";
 
 // URL param value representing the empty role (""), which is the default.
 const DEFAULT_ROLE_PARAM_VALUE = "DEFAULT";
 
-export const DATE_PARAM_FORMAT = "YYYY-MM-DD";
-
-export const DEFAULT_LAST_N_DAYS = 30;
+/** The number of days selected when no date range params are set. */
+export const DEFAULT_LAST_N_DAYS = 7;
 
 export type SortBy =
   | "start-time"
@@ -103,6 +103,25 @@ function parseDimensionType(stringValue: string): stat_filter.Dimension | undefi
   return undefined;
 }
 
+export function getDimensionParamFromFilters(filters: stat_filter.DimensionFilter[]): string {
+  const filterStrings = filters
+    .map((f) => {
+      if (!(f.dimension?.execution || f.dimension?.invocation) || f.value === undefined || f.value === null) {
+        return undefined;
+      }
+      let dimensionName = "";
+      if (f.dimension.execution) {
+        dimensionName = "e" + f.dimension.execution.toString();
+      } else {
+        dimensionName = "i" + f.dimension.invocation!.toString();
+      }
+      return dimensionName + "|" + f.value.length + "|" + f.value;
+    })
+    .filter((f) => f !== undefined);
+
+  return filterStrings.join("|");
+}
+
 // Parses a set of DimensionFilters from the supplied URL param string.  Each
 // entry is formatted as "dimension|value_length|value" and entry is separated
 // from the next by another pipe.
@@ -127,7 +146,7 @@ export function getFiltersFromDimensionParam(dimensionParamValue: string): stat_
     }
     dimensionParamValue = dimensionParamValue.substring(separatorIndex + 1);
     separatorIndex = dimensionParamValue.indexOf("|");
-    if (separatorIndex == -1 || separatorIndex + 1 === dimensionParamValue.length) {
+    if (separatorIndex == -1) {
       break;
     }
 
@@ -141,7 +160,7 @@ export function getFiltersFromDimensionParam(dimensionParamValue: string): stat_
     const value = dimensionParamValue.substring(0, dimensionValueLength);
     filters.push(new stat_filter.DimensionFilter({ dimension, value }));
 
-    dimensionParamValue = dimensionParamValue.substring(dimensionValueLength);
+    dimensionParamValue = dimensionParamValue.substring(dimensionValueLength + 1);
   }
   return filters;
 }
@@ -167,6 +186,9 @@ const STRING_TYPES: stat_filter.FilterType[] = [
   stat_filter.FilterType.BRANCH_FILTER_TYPE,
   stat_filter.FilterType.WORKER_FILTER_TYPE,
   stat_filter.FilterType.ROLE_FILTER_TYPE,
+  stat_filter.FilterType.INVOCATION_ID_FILTER_TYPE,
+  stat_filter.FilterType.EXECUTION_OS_FILTER_TYPE,
+  stat_filter.FilterType.EXECUTION_ARCH_FILTER_TYPE,
 ];
 
 const STRING_ARRAY_TYPES: stat_filter.FilterType[] = [stat_filter.FilterType.TAG_FILTER_TYPE];
@@ -209,6 +231,13 @@ function getType(stringRep: string): stat_filter.FilterType | undefined {
       return stat_filter.FilterType.EXECUTION_UPDATED_AT_USEC_FILTER_TYPE;
     case "tag":
       return stat_filter.FilterType.TAG_FILTER_TYPE;
+    case "inv_id":
+    case "invocation_id":
+      return stat_filter.FilterType.INVOCATION_ID_FILTER_TYPE;
+    case "arch":
+      return stat_filter.FilterType.EXECUTION_ARCH_FILTER_TYPE;
+    case "os":
+      return stat_filter.FilterType.EXECUTION_OS_FILTER_TYPE;
   }
   return undefined;
 }
@@ -306,7 +335,7 @@ function getValues(
     const fvs = values
       .map((v) => Number.parseInt(v))
       .filter(Number.isInteger)
-      .map(Long.fromValue);
+      .map((value) => Long.fromValue(value));
     return [new stat_filter.FilterValue({ intValue: fvs }), remainder];
   } else if (type === stat_filter.FilterType.INVOCATION_STATUS_FILTER_TYPE /* STATUS_FILTER_CATEGORY */) {
     // Casting because typescript doesn't understand the filter() call.
@@ -359,7 +388,7 @@ export function getProtoFilterParams(search: URLSearchParams, now?: moment.Momen
   return {
     role: parseRoleParam(search.get(ROLE_PARAM_NAME)),
     status: parseStatusParam(search.get(STATUS_PARAM_NAME)),
-    updatedAfter: proto.dateToTimestamp(getStartDate(search, now)),
+    updatedAfter: proto.dateToTimestamp(getStartDate(search, now?.toDate())),
     updatedBefore: endDate ? proto.dateToTimestamp(endDate) : undefined,
 
     user: search.get(USER_PARAM_NAME) || undefined,
@@ -385,6 +414,14 @@ export function getDimensionName(d: stat_filter.Dimension): string {
     switch (d.execution) {
       case stat_filter.ExecutionDimensionType.WORKER_EXECUTION_DIMENSION:
         return "Worker";
+      case stat_filter.ExecutionDimensionType.TARGET_LABEL_EXECUTION_DIMENSION:
+        return "Target";
+      case stat_filter.ExecutionDimensionType.ACTION_MNEMONIC_EXECUTION_DIMENSION:
+        return "Mnemonic";
+      case stat_filter.ExecutionDimensionType.EFFECTIVE_POOL_EXECUTION_DIMENSION:
+        return "Pool";
+      case stat_filter.ExecutionDimensionType.EXIT_CODE_EXECUTION_DIMENSION:
+        return "Exit Code";
     }
   } else if (d.invocation) {
     switch (d.invocation) {
@@ -395,68 +432,25 @@ export function getDimensionName(d: stat_filter.Dimension): string {
   return "";
 }
 
-export function getDefaultStartDate(now?: moment.Moment): Date {
-  return (now ? moment(now) : moment())
-    .add(-DEFAULT_LAST_N_DAYS + 1, "days")
-    .startOf("day")
-    .toDate();
-}
-
-export function getStartDate(search: URLSearchParams, now?: moment.Moment): Date {
+/** Returns the start of the date range selected in the URL. */
+export function getStartDate(search: URLSearchParams, now: Date = new Date()): Date {
   const dateString = search.get(START_DATE_PARAM_NAME);
   if (dateString) {
     const dateNumber = Number(dateString);
     if (Number.isInteger(dateNumber)) {
       return new Date(dateNumber);
     }
-    return moment(dateString).toDate();
+    return parseDateParam(dateString);
   }
-  if (search.get(LAST_N_DAYS_PARAM_NAME)) {
-    return (now ? moment(now) : moment())
-      .add(-Number(search.get(LAST_N_DAYS_PARAM_NAME)) + 1, "days")
-      .startOf("day")
-      .toDate();
-  }
-  return getDefaultStartDate(now);
+  const lastNDays = Number(search.get(LAST_N_DAYS_PARAM_NAME)) || DEFAULT_LAST_N_DAYS;
+  return startOfDay(addDays(now, 1 - lastNDays));
 }
 
-export function getDateRangeForPicker(search: URLSearchParams): { startDate: Date; endDate?: Date } {
-  // Not using `getEndDate` here because it's set to "start of day after the one specified
-  // in the URL" which causes an off-by-one error if we were to render that directly in
-  // the calendar.
-  let endDate = undefined;
-  const dateString = search.get(END_DATE_PARAM_NAME);
-  if (dateString) {
-    const dateNumber = Number(dateString);
-    if (Number.isInteger(dateNumber)) {
-      endDate = moment
-        .unix(dateNumber / 1000)
-        .startOf("day")
-        .toDate();
-    } else {
-      endDate = moment(dateString).toDate();
-    }
-  }
-  return { startDate: getStartDate(search), endDate };
-}
-
-function getDateRangeForStringFromUrlParams(search: URLSearchParams): { startDate: Date; endDate?: Date } {
-  // Not using `getEndDate` here because it's set to "start of day after the one specified
-  // in the URL" which causes an off-by-one error if we were to render that directly in
-  // the calendar.
-  let endDate = undefined;
-  const dateString = search.get(END_DATE_PARAM_NAME);
-  if (dateString) {
-    const dateNumber = Number(dateString);
-    if (Number.isInteger(dateNumber)) {
-      endDate = new Date(dateNumber);
-    } else {
-      endDate = getEndDate(search);
-    }
-  }
-  return { startDate: getStartDate(search), endDate };
-}
-
+/**
+ * Returns the exclusive end of the date range selected in the URL: the start
+ * of the day after the end date named in the URL. Returns undefined if no end
+ * date is set.
+ */
 export function getEndDate(search: URLSearchParams): Date | undefined {
   const dateString = search.get(END_DATE_PARAM_NAME);
   if (!dateString) {
@@ -466,7 +460,37 @@ export function getEndDate(search: URLSearchParams): Date | undefined {
   if (Number.isInteger(dateNumber)) {
     return new Date(dateNumber);
   }
-  return moment(search.get(END_DATE_PARAM_NAME)).add(1, "days").toDate();
+  return addDays(parseDateParam(dateString), 1);
+}
+
+/**
+ * Returns the date range to render in the date picker. Unlike `getEndDate`,
+ * the returned end date is the day named in the URL rather than the start of
+ * the day after it, which would be off by one on the calendar.
+ */
+export function getDateRangeForPicker(search: URLSearchParams): { startDate: Date; endDate?: Date } {
+  let endDate = undefined;
+  const dateString = search.get(END_DATE_PARAM_NAME);
+  if (dateString) {
+    const dateNumber = Number(dateString);
+    if (Number.isInteger(dateNumber)) {
+      endDate = startOfDay(new Date(dateNumber));
+    } else {
+      endDate = parseDateParam(dateString);
+    }
+  }
+  return { startDate: getStartDate(search), endDate };
+}
+
+/** Formats a date as a "YYYY-MM-DD" date param. */
+export function formatDateParam(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** Parses a "YYYY-MM-DD" date param as local midnight. */
+function parseDateParam(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year, (month || 1) - 1, day || 1);
 }
 
 const STATUS_TO_STRING = Object.fromEntries(
@@ -529,9 +553,19 @@ export function formatDateRangeDurationFromSearchParams(search: URLSearchParams)
   return diff == 1 ? "day" : `${diff} days`;
 }
 
+/** Formats the date range selected in the URL as a human-readable string. */
 export function formatDateRangeFromUrlParams(search: URLSearchParams): string {
-  const { startDate, endDate } = getDateRangeForStringFromUrlParams(search);
-  return formatDateRange(startDate, endDate);
+  let endDate = undefined;
+  const dateString = search.get(END_DATE_PARAM_NAME);
+  if (dateString) {
+    const dateNumber = Number(dateString);
+    if (Number.isInteger(dateNumber)) {
+      endDate = new Date(dateNumber);
+    } else {
+      endDate = getEndDate(search);
+    }
+  }
+  return formatDateRange(getStartDate(search), endDate);
 }
 
 export function isAnyDimensionFilterSet(param: string): boolean {

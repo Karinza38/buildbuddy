@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/auth"
@@ -19,84 +22,162 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/clientidentity"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor/oomkiller"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executorplatform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/gpu"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/runner"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/snaputil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/priority_task_scheduler"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/scheduler_client"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/task_leaser"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/tasksize"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/cpuset"
 	"github.com/buildbuddy-io/buildbuddy/server/config"
+	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/hostid"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/ssl"
+	"github.com/buildbuddy-io/buildbuddy/server/util/canary"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/monitoring"
+	"github.com/buildbuddy-io/buildbuddy/server/util/shlex"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
-	"github.com/buildbuddy-io/buildbuddy/server/util/vtprotocodec"
+	"github.com/buildbuddy-io/buildbuddy/server/util/xds"
 	"github.com/buildbuddy-io/buildbuddy/server/version"
 	"github.com/buildbuddy-io/buildbuddy/server/xcode"
 	"github.com/google/uuid"
-
-	_ "github.com/buildbuddy-io/buildbuddy/server/util/grpc_server" // imported for grpc_port flag definition to avoid breaking old configs; DO NOT REMOVE.
-	_ "google.golang.org/grpc/encoding/gzip"                        // imported for side effects; DO NOT REMOVE.
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	remote_executor "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor"
+	ofpb "github.com/buildbuddy-io/buildbuddy/proto/oci_fetcher"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
+	_ "github.com/buildbuddy-io/buildbuddy/server/util/grpc_server" // imported for grpc_port flag definition to avoid breaking old configs; DO NOT REMOVE.
 	bspb "google.golang.org/genproto/googleapis/bytestream"
+	_ "google.golang.org/grpc/encoding/gzip" // imported for side effects; DO NOT REMOVE.
+	_ "google.golang.org/grpc/xds"           // registers xds:// resolver.
 )
 
 var (
 	appTarget                 = flag.String("executor.app_target", "grpcs://remote.buildbuddy.io", "The GRPC url of a buildbuddy app server.")
 	cacheTarget               = flag.String("executor.cache_target", "", "The GRPC url of the remote cache to use. If empty, the value from --executor.app_target is used.")
+	cacheTargetTrafficPercent = flag.Int("executor.cache_target_traffic_percent", -1, "The percent of cache traffic to send to --executor.cache_target. If not 100, the remainder will be sent to --executor.app_target. If -1 (the default), then 100% of cache traffic will be sent to executor.cache_target (which defaults to executor.app_target if not set).")
 	disableLocalCache         = flag.Bool("executor.disable_local_cache", false, "If true, a local file cache will not be used.")
 	deleteFileCacheOnStartup  = flag.Bool("executor.delete_filecache_on_startup", false, "If true, delete the file cache on startup")
 	deleteBuildRootOnStartup  = flag.Bool("executor.delete_build_root_on_startup", false, "If true, delete the build root on startup")
 	executorMedadataDirectory = flag.String("executor.metadata_directory", "", "Location where executor host_id and other metadata is stored. Defaults to executor.local_cache_directory/../")
 	localCacheDirectory       = flag.String("executor.local_cache_directory", "/tmp/buildbuddy/filecache", "A local on-disk cache directory. Must be on the same device (disk partition, Docker volume, etc.) as the configured root_directory, since files are hard-linked to this cache for performance reasons. Otherwise, 'Invalid cross-device link' errors may result.")
-	localCacheSizeBytes       = flag.Int64("executor.local_cache_size_bytes", 1_000_000_000 /* 1 GB */, "The maximum size, in bytes, to use for the local on-disk cache")
+	localCacheSize            = flag.String("executor.local_cache_size_bytes", "1000000000" /* 1 GB */, "The maximum size to use for the local on-disk cache. Either an absolute number of bytes, or a percentage of the total size of the filesystem containing executor.local_cache_directory (e.g. \"80%\").")
 	startupWarmupMaxWaitSecs  = flag.Int64("executor.startup_warmup_max_wait_secs", 0, "Maximum time to block startup while waiting for default image to be pulled. Default is no wait.")
+	maximumDiskFullness       = flag.Float64("executor.maximum_disk_fullness", 1.01, "Fail health check if device containing executor.local_cache_directory is more than this full")
+	startupCommands           = flag.Slice("executor.startup_commands", []string{}, "Commands to run on startup. These are run sequentially and block executor startup.")
+	clientType                = flag.String("executor.grpc_client_type", "executor", "The client type label for requests from this executor, used to differentiate e.g. workflow executor traffic.")
 
 	listen            = flag.String("listen", "0.0.0.0", "The interface to listen on (default: 0.0.0.0)")
 	port              = flag.Int("port", 8080, "The port to listen for HTTP traffic on")
 	monitoringPort    = flag.Int("monitoring_port", 9090, "The port to listen for monitoring traffic on")
 	monitoringSSLPort = flag.Int("monitoring.ssl_port", -1, "If non-negative, the SSL port to listen for monitoring traffic on. `ssl` config must have `ssl_enabled: true` and be properly configured.")
 	serverType        = flag.String("server_type", "prod-buildbuddy-executor", "The server type to match on health checks")
+	maxThreads        = flag.Int("executor.max_threads", 0, "The maximum number of threads to allow before panicking. If unset, the golang default will be used (currently 10,000).")
 )
 
-func init() {
-	// Register the codec for all RPC servers and clients.
-	vtprotocodec.Register()
+// Cgroups contains the executor's cgroup paths discovered during setup.
+// On platforms other than linux, all fields are empty.
+type Cgroups struct {
+	// StartingCgroup is the cgroup that contained the executor before setup,
+	// relative to the cgroupfs root. It is empty if the cgroup could not be
+	// determined or if the executor started in the root cgroup.
+	StartingCgroup string
+	// CgroupParent is the parent under which task cgroups are created.
+	CgroupParent string
 }
 
-func InitializeCacheClientsOrDie(cacheTarget string, realEnv *real_environment.RealEnv) {
-	var err error
-	if cacheTarget == "" {
-		log.Fatalf("No cache target was set. Run a local cache or specify one in the config")
-	} else if u, err := url.Parse(cacheTarget); err == nil && u.Hostname() == "cloud.buildbuddy.io" {
-		log.Warning("You are using the old BuildBuddy endpoint, cloud.buildbuddy.io. Migrate `executor.app_target` to remote.buildbuddy.io for improved performance.")
-	}
-	conn, err := grpc_client.DialInternal(realEnv, cacheTarget)
+func isOldEndpoint(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	return err == nil && u.Hostname() == "cloud.buildbuddy.io"
+}
+
+type cacheClient interface {
+	interfaces.Checker
+	grpc.ClientConnInterface
+}
+
+func dialCacheOrDie(target string, env environment.Env) *grpc_client.ClientConnPool {
+	log.Infof("Connecting to cache target %q", target)
+	conn, err := grpc_client.DialInternal(env, target)
 	if err != nil {
-		log.Fatalf("Unable to connect to cache '%s': %s", cacheTarget, err)
+		log.Fatalf("Unable to connect to cache '%s': %s", target, err)
 	}
-	log.Infof("Connecting to cache target: %s", cacheTarget)
+	log.Debugf("Connected to cache target: %s", target)
+	return conn
+}
 
-	realEnv.GetHealthChecker().AddHealthCheck("grpc_cache_connection", conn)
+func initializeCacheClientsOrDie(appTarget, cacheTarget string, cacheTargetTrafficPercent int, realEnv *real_environment.RealEnv) {
+	if isOldEndpoint(appTarget) || isOldEndpoint(cacheTarget) {
+		log.Warning("You are using the old BuildBuddy endpoint, cloud.buildbuddy.io. Migrate `executor.app_target` and `executor.cache_target` (if applicable) to remote.buildbuddy.io for improved performance.")
+	}
 
-	realEnv.SetByteStreamClient(bspb.NewByteStreamClient(conn))
-	realEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
-	realEnv.SetActionCacheClient(repb.NewActionCacheClient(conn))
-	realEnv.SetCapabilitiesClient(repb.NewCapabilitiesClient(conn))
+	// If the user isn't explicitly configuring cache_target_traffic_percent,
+	// then route 100% to cache_target if configured, otherwise 100% to
+	// app_target.
+	if cacheTargetTrafficPercent == -1 {
+		if cacheTarget == "" {
+			cacheTargetTrafficPercent = 0
+		} else {
+			cacheTargetTrafficPercent = 100
+		}
+	}
+
+	if appTarget == "" {
+		log.Fatalf("No app target was set. Run a local app or specify one in the config")
+	} else if cacheTargetTrafficPercent < 0 || cacheTargetTrafficPercent > 100 {
+		log.Fatal("--executor.cache_target_traffic_percent must be between 0 and 100 (inclusive)")
+	} else if cacheTarget == "" && cacheTargetTrafficPercent > 0 {
+		log.Warning("--executor.cache_target_traffic_percent is >0, but --executor.cache_target is empty. Ignoring and using --executor.app_target as cache backend instead.")
+	}
+
+	var client cacheClient
+	if cacheTarget == "" || cacheTargetTrafficPercent == 0 {
+		client = dialCacheOrDie(appTarget, realEnv)
+	} else if cacheTargetTrafficPercent == 100 {
+		client = dialCacheOrDie(cacheTarget, realEnv)
+	} else {
+		appClient := dialCacheOrDie(appTarget, realEnv)
+		cacheClient := dialCacheOrDie(cacheTarget, realEnv)
+		appTargetTrafficPercent := 100 - cacheTargetTrafficPercent
+		log.Infof("Sending %d%% of executor-to-cache traffic to %s and %d%% of executor-to-cache traffic to %s",
+			appTargetTrafficPercent, appTarget, cacheTargetTrafficPercent, cacheTarget)
+		trafficAllocation := map[*grpc_client.ClientConnPool]int{
+			appClient:   appTargetTrafficPercent,
+			cacheClient: cacheTargetTrafficPercent,
+		}
+		var err error
+		client, err = grpc_client.NewClientConnPoolSplitter(trafficAllocation)
+		if err != nil {
+			log.Fatalf("Error initialized ClientConnPoolSplitter: %s", err)
+		}
+	}
+
+	realEnv.GetHealthChecker().AddHealthCheck("grpc_cache_connection", client)
+
+	realEnv.SetByteStreamClient(bspb.NewByteStreamClient(client))
+	realEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(client))
+	realEnv.SetActionCacheClient(repb.NewActionCacheClient(client))
+	realEnv.SetCapabilitiesClient(repb.NewCapabilitiesClient(client))
+	realEnv.SetOCIFetcherClient(ofpb.NewOCIFetcherClient(client))
 }
 
 func getExecutorHostID() string {
@@ -117,10 +198,44 @@ func getExecutorHostID() string {
 	return hostID
 }
 
-func GetConfiguredEnvironmentOrDie(cacheRoot string, healthChecker *healthcheck.HealthChecker) *real_environment.RealEnv {
+func getExecutorHostName() string {
+	name, err := resources.GetMyHostname()
+	if err != nil {
+		log.Warningf("Failed to get hostname: %s", err)
+	}
+	return name
+}
+
+// localCacheSizeBytes returns the resolved value of
+// --executor.local_cache_size_bytes for the given cache root, or 0 if the local
+// cache is disabled.
+func localCacheSizeBytes(cacheRoot string) (int64, error) {
+	if *disableLocalCache {
+		return 0, nil
+	}
+	size, err := disk.ResolveSizeBytes(*localCacheSize, cacheRoot)
+	if err != nil {
+		return 0, status.WrapError(err, "invalid --executor.local_cache_size_bytes")
+	}
+	return size, nil
+}
+
+func warmupImagesForRegistration() []*scpb.WarmupImage {
+	configs := runner.WarmupConfigs()
+	warmupImages := make([]*scpb.WarmupImage, 0, len(configs))
+	for _, cfg := range configs {
+		warmupImages = append(warmupImages, &scpb.WarmupImage{
+			Image:     cfg.Image,
+			Isolation: cfg.Isolation,
+		})
+	}
+	return warmupImages
+}
+
+func GetConfiguredEnvironmentOrDie(cacheRoot string, filecacheSizeBytes int64, healthChecker *healthcheck.HealthChecker) *real_environment.RealEnv {
 	realEnv := real_environment.NewRealEnv(healthChecker)
 
-	mmapLRUEnabled := *platform.EnableFirecracker && (*snaputil.EnableLocalSnapshotSharing || *snaputil.EnableRemoteSnapshotSharing)
+	mmapLRUEnabled := *executorplatform.EnableFirecracker && snaputil.IsChunkedSnapshotSharingEnabled()
 	if err := resources.Configure(mmapLRUEnabled); err != nil {
 		log.Fatal(status.Message(err))
 	}
@@ -128,6 +243,15 @@ func GetConfiguredEnvironmentOrDie(cacheRoot string, healthChecker *healthcheck.
 	// scheduler_server.go
 	metrics.RemoteExecutionAssignableMilliCPU.Set(math.Floor(float64(resources.GetAllocatedCPUMillis()) * tasksize.MaxResourceCapacityRatio))
 	metrics.RemoteExecutionAssignableRAMBytes.Set(math.Floor(float64(resources.GetAllocatedRAMBytes()) * tasksize.MaxResourceCapacityRatio))
+	customResources, err := resources.GetAllocatedCustomResources()
+	if err != nil {
+		log.Fatalf("Error getting allocated custom resources: %v", err)
+	}
+	for _, r := range customResources {
+		metrics.RemoteExecutionAssignableCustomResources.With(prometheus.Labels{
+			metrics.CustomResourceNameLabel: r.GetName(),
+		}).Set(float64(r.GetValue()))
+	}
 
 	if err := auth.Register(context.Background(), realEnv); err != nil {
 		if err := auth.RegisterNullAuth(realEnv); err != nil {
@@ -138,6 +262,12 @@ func GetConfiguredEnvironmentOrDie(cacheRoot string, healthChecker *healthcheck.
 
 	xl := xcode.NewXcodeLocator()
 	realEnv.SetXcodeLocator(xl)
+
+	leaser, err := cpuset.NewLeaser(cpuset.LeaserOpts{})
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	realEnv.SetCPULeaser(leaser)
 
 	if err := gcs_cache.Register(realEnv); err != nil {
 		log.Fatal(err.Error())
@@ -156,27 +286,33 @@ func GetConfiguredEnvironmentOrDie(cacheRoot string, healthChecker *healthcheck.
 		log.Fatal(err.Error())
 	}
 
-	// Identify ourselves as an executor client in gRPC requests to the app.
-	usageutil.SetClientType("executor")
+	// Identify ourselves in gRPC requests to the app.
+	usageutil.SetServerName(*clientType)
 
-	cache := *cacheTarget
-	if cache == "" {
-		cache = *appTarget
-	}
-	InitializeCacheClientsOrDie(cache, realEnv)
+	initializeCacheClientsOrDie(*appTarget, *cacheTarget, *cacheTargetTrafficPercent, realEnv)
 
 	if !*disableLocalCache {
-		log.Infof("Enabling filecache in %q (size %d bytes)", cacheRoot, *localCacheSizeBytes)
-		if fc, err := filecache.NewFileCache(cacheRoot, *localCacheSizeBytes, *deleteFileCacheOnStartup); err == nil {
-			realEnv.SetFileCache(fc)
+		log.Infof("Enabling filecache in %q (size %d bytes, configured as %q)", cacheRoot, filecacheSizeBytes, *localCacheSize)
+		fc, err := filecache.NewFileCache(cacheRoot, filecacheSizeBytes, *deleteFileCacheOnStartup)
+		if err != nil {
+			log.Fatalf("Error initializing file cache: %s", err)
+		}
+		realEnv.SetFileCache(fc)
+		realEnv.GetHealthChecker().RegisterShutdownFunction(func(ctx context.Context) error {
+			return fc.Close()
+		})
+
+		if err := migrateExt4ImagesToFileCache(fc, cacheRoot); err != nil {
+			log.Fatalf("Error migrating ext4 images to file cache: %s", err)
 		}
 	}
 
+	log.Infof("Connecting to app target: %s", *appTarget)
 	conn, err := grpc_client.DialInternal(realEnv, *appTarget)
 	if err != nil {
 		log.Fatalf("Unable to connect to app '%s': %s", *appTarget, err)
 	}
-	log.Infof("Connecting to app target: %s", *appTarget)
+	log.Debugf("Connected to app target: %s", *appTarget)
 
 	realEnv.GetHealthChecker().AddHealthCheck("grpc_app_connection", conn)
 	realEnv.SetSchedulerClient(scpb.NewSchedulerClient(conn))
@@ -187,6 +323,7 @@ func GetConfiguredEnvironmentOrDie(cacheRoot string, healthChecker *healthcheck.
 }
 
 func main() {
+	executorStartTime := time.Now()
 	version.Print("BuildBuddy executor")
 
 	setUmask()
@@ -205,29 +342,66 @@ func main() {
 
 	config.ReloadOnSIGHUP()
 
+	if *maxThreads > 0 {
+		debug.SetMaxThreads(*maxThreads)
+	}
+
 	if err := log.Configure(); err != nil {
 		fmt.Printf("Error configuring logging: %s", err)
 		os.Exit(1)
+	}
+	if err := gpu.Configure(); err != nil {
+		log.Fatalf("Could not configure GPU memory tracking: %s", err)
+	}
+
+	if err := xds.Bootstrap(rootContext, nil /*=client*/); err != nil {
+		log.Fatalf("Error bootstrapping xDS config: %s", err)
 	}
 
 	// Note: cleanupFUSEMounts needs to happen before deleteBuildRootOnStartup.
 	cleanupFUSEMounts()
 
 	if *deleteBuildRootOnStartup {
-		rootDir := runner.GetBuildRoot()
-		if err := os.RemoveAll(rootDir); err != nil {
-			log.Warningf("Failed to remove build root dir: %s", err)
+		deleteBuildRoot(rootContext, runner.GetBuildRoot())
+	}
+	if err := os.MkdirAll(runner.GetBuildRoot(), 0755); err != nil {
+		log.Fatalf("Unable to create build root directory %q: %s", runner.GetBuildRoot(), err)
+	}
+	if err := resources.ConfigureDiskCapacity(runner.GetBuildRoot()); err != nil {
+		log.Warningf("Could not determine assignable disk capacity: %s", err)
+	}
+	metrics.RemoteExecutionAssignableDiskBytes.Set(math.Floor(float64(resources.GetAllocatedDiskBytes()) * tasksize.MaxResourceCapacityRatio))
+
+	// Run any startup commands.
+	for i, startupCommand := range *startupCommands {
+		start := time.Now()
+		args, err := shlex.Split(startupCommand)
+		if err != nil {
+			log.Fatalf("Error parsing startup command %d: %q: %s", i, startupCommand, err)
 		}
-		if err := disk.EnsureDirectoryExists(rootDir); err != nil {
-			log.Warningf("Failed to create build root dir: %s", err)
+		cmd := exec.CommandContext(rootContext, args[0], args[1:]...)
+		cmd.Stderr = log.Writer(fmt.Sprintf("startup_commands[%d]", i))
+		cmd.Stdout = log.Writer(fmt.Sprintf("startup_commands[%d]", i))
+		log.Infof("Running startup command %d: %q...", i, startupCommand)
+		if err := cmd.Run(); err != nil {
+			log.Errorf("Error running startup command %d: %q: %s", i, startupCommand, err)
 		}
+		log.Infof("Executed startup command %d: %q in %s", i, startupCommand, time.Since(start))
 	}
 
 	setupNetworking(rootContext)
 
 	cacheRoot := filepath.Join(*localCacheDirectory, getExecutorHostID())
+	filecacheSizeBytes, err := localCacheSizeBytes(cacheRoot)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 	healthChecker := healthcheck.NewHealthChecker(*serverType)
-	env := GetConfiguredEnvironmentOrDie(cacheRoot, healthChecker)
+	env := GetConfiguredEnvironmentOrDie(cacheRoot, filecacheSizeBytes, healthChecker)
+
+	dshc := disk.NewUsageMonitor(cacheRoot, *maximumDiskFullness)
+	healthChecker.AddHealthCheck("executor_disk_usage", dshc)
+	statusz.AddSection("executor_disk_usage", "Executor disk usage", dshc)
 
 	if err := tracing.Configure(env); err != nil {
 		log.Fatalf("Could not configure tracing: %s", err)
@@ -242,28 +416,54 @@ func main() {
 	imageCacheAuth := container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{})
 	env.SetImageCacheAuthenticator(imageCacheAuth)
 
-	tasksCgroupParent, err := setupCgroups()
+	cgroups, err := setupCgroups()
 	if err != nil {
 		log.Fatalf("cgroup setup failed: %s", err)
 	}
 
+	var oomKiller oomkiller.Killer
+	if oomkiller.Enabled() {
+		monitor, err := oomkiller.NewMemoryMonitor(cgroups.StartingCgroup)
+		if err != nil {
+			log.Fatalf("Error initializing executor OOM killer memory monitor: %s", err)
+		}
+		k, err := oomkiller.New(rootContext, monitor)
+		if err != nil {
+			log.Fatalf("Error initializing executor OOM killer: %s", err)
+		}
+		oomKiller = k
+	}
+
 	runnerPool, err := runner.NewPool(env, cacheRoot, &runner.PoolOptions{
-		CgroupParent: tasksCgroupParent,
+		CgroupParent: cgroups.CgroupParent,
+		OOMKiller:    oomKiller,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize runner pool: %s", err)
 	}
 
-	executor, err := remote_executor.NewExecutor(env, executorID, getExecutorHostID(), runnerPool)
+	executorHostName := getExecutorHostName()
+	executor, err := remote_executor.NewExecutor(env, executorID, getExecutorHostID(), executorHostName, runnerPool)
 	if err != nil {
 		log.Fatalf("Error initializing ExecutionServer: %s", err)
 	}
-	taskScheduler := priority_task_scheduler.NewPriorityTaskScheduler(env, executor, runnerPool, &priority_task_scheduler.Options{})
+	taskLeaser := task_leaser.NewTaskLeaser(env, executorID, executorHostName)
+	taskScheduler, err := priority_task_scheduler.NewPriorityTaskScheduler(env, executor, runnerPool, taskLeaser, &priority_task_scheduler.Options{})
+	if err != nil {
+		log.Fatalf("Error creating task scheduler: %v", err)
+	}
 	if err := taskScheduler.Start(); err != nil {
 		log.Fatalf("Error starting task scheduler: %v", err)
 	}
+	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "buildbuddy",
+		Subsystem: "remote_execution",
+		Name:      "running_task_progress_seconds",
+		Help:      "Total time, in seconds, that the tasks currently running on this executor have spent executing so far. This approximates the execution progress that would be lost if the executor were shut down, since killed tasks are re-enqueued and restart from scratch.",
+	}, func() float64 {
+		return taskScheduler.TotalRunningTaskExecutionDuration().Seconds()
+	}))
 
-	container.Metrics.Start(rootContext)
 	monitoring.StartMonitoringHandler(env, fmt.Sprintf("%s:%d", *listen, *monitoringPort))
 
 	// Setup SSL for monitoring endpoints (optional).
@@ -279,7 +479,11 @@ func main() {
 	http.Handle("/healthz", env.GetHealthChecker().LivenessHandler())
 	http.Handle("/readyz", env.GetHealthChecker().ReadinessHandler())
 
-	schedulerOpts := &scheduler_client.Options{}
+	schedulerOpts := &scheduler_client.Options{
+		FilecacheMaxSizeBytes: &filecacheSizeBytes,
+		WarmupImages:          warmupImagesForRegistration(),
+		StartTime:             timestamppb.New(executorStartTime),
+	}
 	reg, err := scheduler_client.NewRegistration(env, taskScheduler, executorID, executor.HostID(), schedulerOpts)
 	if err != nil {
 		log.Fatalf("Error initializing executor registration: %s", err)
@@ -302,8 +506,27 @@ func main() {
 		reg.Start(rootContext)
 	}()
 
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", *listen, *port))
+	if err != nil {
+		log.Fatalf("Failed to listen on port %d: %s", *port, err)
+	}
 	go func() {
-		http.ListenAndServe(fmt.Sprintf("%s:%d", *listen, *port), nil)
+		_ = http.Serve(lis, nil)
 	}()
+
 	env.GetHealthChecker().WaitForGracefulShutdown()
+}
+
+func deleteBuildRoot(ctx context.Context, rootDir string) {
+	log.Infof("Cleaning build root dir at %q", rootDir)
+	stop := canary.StartWithLateFn(1*time.Minute, func(timeTaken time.Duration) {
+		log.Infof("Still cleaning build root dir (%s elapsed)", timeTaken)
+	}, func(timeTaken time.Duration) {})
+	defer stop()
+
+	if err := cleanBuildRoot(ctx, rootDir); err != nil {
+		log.Errorf("Error cleaning build root dir %q: %s", rootDir, err)
+	} else {
+		log.Infof("Cleaned build root dir at %q", rootDir)
+	}
 }

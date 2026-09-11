@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -131,13 +132,7 @@ func GetYAMLTypeString(yamlValue any) string {
 	if v, ok := yamlValue.(YAMLTypeStringable); ok {
 		return v.YAMLTypeString()
 	}
-	value := reflect.ValueOf(yamlValue)
-	if value.CanAddr() {
-		if v, ok := value.Addr().Interface().(YAMLTypeStringable); ok {
-			return v.YAMLTypeString()
-		}
-	}
-	t := value.Type()
+	t := reflect.TypeOf(yamlValue)
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
@@ -222,10 +217,8 @@ func (f *Style) Passthrough() bool { return true }
 type redactSecrets struct{}
 
 func (r *redactSecrets) Transform(in any, n *yaml.Node, flg *flag.Flag) (*yaml.Node, error) {
-	if flg != nil {
-		if s, ok := flg.Value.(common.Secretable); ok && s.IsSecret() {
-			return nil, nil
-		}
+	if common.IsSecret(flg) {
+		return nil, nil
 	}
 
 	t := reflect.TypeOf(in)
@@ -235,9 +228,8 @@ func (r *redactSecrets) Transform(in any, n *yaml.Node, flg *flag.Flag) (*yaml.N
 		for i := 0; i < len(n.Content)/2; i++ {
 			contentIndex[n.Content[2*i].Value] = 2*i + 1
 		}
-		for i := 0; i < t.NumField(); i++ {
-			ft := t.Field(i)
-			name := strings.Split(ft.Tag.Get("yaml"), ",")[0]
+		for ft := range t.Fields() {
+			name, _, _ := strings.Cut(ft.Tag.Get("yaml"), ",")
 			if name == "" {
 				name = strings.ToLower(ft.Name)
 			}
@@ -246,7 +238,7 @@ func (r *redactSecrets) Transform(in any, n *yaml.Node, flg *flag.Flag) (*yaml.N
 				// field is not encoded by yaml
 				continue
 			}
-			for _, s := range strings.Split(ft.Tag.Get("config"), ",") {
+			for s := range strings.SplitSeq(ft.Tag.Get("config"), ",") {
 				if s == "secret" {
 					n.Content[idx] = nil
 					break
@@ -322,8 +314,8 @@ func DocumentNode(in any, n *yaml.Node, flg *flag.Flag, opts ...common.DocumentN
 				return DocumentNode(v.Elem().Interface(), n, flg, opts...)
 			} else {
 				exampleOpts := append(filterPassthrough(opts), AppendTypeToLineComment)
-				for i := len(exampleOpts) - 1; i >= 0; i-- {
-					if exampleOpts[i] == RedactSecrets {
+				for i, exampleOpt := range slices.Backward(exampleOpts) {
+					if exampleOpt == RedactSecrets {
 						exampleOpts = append(exampleOpts[:i], exampleOpts[i+1:]...)
 					}
 				}
@@ -349,7 +341,7 @@ func DocumentNode(in any, n *yaml.Node, flg *flag.Flag, opts ...common.DocumentN
 			}
 			for i := 0; i < t.NumField(); i++ {
 				ft := t.Field(i)
-				name := strings.Split(ft.Tag.Get("yaml"), ",")[0]
+				name, _, _ := strings.Cut(ft.Tag.Get("yaml"), ",")
 				if name == "" {
 					name = strings.ToLower(ft.Name)
 				}
@@ -394,8 +386,8 @@ func DocumentNode(in any, n *yaml.Node, flg *flag.Flag, opts ...common.DocumentN
 			}
 			if len(n.Content) == 0 {
 				exampleOpts := append(filterPassthrough(opts), AppendTypeToLineComment)
-				for i := len(exampleOpts) - 1; i >= 0; i-- {
-					if exampleOpts[i] == RedactSecrets {
+				for i, exampleOpt := range slices.Backward(exampleOpts) {
+					if exampleOpt == RedactSecrets {
 						exampleOpts = append(exampleOpts[:i], exampleOpts[i+1:]...)
 					}
 				}
@@ -726,7 +718,7 @@ func PopulateFlagsFromYAMLMap(m map[string]any, node *yaml.Node) error {
 	return populateFlagsFromYAML(m, []string{}, node, setFlags, true)
 }
 
-func populateFlagsFromYAML(a any, prefix []string, node *yaml.Node, setFlags map[string]struct{}, appendSlice bool) error {
+func populateFlagsFromYAML(a any, prefix []string, node *yaml.Node, setFlags map[string]struct{}, accumulate bool) error {
 	if m, ok := a.(map[string]any); ok {
 		i := 0
 		for k, v := range m {
@@ -744,7 +736,7 @@ func populateFlagsFromYAML(a any, prefix []string, node *yaml.Node, setFlags map
 			if _, ok := IgnoreSet[strings.Join(p, ".")]; ok {
 				return nil
 			}
-			if err := populateFlagsFromYAML(v, p, n, setFlags, appendSlice); err != nil {
+			if err := populateFlagsFromYAML(v, p, n, setFlags, accumulate); err != nil {
 				return err
 			}
 		}
@@ -759,12 +751,12 @@ func populateFlagsFromYAML(a any, prefix []string, node *yaml.Node, setFlags map
 	if flg == nil {
 		return nil
 	}
-	return setValueForYAML(common.DefaultFlagSet, flg.Value, name, a, setFlags, appendSlice)
+	return setValueForYAML(common.DefaultFlagSet, flg.Value, name, a, setFlags, accumulate)
 }
 
-func setValueForYAML(flagset *flag.FlagSet, flagValue flag.Value, name string, newValue any, setFlags map[string]struct{}, appendSlice bool, setHooks ...func()) error {
+func setValueForYAML(flagset *flag.FlagSet, flagValue flag.Value, name string, newValue any, setFlags map[string]struct{}, accumulate bool, setHooks ...func()) error {
 	if v, ok := flagValue.(YAMLSetValueHooked); ok {
 		setHooks = append(setHooks, v.YAMLSetValueHook)
 	}
-	return common.SetValueWithCustomIndirectBehavior(common.DefaultFlagSet, flagValue, name, newValue, setFlags, appendSlice, setValueForYAML, setHooks...)
+	return common.SetValueWithCustomIndirectBehavior(common.DefaultFlagSet, flagValue, name, newValue, setFlags, accumulate, setValueForYAML, setHooks...)
 }

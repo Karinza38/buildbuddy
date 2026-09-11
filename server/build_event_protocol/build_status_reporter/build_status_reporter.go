@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/github"
@@ -12,7 +13,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/endpoint_urls/build_buddy_url"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
-	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 
@@ -24,14 +24,16 @@ var (
 )
 
 type BuildStatusReporter struct {
-	baseBBURL                 string
-	env                       environment.Env
-	githubClient              interfaces.GitHubStatusClient
-	buildEventAccumulator     accumulator.Accumulator
-	groups                    map[string]*GroupStatus
-	inFlight                  map[string]bool
-	payloads                  []*github.GithubStatusPayload
-	shouldReportStatusPerTest bool
+	baseBBURL                  string
+	env                        environment.Env
+	githubClient               interfaces.GitHubStatusClient
+	buildEventAccumulator      accumulator.Accumulator
+	groups                     map[string]*GroupStatus
+	inFlight                   map[string]bool
+	payloads                   []*github.GithubStatusPayload
+	shouldReportStatusPerTest  bool
+	shouldReportCommitStatuses bool
+	once                       sync.Once
 }
 
 type GroupStatus struct {
@@ -43,7 +45,7 @@ type GroupStatus struct {
 }
 
 func NewBuildStatusReporter(env environment.Env, buildEventAccumulator accumulator.Accumulator) *BuildStatusReporter {
-	return &BuildStatusReporter{
+	r := &BuildStatusReporter{
 		baseBBURL:                 build_buddy_url.String(),
 		env:                       env,
 		shouldReportStatusPerTest: *statusPerTestTarget,
@@ -51,24 +53,29 @@ func NewBuildStatusReporter(env environment.Env, buildEventAccumulator accumulat
 		payloads:                  make([]*github.GithubStatusPayload, 0),
 		inFlight:                  make(map[string]bool),
 	}
+
+	if env.GetGitHubStatusService() != nil {
+		r.githubClient = env.GetGitHubStatusService().GetStatusClient()
+	}
+	return r
 }
 
 func (r *BuildStatusReporter) SetBaseBuildBuddyURL(url string) {
 	r.baseBBURL = url
 }
 
-func (r *BuildStatusReporter) initGHClient(ctx context.Context) interfaces.GitHubStatusClient {
-	accessToken := ""
-	if workflowID := r.buildEventAccumulator.WorkflowID(); workflowID != "" {
-		if dbh := r.env.GetDBHandle(); dbh != nil {
-			workflow := &tables.Workflow{}
-			if err := dbh.NewQuery(ctx, "build_status_reporter_get_workflow").Raw(
-				`SELECT * from "Workflows" WHERE workflow_id = ?`, workflowID).Take(workflow); err == nil {
-				accessToken = workflow.AccessToken
-			}
+func (r *BuildStatusReporter) isStatusReportingEnabled(ctx context.Context, groupID, repoURL string) bool {
+	r.once.Do(func() {
+		enabled, err := r.githubClient.IsStatusReportingEnabled(ctx, groupID, repoURL)
+		if err != nil {
+			log.CtxInfof(ctx, "Failed to check if GitHub status reporting is enabled: %s", err)
+			return
 		}
-	}
-	return r.env.GetGitHubStatusService().GetStatusClient(accessToken)
+
+		r.shouldReportCommitStatuses = enabled
+	})
+
+	return r.shouldReportCommitStatuses
 }
 
 // ReportStatusForEvent reports a status to GitHub for the event if applicable.
@@ -133,13 +140,27 @@ func (r *BuildStatusReporter) flushPayloadsIfMetadataLoaded(ctx context.Context)
 	if r.env.GetGitHubStatusService() == nil {
 		return
 	}
-	// Don't flush payloads if explicitly disabled in build metadata, or if we
-	// don't yet have the metadata.
-	if !r.buildEventAccumulator.MetadataIsLoaded() || r.buildEventAccumulator.DisableCommitStatusReporting() {
+
+	// If there is no authenticated user (e.g. a self-hosted deployment with no
+	// auth configured), we can still report commit statuses when a hard-coded
+	// github.access_token is configured. Only bail out when status reporting is
+	// not unconditionally enabled, so the webhook/workflow path keeps its group
+	// attribution while the access_token path keeps working. See #12302.
+	userInfo, err := r.env.GetAuthenticator().AuthenticatedUser(ctx)
+	var groupID string
+	if err == nil {
+		groupID = userInfo.GetGroupID()
+	} else if !github.AlwaysEnableStatusReporting() {
+		log.CtxWarningf(ctx, "Failed to get authenticated user: %s", err)
 		return
 	}
-	if r.githubClient == nil {
-		r.githubClient = r.initGHClient(ctx)
+
+	// Don't report statuses if we don't yet have the metadata, it's explicitly
+	// disabled in build metadata, or it's not enabled for this repo.
+	if !r.buildEventAccumulator.MetadataIsLoaded() ||
+		r.buildEventAccumulator.DisableCommitStatusReporting() ||
+		!r.isStatusReportingEnabled(ctx, groupID, r.buildEventAccumulator.Invocation().GetRepoUrl()) {
+		return
 	}
 
 	for _, payload := range r.payloads {
@@ -158,7 +179,7 @@ func (r *BuildStatusReporter) flushPayloadsIfMetadataLoaded(ctx context.Context)
 		}
 		commitSHA := r.buildEventAccumulator.Invocation().GetCommitSha()
 		if ownerRepo != "" && commitSHA != "" {
-			err = r.githubClient.CreateStatus(ctx, ownerRepo, commitSHA, payload)
+			err = r.githubClient.CreateStatus(ctx, groupID, ownerRepo, commitSHA, payload)
 			if err != nil {
 				// Note: using info-level log since this is often due to client
 				// misconfiguration (e.g. user doesn't have BB GitHub app
@@ -264,6 +285,9 @@ func (r *BuildStatusReporter) invocationLabel() string {
 	if r.buildEventAccumulator.ActionName() != "" {
 		return r.buildEventAccumulator.ActionName()
 	}
+	if r.buildEventAccumulator.CommitStatusLabel() != "" {
+		return r.buildEventAccumulator.CommitStatusLabel()
+	}
 
 	command := r.buildEventAccumulator.Invocation().GetCommand()
 	pattern := r.buildEventAccumulator.Pattern()
@@ -288,7 +312,7 @@ func (r *BuildStatusReporter) targetURL(label string) string {
 
 func (r *BuildStatusReporter) initializeGroups(testGroups string) {
 	r.groups = make(map[string]*GroupStatus)
-	for _, group := range strings.Split(testGroups, ",") {
+	for group := range strings.SplitSeq(testGroups, ",") {
 		r.groups[group] = &GroupStatus{
 			name: group,
 		}

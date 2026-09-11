@@ -1,4 +1,6 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+package(default_visibility = ["//cli:__subpackages__"])
 
 go_library(
     name = "sidecar",
@@ -17,4 +19,16 @@ go_library(
     ],
 )
 
-package(default_visibility = ["//cli:__subpackages__"])
+go_test(
+    name = "sidecar_test",
+    size = "small",
+    srcs = ["sidecar_test.go"],
+    embed = [":sidecar"],
+    deps = [
+        "//cli/arg",
+        "//cli/parser",
+        "//cli/parser/test_data",
+        "//cli/workspace",
+        "@com_github_stretchr_testify//require",
+    ],
+)

@@ -5,9 +5,10 @@ package api.v1;
 import "proto/api/v1/file.proto";
 
 // Request passed into GetInvocation.
-// Next tag: 5
+// Next tag: 7
 message GetInvocationRequest {
-  // The selector defining which invocations(s) to retrieve.
+  // Required: The selector object defining which invocations(s) to retrieve.
+  // The selector must specify either `invocation_id` or `commit_sha`.
   InvocationSelector selector = 1;
 
   // If true, includes additional build metadata.
@@ -15,6 +16,13 @@ message GetInvocationRequest {
 
   // If true, include artifacts attached to the invocation.
   bool include_artifacts = 4;
+
+  // If true, include build tool logs, such as the timing profile and compact
+  // execution log if available.
+  bool include_build_tool_logs = 6;
+
+  // If true, include child invocations (if this invocation was a workflow).
+  bool include_child_invocations = 5;
 
   // The next_page_token value returned from a previous request, if any.
   string page_token = 3;
@@ -98,8 +106,16 @@ message Invocation {
   // Only included if include_artifacts = true.
   repeated File artifacts = 24;
 
+  // Build tool logs, such as timing profiles and compact execution logs. Only
+  // included if include_build_tool_logs = true.
+  repeated File build_tool_logs = 27;
+
   // The state of the build event stream for the invocation.
   InvocationStatus invocationStatus = 25;
+
+  // Any invocations spawned during this invocation. Only included if
+  // include_child_invocations = true.
+  repeated Id child_invocations = 26;
 }
 
 // Key value pair containing invocation metadata.
@@ -110,8 +126,6 @@ message InvocationMetadata {
 
 // The selector used to specify which invocations to return.
 message InvocationSelector {
-  // One invocation_id or commit_sha is required.
-
   // Optional: The Invocation ID.
   // Return only the invocation with this invocation ID.
   string invocation_id = 1;

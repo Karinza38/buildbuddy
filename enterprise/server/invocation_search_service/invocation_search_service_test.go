@@ -11,6 +11,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/perms"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -113,7 +114,11 @@ func setUpFakeData(ctx context.Context, env *real_environment.RealEnv, t *testin
 }
 
 func setUpDB(ctx context.Context, env *real_environment.RealEnv, t *testing.T) *testauth.TestAuthenticator {
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	// Disable async invocation batch inserts.
+	flags.Set(t, "olap_database.invocation_batch_insert_interval", 0)
+	flags.Set(t, "olap_database.async_insert", true)
+
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 	setUpFakeData(ctx, env, t)
 	return ta
@@ -154,6 +159,92 @@ func TestNonOLAPQuery(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{getUUIDString(3)}, getInvocationIDSlice(rsp))
+}
+
+func TestGroupIDDefaultsToAuthenticatedGroupID(t *testing.T) {
+	env := testenv.GetTestEnv(t)
+	ta := setUpDB(t.Context(), env, t)
+
+	service := invocation_search_service.NewInvocationSearchService(env, env.GetDBHandle(), env.GetOLAPDBHandle())
+
+	for _, tc := range []struct {
+		name                  string
+		user                  string
+		query                 *inpb.InvocationQuery
+		expectedInvocationIDs []string
+		expectedError         func(err error) bool
+	}{
+		{
+			name:  "nil query",
+			user:  "US1",
+			query: nil,
+			expectedInvocationIDs: []string{
+				getUUIDString(0),
+				getUUIDString(1),
+				getUUIDString(2),
+				getUUIDString(3),
+				// Note: invocation 00..04 is not owned by US1's group
+				getUUIDString(5),
+				getUUIDString(6),
+				getUUIDString(7),
+			},
+		},
+		{
+			name:  "empty query",
+			user:  "US1",
+			query: &inpb.InvocationQuery{},
+			expectedInvocationIDs: []string{
+				getUUIDString(0),
+				getUUIDString(1),
+				getUUIDString(2),
+				getUUIDString(3),
+				getUUIDString(5),
+				getUUIDString(6),
+				getUUIDString(7),
+			},
+		},
+		{
+			name:  "nonempty query",
+			user:  "US1",
+			query: &inpb.InvocationQuery{User: "jdhollen"},
+			expectedInvocationIDs: []string{
+				getUUIDString(0),
+				getUUIDString(1),
+				getUUIDString(2),
+				getUUIDString(5),
+				getUUIDString(6),
+				getUUIDString(7),
+			},
+		},
+		{
+			name:          "unauthenticated",
+			user:          "",
+			query:         nil,
+			expectedError: status.IsInternalError,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tc.user != "" {
+				var err error
+				ctx, err = ta.WithAuthenticatedUser(t.Context(), tc.user)
+				require.NoError(t, err)
+			}
+
+			req := &inpb.SearchInvocationRequest{
+				RequestContext: &ctxpb.RequestContext{GroupId: "GR1"},
+				Query:          tc.query,
+			}
+			rsp, err := service.QueryInvocations(ctx, req)
+
+			if tc.expectedError != nil {
+				require.True(t, tc.expectedError(err))
+			} else {
+				require.NoError(t, err)
+				assert.ElementsMatch(t, tc.expectedInvocationIDs, getInvocationIDSlice(rsp))
+			}
+		})
+	}
 }
 
 func TestBlendedOLAPQuery(t *testing.T) {

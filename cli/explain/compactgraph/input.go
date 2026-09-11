@@ -1,19 +1,19 @@
 package compactgraph
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"iter"
+	"maps"
 	"path"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/cli/log"
 	"github.com/buildbuddy-io/buildbuddy/proto/spawn"
-	"golang.org/x/exp/maps"
 )
 
 type Hash = []byte
@@ -251,9 +251,8 @@ func (s *InputSet) Flatten() []Input {
 		}
 	}
 
-	inputs := maps.Keys(inputsSet)
-	sort.Slice(inputs, func(i, j int) bool {
-		return inputs[i].Path() < inputs[j].Path()
+	inputs := slices.SortedFunc(maps.Keys(inputsSet), func(i, j Input) int {
+		return cmp.Compare(i.Path(), j.Path())
 	})
 	return inputs
 }
@@ -262,20 +261,35 @@ func (s *InputSet) String() string {
 	return fmt.Sprintf("set:(direct=%v, transitive=%v)", s.DirectEntries, s.TransitiveSets)
 }
 
-func protoToInputSet(s *spawn.ExecLogEntry_InputSet, previousInputs map[uint32]Input) *InputSet {
+func newInputSet(directEntries []Input, transitiveSets []*InputSet) *InputSet {
 	pathHash := sha256.New()
 	pathHash.Write([]byte{transitivePaths})
 
 	contentHash := sha256.New()
 	contentHash.Write([]byte{inputSetContent})
 
+	for _, input := range directEntries {
+		pathHash.Write(input.ShallowPathHash())
+		contentHash.Write(input.ShallowContentHash())
+	}
+	for _, set := range transitiveSets {
+		pathHash.Write(set.ShallowPathHash())
+		contentHash.Write(set.ShallowContentHash())
+	}
+
+	return &InputSet{
+		DirectEntries:      directEntries,
+		TransitiveSets:     transitiveSets,
+		shallowPathHash:    pathHash.Sum(nil),
+		shallowContentHash: contentHash.Sum(nil),
+	}
+}
+
+func protoToInputSet(s *spawn.ExecLogEntry_InputSet, previousInputs map[uint32]Input) *InputSet {
 	directInputs := make([]Input, 0, len(s.InputIds)+len(s.FileIds)+len(s.DirectoryIds)+len(s.UnresolvedSymlinkIds))
 	addInputs := func(ids []uint32) {
 		for _, id := range ids {
-			input := previousInputs[id]
-			directInputs = append(directInputs, input)
-			pathHash.Write(input.ShallowPathHash())
-			contentHash.Write(input.ShallowContentHash())
+			directInputs = append(directInputs, previousInputs[id])
 		}
 	}
 	addInputs(s.InputIds)
@@ -285,18 +299,10 @@ func protoToInputSet(s *spawn.ExecLogEntry_InputSet, previousInputs map[uint32]I
 
 	transitiveSets := make([]*InputSet, 0, len(s.TransitiveSetIds))
 	for _, id := range s.TransitiveSetIds {
-		set := previousInputs[id].(*InputSet)
-		transitiveSets = append(transitiveSets, set)
-		pathHash.Write(set.ShallowPathHash())
-		contentHash.Write(set.ShallowContentHash())
+		transitiveSets = append(transitiveSets, previousInputs[id].(*InputSet))
 	}
 
-	return &InputSet{
-		DirectEntries:      directInputs,
-		TransitiveSets:     transitiveSets,
-		shallowPathHash:    pathHash.Sum(nil),
-		shallowContentHash: contentHash.Sum(nil),
-	}
+	return newInputSet(directInputs, transitiveSets)
 }
 
 type SymlinkEntrySet struct {
@@ -345,8 +351,7 @@ func protoToSymlinkEntrySet(s *spawn.ExecLogEntry_SymlinkEntrySet, previousInput
 	contentHash := sha256.New()
 	contentHash.Write([]byte{symlinkEntrySetContent})
 
-	paths := maps.Keys(s.DirectEntries)
-	slices.Sort(paths)
+	paths := slices.Sorted(maps.Keys(s.DirectEntries))
 	directEntries := make(map[string]Input, len(paths))
 	for _, p := range paths {
 		directEntries[p] = previousInputs[s.DirectEntries[p]]
@@ -376,6 +381,7 @@ type RunfilesTree struct {
 	Symlinks            *SymlinkEntrySet
 	RootSymlinks        *SymlinkEntrySet
 	RepoMappingManifest *File
+	EmptyFiles          []string
 
 	path               string
 	shallowPathHash    Hash
@@ -396,7 +402,22 @@ func (r *RunfilesTree) String() string {
 		r.path, r.Artifacts, r.Symlinks, r.RootSymlinks, r.RepoMappingManifest)
 }
 
-func (r *RunfilesTree) ComputeMapping() map[string]Input {
+var emptyDigest = map[string]*spawn.Digest{
+	"SHA-1": {
+		Hash:             "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+		HashFunctionName: "SHA-1",
+	},
+	"SHA-256": {
+		Hash:             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		HashFunctionName: "SHA-256",
+	},
+	"BLAKE3": {
+		Hash:             "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+		HashFunctionName: "BLAKE3",
+	},
+}
+
+func (r *RunfilesTree) ComputeMapping(workspaceRunfilesDirectory, hashFunction string) map[string]Input {
 	m := make(map[string]Input)
 	// Reconstruct runfiles with the same order of precedence as Bazel would (see spawn.proto):
 	// 1. Symlinks.
@@ -410,27 +431,28 @@ func (r *RunfilesTree) ComputeMapping() map[string]Input {
 	// 2. Artifacts at canonical locations.
 	// Later artifacts override earlier ones, but only after removing duplicates. Bazel internally uses a NestedSet,
 	// which deduplicates artifacts and then maps them to their potentially duplicate runfiles paths).
-	for runfilesPath, artifact := range iterateAsRunfiles(r.Artifacts, newDuplicateFilter()) {
-		m[runfilesPath] = artifact
+	maps.Insert(m, iterateAsRunfiles(r.Artifacts, newDuplicateFilter()))
+	// 3. Empty files.
+	for _, emptyFilePath := range r.EmptyFiles {
+		// Empty file paths as contained in the log are not prefixed with the workspace runfiles directory.
+		m[path.Join(workspaceRunfilesDirectory, emptyFilePath)] = protoToFile(&spawn.ExecLogEntry_File{
+			Path:   emptyFilePath,
+			Digest: emptyDigest[hashFunction],
+		}, hashFunction)
 	}
-	// 3. Empty files, if generated at all, are a pure function of the other paths and thus don't need to considered
-	// when diffing runfiles trees.
 	// 4. Root symlinks.
-	for runfilesPath, artifact := range iterateAsRunfiles(r.RootSymlinks, noFilter) {
-		m[runfilesPath] = artifact
-	}
+	maps.Insert(m, iterateAsRunfiles(r.RootSymlinks, noFilter))
 	// 5. The repo mapping manifest at its fixed location.
 	if r.RepoMappingManifest != nil {
 		m["_repo_mapping"] = r.RepoMappingManifest
 	}
-	// 6. The existence of the <workspace runfiles directory>/.runfile file, similar to empty files, is a pure function
-	// of the other paths, so just as for empty files, it doesn't need to be considered here.
+	// 6. The existence of the <workspace runfiles directory>/.runfile file, is a pure function, so it doesn't need to
+	// be considered here.
 
 	// Populate the exact content hash so that consumers don't need to recompute the mapping to determine whether the
 	// tree changed.
 	contentHash := sha256.New()
-	sortedRunfilesPaths := maps.Keys(m)
-	sort.Strings(sortedRunfilesPaths)
+	sortedRunfilesPaths := slices.Sorted(maps.Keys(m))
 	for _, p := range sortedRunfilesPaths {
 		_ = binary.Write(contentHash, binary.LittleEndian, uint64(len(p)))
 		contentHash.Write([]byte(p))
@@ -473,7 +495,7 @@ func (o *OpaqueRunfilesDirectory) String() string {
 	return fmt.Sprintf("runfilesDirectory:%s", o.runfilesTree.Path())
 }
 
-func protoToRunfilesTree(r *spawn.ExecLogEntry_RunfilesTree, previousInputs map[uint32]Input, hashFunctionName string) *RunfilesTree {
+func protoToRunfilesTree(r *spawn.ExecLogEntry_RunfilesTree, previousInputs map[uint32]Input, hashFunctionName string, interner func(string) string) *RunfilesTree {
 	pathHash := sha256.New()
 	pathHash.Write([]byte{directPath})
 	pathHash.Write([]byte(r.Path))
@@ -509,12 +531,24 @@ func protoToRunfilesTree(r *spawn.ExecLogEntry_RunfilesTree, previousInputs map[
 		contentHash.Write(repoMappingManifest.ShallowContentHash())
 	}
 
+	_ = binary.Write(contentHash, binary.LittleEndian, uint64(len(r.EmptyFiles)))
+	internedEmptyFiles := make([]string, 0, len(r.EmptyFiles))
+	for _, emptyFilePath := range r.EmptyFiles {
+		_ = binary.Write(contentHash, binary.LittleEndian, uint64(len(emptyFilePath)))
+		contentHash.Write([]byte(emptyFilePath))
+		// Bazel emits an empty file for each parent of a directory with a Python file in it. This typically results in
+		// many duplicated paths across Python runfiles trees. Interning them reduces the retained memory to be roughly
+		// linear in the compressed size of the exec log.
+		internedEmptyFiles = append(internedEmptyFiles, interner(emptyFilePath))
+	}
+
 	return &RunfilesTree{
 		path:                r.Path,
 		Artifacts:           artifacts,
 		Symlinks:            symlinks,
 		RootSymlinks:        rootSymlinks,
 		RepoMappingManifest: repoMappingManifest,
+		EmptyFiles:          internedEmptyFiles,
 		shallowPathHash:     pathHash.Sum(nil),
 		shallowContentHash:  contentHash.Sum(nil),
 	}
@@ -537,21 +571,51 @@ func (i InvalidOutput) Proto() any               { return i.path }
 func (i InvalidOutput) String() string           { return fmt.Sprintf("invalid:%s", i.path) }
 
 type Spawn struct {
-	Mnemonic    string
-	TargetLabel string
-	Args        []string
-	ParamFiles  *InputSet
-	Env         map[string]string
-	Inputs      *InputSet
-	Tools       *InputSet
-	Outputs     []Input
-	ExitCode    int32
+	Mnemonic       string
+	TargetLabel    string
+	Args           []string
+	ParamFiles     *InputSet
+	Env            map[string]string
+	ExecProperties map[string]string
+	Inputs         *InputSet
+	Tools          *InputSet
+	Outputs        []Input
+	ExitCode       int32
 }
 
 const testRunnerXmlGeneration = "TestRunner (XML generation)"
 const testRunnerCoverageCollection = "TestRunner (coverage collection)"
 
-func protoToSpawn(s *spawn.ExecLogEntry_Spawn, previousInputs map[uint32]Input) (*Spawn, []string) {
+// Names of environment variables whose set of values is expected to be closer
+// to O(n) than O(1) in the number of spawns, mostly due to the values being
+// dependent on the spawn's primary output path.
+var volatileEnvVars = map[string]struct{}{
+	"COVERAGE_DIR":                            {},
+	"COVERAGE_MANIFEST":                       {},
+	"COVERAGE_OUTPUT_FILE":                    {},
+	"JAVA_RUNFILES":                           {},
+	"PYTHON_RUNFILES":                         {},
+	"RUNFILES_DIR":                            {},
+	"TEST_BINARY":                             {},
+	"TEST_INFRASTRUCTURE_FAILURE_FILE":        {},
+	"TEST_LOGSPLITTER_OUTPUT_FILE":            {},
+	"TEST_NAME":                               {},
+	"TEST_PREMATURE_EXIT_FILE":                {},
+	"TEST_SHARD_STATUS_FILE":                  {},
+	"TEST_SRCDIR":                             {},
+	"TEST_TARGET":                             {},
+	"TEST_TMPDIR":                             {},
+	"TEST_UNDECLARED_OUTPUTS_ANNOTATIONS":     {},
+	"TEST_UNDECLARED_OUTPUTS_ANNOTATIONS_DIR": {},
+	"TEST_UNDECLARED_OUTPUTS_DIR":             {},
+	"TEST_UNDECLARED_OUTPUTS_MANIFEST":        {},
+	"TEST_UNDECLARED_OUTPUTS_ZIP":             {},
+	"TEST_UNUSED_RUNFILES_LOG_FILE":           {},
+	"TEST_WARNINGS_OUTPUT_FILE":               {},
+	"XML_OUTPUT_FILE":                         {},
+}
+
+func protoToSpawn(s *spawn.ExecLogEntry_Spawn, previousInputs map[uint32]Input, interner func(string) string) (*Spawn, []string) {
 	outputs := make([]Input, 0, len(s.Outputs))
 	outputPaths := make([]string, 0, len(s.Outputs))
 	for _, outputProto := range s.Outputs {
@@ -605,9 +669,22 @@ func protoToSpawn(s *spawn.ExecLogEntry_Spawn, previousInputs map[uint32]Input) 
 			log.Fatalf("test.log output from %s %s", s.Mnemonic, s.TargetLabel)
 		}
 	}
+	// Environment variable names are typically repeated across spawns, but some
+	// values are not.
 	env := make(map[string]string, len(s.EnvVars))
 	for _, kv := range s.EnvVars {
-		env[kv.Name] = kv.Value
+		var value string
+		if _, volatile := volatileEnvVars[kv.Name]; volatile {
+			value = kv.Value
+		} else {
+			value = interner(kv.Value)
+		}
+		env[interner(kv.Name)] = value
+	}
+	// Exec property keys and values are typically repeated across spawns.
+	execProperties := make(map[string]string, len(s.Platform.GetProperties()))
+	for _, kv := range s.Platform.GetProperties() {
+		execProperties[interner(kv.Name)] = interner(kv.Value)
 	}
 	inputs := previousInputs[s.InputSetId].(*InputSet)
 	paramFiles := drainParamFiles(inputs)
@@ -634,15 +711,16 @@ func protoToSpawn(s *spawn.ExecLogEntry_Spawn, previousInputs map[uint32]Input) 
 	}
 
 	return &Spawn{
-		Mnemonic:    mnemonic,
-		TargetLabel: s.TargetLabel,
-		Args:        s.Args,
-		ParamFiles:  paramFiles,
-		Env:         env,
-		Inputs:      inputs,
-		Tools:       previousInputs[s.ToolSetId].(*InputSet),
-		Outputs:     outputs,
-		ExitCode:    s.ExitCode,
+		Mnemonic:       mnemonic,
+		TargetLabel:    s.TargetLabel,
+		Args:           s.Args,
+		ParamFiles:     paramFiles,
+		Env:            env,
+		ExecProperties: execProperties,
+		Inputs:         inputs,
+		Tools:          previousInputs[s.ToolSetId].(*InputSet),
+		Outputs:        outputs,
+		ExitCode:       s.ExitCode,
 	}, outputPaths
 }
 
@@ -670,12 +748,22 @@ func drainParamFiles(set *InputSet) *InputSet {
 	if len(paramFiles) == 0 {
 		return emptyInputSet
 	}
-	set.DirectEntries = nonParamFiles
-	return &InputSet{DirectEntries: paramFiles}
+	*set = *newInputSet(nonParamFiles, set.TransitiveSets)
+	return newInputSet(paramFiles, nil)
 }
 
 func isSourcePath(path string) bool {
 	return !strings.HasPrefix(path, "bazel-out/")
+}
+
+// Exec-configured output paths look like:
+// bazel-out/darwin_arm64-opt-exec-ST-d57f47055a04/bin/pkg/foo
+// bazel-out/my_platform-opt-exec/bin/pkg/foo
+var execOutputRegexp = regexp.MustCompile("bazel-out/[^/]+-exec[-/].*")
+
+// Whether the given path is an output path of an artifact built in the exec configuration.
+func isExecOutputPath(path string) bool {
+	return execOutputRegexp.MatchString(path)
 }
 
 func computeRunfilesPath(input Input) string {
@@ -749,8 +837,10 @@ func iterateAsRunfiles(s depset, filter InputFilter) RunfilesSeq {
 // reverse order (generators can't).
 func depsetsBackward[T depset](depsets []T) DepsetSeq {
 	return func(yield func(depset) bool) {
-		for i := len(depsets) - 1; i >= 0; i-- {
-			if !yield(depsets[i]) {
+		// A nested slices.Backward iterator can allocate when this helper is
+		// inlined into a method returning DepsetSeq. Keep a direct countdown.
+		for i := len(depsets); i > 0; i-- {
+			if !yield(depsets[i-1]) {
 				return
 			}
 		}

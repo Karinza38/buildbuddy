@@ -1,9 +1,12 @@
 package explain
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -13,31 +16,52 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/cli/arg"
 	"github.com/buildbuddy-io/buildbuddy/cli/explain/compactgraph"
+	"github.com/buildbuddy-io/buildbuddy/cli/flaghistory"
 	"github.com/buildbuddy-io/buildbuddy/cli/log"
+	"github.com/buildbuddy-io/buildbuddy/cli/login"
+	"github.com/buildbuddy-io/buildbuddy/cli/util/download"
 	"github.com/buildbuddy-io/buildbuddy/proto/spawn"
 	"github.com/buildbuddy-io/buildbuddy/proto/spawn_diff"
-	"golang.org/x/exp/maps"
+	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
+	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
+	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
+	bbpb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
+	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	gocmp "github.com/google/go-cmp/cmp"
 )
 
 const (
 	explainCmdUsage = `
-usage: bb explain --old <old compact execution log> --new <new compact execution log> [--verbose]
+usage: bb explain [--old {FILE | INVOCATION_ID}] [--new {FILE | INVOCATION_ID}] [--output_format {text|json|proto}] [--nondeterministic_only]
 
-Displays a human-readable, structural diff of two compact execution logs.
+Displays a human-readable, structural diff of two compact execution logs, either
+obtained from the given invocations or located at the given file paths.
 
-Use the --experimental_execution_log_compact_file flag to have Bazel produce a
-compact execution log.
+If --new isn't specified, the most recent build performed with the bb CLI is
+used as the "new" log. If --old also isn't specified, the second most recent
+build is used as the "old" log.
+
+Use the --execution_log_compact_file flag to have Bazel produce a compact
+execution log and upload it to the BuildBuddy BES backend.
+
+Pass --nondeterministic_only to restrict the output to non-deterministic spawns,
+i.e. spawns whose outputs or exit code changed even though their inputs didn't.
+
+Output formats:
+  text   Unstructured output (default)
+  json   Structured output as JSON
+  proto  Structured output as binary proto
 `
 )
 
 type MapFlag map[string]string
 
 func (m MapFlag) String() string {
-	keys := maps.Keys(m)
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(m))
 	var parts []string
 	for _, k := range keys {
 		parts = append(parts, fmt.Sprintf("%s=%s", k, m[k]))
@@ -58,10 +82,15 @@ func (m MapFlag) Set(s string) error {
 }
 
 var (
-	explainCmd = flag.NewFlagSet("explain", flag.ContinueOnError)
-	oldPath    = explainCmd.String("old", "", "Path to a compact execution log to consider as the baseline for the diff.")
-	newPath    = explainCmd.String("new", "", "Path to a compact execution log to compare against the baseline.")
-	verbose    = explainCmd.Bool("verbose", false, "Print more detailed execution information.")
+	explainCmd       = flag.NewFlagSet("explain", flag.ContinueOnError)
+	Flags            = explainCmd
+	oldLog           = explainCmd.String("old", "", "Path to a compact execution log or invocation ID of a build to consider as the baseline for the diff.")
+	newLog           = explainCmd.String("new", "", "Path to a compact execution log or invocation ID of a build to compare against the baseline.")
+	verbose          = explainCmd.Bool("verbose", false, "Print more detailed execution information.")
+	apiTarget        = explainCmd.String("target", "", "The API target to use for fetching logs instead of the last --bes_backend.")
+	httpTarget       = explainCmd.String("url", login.DefaultHTTPTarget, "The BuildBuddy web URL to use for downloading the execution log.")
+	outputFormat     = explainCmd.String("output_format", "text", "Output format: text, json, or proto.")
+	nondeterministic = explainCmd.Bool("nondeterministic_only", false, "Only show non-deterministic spawns, i.e. spawns whose outputs or exit code changed even though their inputs didn't.")
 
 	profilePaths = make(MapFlag)
 )
@@ -69,33 +98,75 @@ var (
 func HandleExplain(args []string) (int, error) {
 	explainCmd.Var(profilePaths, "profile", "Path that a CPU profile should be written to.")
 	if err := arg.ParseFlagSet(explainCmd, args); err != nil {
-		if err != flag.ErrHelp {
+		if !errors.Is(err, flag.ErrHelp) {
 			log.Printf("Failed to parse flags: %s", err)
 		}
+		log.Print(explainCmdUsage)
+		return 1, nil
+	}
+	if len(explainCmd.Args()) > 0 {
 		log.Print(explainCmdUsage)
 		return 1, nil
 	}
 	if profilePaths["cpu"] != "" {
 		f, err := os.Create(profilePaths["cpu"])
 		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
+			return -1, fmt.Errorf("could not create CPU profile: %v", err)
 		}
 		defer f.Close()
 		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
+			return -1, fmt.Errorf("could not start CPU profile: %v", err)
 		}
 		defer pprof.StopCPUProfile()
 	}
-	if *oldPath == "" || *newPath == "" {
+	if *newLog == "" {
+		newId, err := flaghistory.GetPreviousFlag(flaghistory.InvocationIDFlagName)
+		if err != nil {
+			return -1, fmt.Errorf("could not get invocation ID of the last build, please specify --new: %v", err)
+		}
+		if newId == "" {
+			return -1, fmt.Errorf("no previous build to compare against, please specify --new")
+		}
+		*newLog = newId
+		if *oldLog == "" {
+			oldId, err := flaghistory.GetNthPreviousFlag(flaghistory.InvocationIDFlagName, 2)
+			if err != nil {
+				return -1, fmt.Errorf("could not get invocation ID of the build before the last, please specify --old: %v", err)
+			}
+			if oldId == "" {
+				return -1, fmt.Errorf("no previous build to compare against, please specify --old")
+			}
+			*oldLog = oldId
+		}
+	}
+	if *oldLog == "" || *newLog == "" {
 		log.Print(explainCmdUsage)
 		return 1, nil
 	}
 
-	spawnDiffs, err := diff(*oldPath, *newPath)
+	diffResult, err := Diff(*oldLog, *newLog, *nondeterministic)
 	if err != nil {
 		return -1, err
 	}
-	writeSpawnDiffs(os.Stdout, spawnDiffs)
+	switch *outputFormat {
+	case "text":
+		WriteText(os.Stdout, diffResult, *verbose)
+	case "json":
+		b, err := protojson.MarshalOptions{Multiline: true, UseProtoNames: true}.Marshal(diffResult)
+		if err != nil {
+			return -1, fmt.Errorf("failed to marshal diff result as JSON: %v", err)
+		}
+		_, _ = os.Stdout.Write(b)
+		_, _ = fmt.Fprintln(os.Stdout)
+	case "proto":
+		b, err := proto.Marshal(diffResult)
+		if err != nil {
+			return -1, fmt.Errorf("failed to marshal diff result as proto: %v", err)
+		}
+		_, _ = os.Stdout.Write(b)
+	default:
+		return 1, fmt.Errorf("unknown --output_format %q: must be text, json, or proto", *outputFormat)
+	}
 
 	for profile, p := range profilePaths {
 		if profile == "cpu" {
@@ -103,7 +174,7 @@ func HandleExplain(args []string) (int, error) {
 		}
 		f, err := os.Create(p)
 		if err != nil {
-			log.Fatalf("could not create %s profile: %s", profile, err)
+			return -1, fmt.Errorf("could not create %s profile: %v", profile, err)
 		}
 		defer f.Close()
 		if profile == "heap" || profile == "alloc" {
@@ -111,104 +182,231 @@ func HandleExplain(args []string) (int, error) {
 			runtime.GC()
 		}
 		if err := pprof.Lookup(profile).WriteTo(f, 0); err != nil {
-			log.Fatalf("could not write %s profile: %s", profile, err)
+			return -1, fmt.Errorf("could not write %s profile: %v", profile, err)
 		}
-		f.Close()
 	}
 	return 0, nil
 }
 
-func diff(oldPath, newPath string) ([]*spawn_diff.SpawnDiff, error) {
+// Diff returns a structural diff of two compact execution logs. If
+// nondeterministicOnly is set, the diff is reduced to the spawns that represent
+// genuine non-determinism (see filterNondeterministicSpawns).
+func Diff(oldPath, newPath string, nondeterministicOnly bool) (*spawn_diff.DiffResult, error) {
+	oldSource, err := openLog(oldPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open old log: %v", err)
+	}
+	defer oldSource.Close()
+	newSource, err := openLog(newPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open new log: %v", err)
+	}
+	defer newSource.Close()
 	readsEG := errgroup.Group{}
 	var oldGraph *compactgraph.CompactGraph
 	readsEG.Go(func() (err error) {
-		oldGraph, err = readGraph(oldPath)
+		oldGraph, err = compactgraph.ReadCompactLog(oldSource)
 		return err
 	})
 	var newGraph *compactgraph.CompactGraph
 	readsEG.Go(func() (err error) {
-		newGraph, err = readGraph(newPath)
+		newGraph, err = compactgraph.ReadCompactLog(newSource)
 		return err
 	})
 	if err := readsEG.Wait(); err != nil {
 		return nil, err
 	}
-	return compactgraph.Diff(oldGraph, newGraph)
-}
-
-func readGraph(path string) (*compactgraph.CompactGraph, error) {
-	f, err := os.Open(path)
+	result, err := compactgraph.Diff(oldGraph, newGraph)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return compactgraph.ReadCompactLog(f)
+	if nondeterministicOnly {
+		result.SpawnDiffs = filterNondeterministicSpawns(result.SpawnDiffs)
+	}
+	return result, nil
 }
 
-func writeSpawnDiffs(w io.Writer, diffs []*spawn_diff.SpawnDiff) {
+// filterNondeterministicSpawns reduces the diff to the modified spawns that
+// represent genuine non-determinism, i.e. whose outputs or exit code changed
+// even though their inputs didn't (see isNondeterministic). Spawns whose
+// non-determinism is expected (e.g. timestamps in test outputs) are dropped.
+func filterNondeterministicSpawns(diffs []*spawn_diff.SpawnDiff) []*spawn_diff.SpawnDiff {
+	var filtered []*spawn_diff.SpawnDiff
+	for _, d := range diffs {
+		if d.GetModified().GetExpected() {
+			continue
+		}
+		if isNondeterministic(d) {
+			filtered = append(filtered, d)
+		}
+	}
+	return filtered
+}
+
+// isNondeterministic reports whether a modified spawn diff records a change in
+// output contents (non-hermetic outputs) or exit code (flaky action) without a
+// corresponding change in inputs.
+func isNondeterministic(d *spawn_diff.SpawnDiff) bool {
+	for _, sd := range d.GetModified().GetDiffs() {
+		switch sd.Diff.(type) {
+		case *spawn_diff.Diff_OutputContents, *spawn_diff.Diff_ExitCode:
+			return true
+		}
+	}
+	return false
+}
+
+func openLog(pathOrId string) (io.ReadCloser, error) {
+	f, err := os.Open(pathOrId)
+	if err == nil {
+		return f, nil
+	} else if !os.IsNotExist(err) || !uuid.Pattern.MatchString(pathOrId) {
+		return nil, err
+	}
+	matches := uuid.Pattern.FindStringSubmatch(pathOrId)
+	invocationId := matches[1]
+
+	ctx := context.Background()
+	target, err := download.ResolveTarget(*apiTarget)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := grpc_client.DialSimple(target)
+	if err != nil {
+		return nil, err
+	}
+	bbClient := bbpb.NewBuildBuddyServiceClient(conn)
+
+	// Avoid reading the entire log into memory at once.
+	in, out := io.Pipe()
+	go func() {
+		err := download.GetInvocationFile(ctx, bbClient, out, *httpTarget, invocationId, "execution log", findExecutionLog)
+		conn.Close()
+		out.CloseWithError(err)
+	}()
+	return in, nil
+}
+
+func findExecutionLog(inv *inpb.Invocation) *bespb.File {
+	for _, event := range inv.GetEvent() {
+		for _, file := range event.GetBuildEvent().GetBuildToolLogs().GetLog() {
+			if file.Name == "execution_log.binpb.zst" {
+				return file
+			}
+		}
+	}
+	return nil
+}
+
+func writeHeader(w io.Writer, oldInvocationId, newInvocationId string) {
+	besResultsUrl, err := flaghistory.GetPreviousFlag(flaghistory.BesResultsUrlFlagName)
+	if err != nil {
+		besResultsUrl = ""
+	}
+	if oldInvocationId != "" {
+		_, _ = fmt.Fprintf(w, "old invocation: %s%s\n", besResultsUrl, oldInvocationId)
+	}
+	if newInvocationId != "" {
+		_, _ = fmt.Fprintf(w, "new invocation: %s%s\n", besResultsUrl, newInvocationId)
+	}
+	if oldInvocationId != "" || newInvocationId != "" {
+		_, _ = fmt.Fprintln(w)
+	}
+}
+
+const (
+	initialState = iota
+	oldOnlyState
+	newOnlyState
+	modifiedState
+	finalState
+)
+
+// WriteText writes a human-readable diff result.
+func WriteText(w io.Writer, diffResult *spawn_diff.DiffResult, verbose bool) {
+	writeHeader(w, diffResult.OldInvocationId, diffResult.NewInvocationId)
+	writeSpawnDiffs(w, diffResult.SpawnDiffs, verbose)
+}
+
+func writeSpawnDiffs(w io.Writer, diffs []*spawn_diff.SpawnDiff, verbose bool) {
 	// Diffs come in the order "old only", "new only", then "modified".
 	var oldOnly, newOnly map[string]uint32
-	for _, d := range diffs {
-		switch td := d.Diff.(type) {
+	previousState := initialState
+	// Append a nil diff as a sentinel to ensure the final state is processed.
+	for _, d := range append(diffs, nil) {
+		var currentState int
+		switch d.GetDiff().(type) {
 		case *spawn_diff.SpawnDiff_OldOnly:
-			if oldOnly == nil {
+			currentState = oldOnlyState
+		case *spawn_diff.SpawnDiff_NewOnly:
+			currentState = newOnlyState
+		case *spawn_diff.SpawnDiff_Modified:
+			currentState = modifiedState
+		case nil:
+			currentState = finalState
+		}
+		if currentState != previousState {
+			switch previousState {
+			case oldOnlyState:
+				if len(oldOnly) > 0 {
+					if verbose {
+						_, _ = fmt.Fprintln(w, "\nold only (transitive executions):")
+					} else {
+						_, _ = fmt.Fprintln(w, "old only (pass --verbose to see details):")
+					}
+					writeMnemonicCounts(w, oldOnly, "  ")
+					_, _ = fmt.Fprintln(w)
+				}
+			case newOnlyState:
+				if len(newOnly) > 0 {
+					if verbose {
+						_, _ = fmt.Fprintln(w, "\nnew only (transitive executions):")
+					} else {
+						_, _ = fmt.Fprintln(w, "new only (pass --verbose to see details):")
+					}
+					writeMnemonicCounts(w, newOnly, "  ")
+					_, _ = fmt.Fprintln(w)
+				}
+			default:
+			}
+			switch currentState {
+			case oldOnlyState:
 				oldOnly = make(map[string]uint32)
-				if *verbose {
+				if verbose {
 					_, _ = fmt.Fprintln(w, "old only (top-level executions only):")
 				}
+			case newOnlyState:
+				newOnly = make(map[string]uint32)
+				if verbose {
+					_, _ = fmt.Fprintln(w, "new only (top-level executions only):")
+				}
+			default:
 			}
-			if *verbose && td.OldOnly.TopLevel {
+			previousState = currentState
+		}
+
+		switch td := d.GetDiff().(type) {
+		case *spawn_diff.SpawnDiff_OldOnly:
+			if verbose && td.OldOnly.TopLevel {
 				_, _ = fmt.Fprintf(w, "  %s\n", spawnHeader(d))
 			} else {
 				oldOnly[d.Mnemonic]++
 			}
-
 		case *spawn_diff.SpawnDiff_NewOnly:
-			if len(oldOnly) > 0 {
-				if *verbose {
-					_, _ = fmt.Fprintln(w, "\nold only (transitive executions):")
-				} else {
-					_, _ = fmt.Fprintln(w, "old only (pass --verbose to see details):")
-				}
-				writeMnemonicCounts(w, oldOnly, "  ")
-				_, _ = fmt.Fprintln(w)
-				oldOnly = nil
-			}
-
-			if newOnly == nil {
-				newOnly = make(map[string]uint32)
-				if *verbose {
-					_, _ = fmt.Fprintln(w, "new only (top-level executions):")
-				}
-			}
-			if *verbose && td.NewOnly.TopLevel {
+			if verbose && td.NewOnly.TopLevel {
 				_, _ = fmt.Fprintf(w, "  %s\n", spawnHeader(d))
 			} else {
 				newOnly[d.Mnemonic]++
 			}
-
 		case *spawn_diff.SpawnDiff_Modified:
-			if len(newOnly) > 0 {
-				if *verbose {
-					_, _ = fmt.Fprintln(w, "\nnew only (transitive executions):")
-				} else {
-					_, _ = fmt.Fprintln(w, "new only (pass --verbose to see details):")
-				}
-				writeMnemonicCounts(w, newOnly, "  ")
-				_, _ = fmt.Fprintln(w)
-				newOnly = nil
-			}
-
-			if td.Modified.Expected && !*verbose {
+			if td.Modified.Expected && !verbose {
 				continue
 			}
 
 			_, _ = fmt.Fprintf(w, "%s\n", spawnHeader(d))
-
 			for _, sd := range td.Modified.Diffs {
 				writeSingleDiff(w, sd)
 			}
-
 			if len(td.Modified.TransitivelyInvalidated) > 0 {
 				_, _ = fmt.Fprintf(w, "  transitively invalidated:\n")
 				writeMnemonicCounts(w, td.Modified.TransitivelyInvalidated, "    ")
@@ -262,6 +460,9 @@ func writeSingleDiff(w io.Writer, diff *spawn_diff.Diff) {
 	case *spawn_diff.Diff_Env:
 		_, _ = fmt.Fprintln(w, "  env changed:")
 		writeDictDiff(w, d.Env)
+	case *spawn_diff.Diff_ExecProperties:
+		_, _ = fmt.Fprintln(w, "  exec properties changed:")
+		writeDictDiff(w, d.ExecProperties)
 	case *spawn_diff.Diff_Args:
 		_, _ = fmt.Fprintln(w, "  args changed:")
 		writeListDiff(w, d.Args)
@@ -304,7 +505,9 @@ func writeListDiff(w io.Writer, d *spawn_diff.ListDiff) {
 }
 
 func writeDictDiff(w io.Writer, d *spawn_diff.DictDiff) {
-	allKeys := append(maps.Keys(d.OldChanged), maps.Keys(d.NewChanged)...)
+	allKeys := make([]string, 0, len(d.OldChanged)+len(d.NewChanged))
+	allKeys = slices.AppendSeq(allKeys, maps.Keys(d.OldChanged))
+	allKeys = slices.AppendSeq(allKeys, maps.Keys(d.NewChanged))
 	slices.Sort(allKeys)
 	allKeys = slices.Compact(allKeys)
 

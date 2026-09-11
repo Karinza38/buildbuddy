@@ -11,6 +11,11 @@
 
 .executors-page .executor-section div {
   flex-grow: 1;
+  min-width: 0;
+}
+
+.executors-page .executor-custom-resource div {
+  flex-grow: 0;
 }
 
 .executor-section div.executor-section-title {
@@ -20,6 +25,40 @@
   text-align: left;
   margin-right: 16px;
   font-weight: 700;
+}
+
+.executor-custom-resource {
+  display: flex;
+  flex-direction: column;
+}
+
+.executor-warmup-images {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.executor-warmup-image {
+  display: flex;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.executor-warmup-image-isolation {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.executor-custom-resource-wrapper {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.executor-custom-resource-key {
+  width: 280px;
+  margin-right: 16px;
+  font-weight: 600;
 }
 
 .executor-section .executor-history-button {
@@ -54,10 +93,25 @@
   margin-top: 16px;
 }
 
-.executors-page .banner {
+.executors-page .self-hosted-executors-banner {
   margin-top: 32px;
   margin-bottom: 32px;
-  max-width: 600px;
+}
+
+.executors-page .executor-cards {
+  margin-top: 16px;
+}
+
+/* Pool heading + "view executions" link. */
+.executors-page .executor-pool-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.executors-page .executor-pool-header h2 {
+  margin: 0;
 }
 
 .executors-page .executor-details {
@@ -73,9 +127,11 @@
   gap: 8px;
 }
 
+.executors-page .executor-configured-flags {
+  font-family: monospace;
+  overflow-wrap: anywhere;
+}
+
 .executors-page .pool-size-warning {
-  margin: 0;
   margin-top: 16px;
-  max-width: initial;
-  display: inline-flex;
 }

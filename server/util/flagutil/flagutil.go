@@ -1,23 +1,30 @@
 package flagutil
 
 import (
+	stdflag "flag"
+	"reflect"
+
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flagutil/common"
 )
 
-// SetValueForFlagName sets the value for a flag by name. setFlags is the set of
-// flags that have already been set on the command line; those flags will not be
-// set again except to append to them, in the case of slices. To force the
-// setting of a flag, pass a nil map. If appendSlice is true, a slice value will
-// be appended to the current slice value; otherwise, a slice value will replace
-// the current slice value. appendSlice has no effect if the values in question
-// are not slices.
-func SetValueForFlagName(name string, newValue any, setFlags map[string]struct{}, appendSlice bool) error {
-	return common.SetValueForFlagName(common.DefaultFlagSet, name, newValue, setFlags, appendSlice)
+func GetTypeForFlagValue(value stdflag.Value) (reflect.Type, error) {
+	return common.GetTypeForFlagValue(value)
 }
 
-func SetValueForFlagSet(flagset *flag.FlagSet, name string, newValue any, setFlags map[string]struct{}, appendSlice bool) error {
-	return common.SetValueForFlagName(flagset, name, newValue, setFlags, appendSlice)
+// SetValueForFlagName sets the value for a flag by name. setFlags is the set of
+// flags that have already been set on the command line; those flags will not be
+// set again except to accumulate into them, in the case of collection flags. To
+// force the setting of a flag, pass a nil map. If accumulate is true, a slice
+// value will be appended to the current slice value and a map value will be
+// merged into the current map value; otherwise, the value will replace the
+// current value. accumulate has no effect if the flag is not Accumulable.
+func SetValueForFlagName(name string, newValue any, setFlags map[string]struct{}, accumulate bool) error {
+	return common.SetValueForFlagName(common.DefaultFlagSet, name, newValue, setFlags, accumulate)
+}
+
+func SetValueForFlagSet(flagset *flag.FlagSet, name string, newValue any, setFlags map[string]struct{}, accumulate bool) error {
+	return common.SetValueForFlagName(flagset, name, newValue, setFlags, accumulate)
 }
 
 // SetWithOverride sets the flag's value by creating a new, empty flag.Value of
@@ -43,3 +50,8 @@ func GetDereferencedValue[T any](name string) (T, error) {
 // Expand updates the flag value to replace any placeholders in format ${FOO}
 // with the content of calling the mapper function with the placeholder name.
 var Expand = common.Expand
+
+// Returns whether the provided flag is Secretable.IsSecret() or not.
+func IsSecret(flg *flag.Flag) bool {
+	return common.IsSecret(flg)
+}

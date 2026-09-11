@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/filestore"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/constants"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/filestore"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/keys"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/rbuilder"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/replica"
@@ -25,10 +25,12 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
 	"github.com/stretchr/testify/require"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 
 	rfpb "github.com/buildbuddy-io/buildbuddy/proto/raft"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
+	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 	dbsm "github.com/lni/dragonboat/v4/statemachine"
 )
 
@@ -98,7 +100,7 @@ func writeMetaRangeDescriptor(t *testing.T, em *entryMaker, r *replica.Replica, 
 	writeRangeDescriptor(t, em, r, keys.RangeMetaKey(rd.GetEnd()), rd)
 }
 
-func reader(t *testing.T, r *replica.Replica, h *rfpb.Header, fileRecord *rfpb.FileRecord) (io.ReadCloser, error) {
+func reader(t *testing.T, r *replica.Replica, h *rfpb.Header, fileRecord *sgpb.FileRecord) (io.ReadCloser, error) {
 	fs := filestore.New()
 
 	key, err := fs.PebbleKey(fileRecord)
@@ -123,7 +125,7 @@ func reader(t *testing.T, r *replica.Replica, h *rfpb.Header, fileRecord *rfpb.F
 	return rc, nil
 }
 
-func writer(t *testing.T, em *entryMaker, r *replica.Replica, h *rfpb.Header, fileRecord *rfpb.FileRecord) interfaces.CommittedWriteCloser {
+func writer(t *testing.T, em *entryMaker, r *replica.Replica, h *rfpb.Header, fileRecord *sgpb.FileRecord) interfaces.CommittedWriteCloser {
 	fs := filestore.New()
 	key, err := fs.PebbleKey(fileRecord)
 	require.NoError(t, err)
@@ -133,24 +135,18 @@ func writer(t *testing.T, em *entryMaker, r *replica.Replica, h *rfpb.Header, fi
 	writeCloserMetadata := fs.InlineWriter(context.TODO(), fileRecord.GetDigest().GetSizeBytes())
 
 	wc := ioutil.NewCustomCommitWriteCloser(writeCloserMetadata)
-	wc.CommitFn = func(bytesWritten int64) error {
+	wc.SetCommitFn(func(bytesWritten int64) error {
 		now := time.Now()
-		md := &rfpb.FileMetadata{
+		md := &sgpb.FileMetadata{
 			FileRecord:      fileRecord,
 			StorageMetadata: writeCloserMetadata.Metadata(),
 			StoredSizeBytes: bytesWritten,
 			LastModifyUsec:  now.UnixMicro(),
 			LastAccessUsec:  now.UnixMicro(),
 		}
-		protoBytes, err := proto.Marshal(md)
-		if err != nil {
-			return err
-		}
-		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
-			Kv: &rfpb.KV{
-				Key:   fileMetadataKey,
-				Value: protoBytes,
-			},
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.SetRequest{
+			Key:          fileMetadataKey,
+			FileMetadata: md,
 		}))
 		entries := []dbsm.Entry{entry}
 		writeRsp, err := r.Update(entries)
@@ -160,23 +156,25 @@ func writer(t *testing.T, em *entryMaker, r *replica.Replica, h *rfpb.Header, fi
 		require.Equal(t, 1, len(writeRsp))
 
 		return rbuilder.NewBatchResponse(writeRsp[0].Result.Data).AnyError()
-	}
+	})
 	return wc
 }
 
-func writeDefaultRangeDescriptor(t *testing.T, em *entryMaker, r *replica.Replica) {
-	writeLocalRangeDescriptor(t, em, r, &rfpb.RangeDescriptor{
+func writeDefaultRangeDescriptor(t *testing.T, em *entryMaker, r *replica.Replica) *rfpb.RangeDescriptor {
+	rd := &rfpb.RangeDescriptor{
 		Start:      keys.Key{constants.UnsplittableMaxByte},
 		End:        keys.MaxByte,
 		RangeId:    1,
 		Generation: 1,
-	})
+	}
+	writeLocalRangeDescriptor(t, em, r, rd)
+	return rd
 }
 
-func randomRecord(t *testing.T, partition string, sizeBytes int64) (*rfpb.FileRecord, []byte) {
+func randomRecord(t *testing.T, partition string, sizeBytes int64) (*sgpb.FileRecord, []byte) {
 	r, buf := testdigest.RandomCASResourceBuf(t, sizeBytes)
-	return &rfpb.FileRecord{
-		Isolation: &rfpb.Isolation{
+	return &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
 			CacheType:   r.GetCacheType(),
 			PartitionId: partition,
 			GroupId:     interfaces.AuthAnonymousUser,
@@ -184,6 +182,27 @@ func randomRecord(t *testing.T, partition string, sizeBytes int64) (*rfpb.FileRe
 		Digest:         r.GetDigest(),
 		DigestFunction: repb.DigestFunction_SHA256,
 	}, buf
+}
+
+func directRead(t *testing.T, repl *testutil.TestingReplica, key []byte) (*rfpb.DirectReadResponse, error) {
+	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectReadRequest{
+		Key: key,
+	}).ToBuf()
+	require.NoError(t, err)
+	readRsp, err := repl.Lookup(buf)
+	require.NoError(t, err)
+
+	readBatch := rbuilder.NewBatchResponse(readRsp)
+	return readBatch.DirectReadResponse(0)
+}
+
+func verifyReplicaHasLocalRange(t *testing.T, repl *testutil.TestingReplica, rd *rfpb.RangeDescriptor) {
+	rsp, err := directRead(t, repl, constants.LocalRangeKey)
+	require.NoError(t, err)
+	gotRD := &rfpb.RangeDescriptor{}
+	err = proto.Unmarshal(rsp.GetKv().GetValue(), gotRD)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(rd, gotRD))
 }
 
 type replicaTester struct {
@@ -196,7 +215,7 @@ func newWriteTester(t *testing.T, em *entryMaker, repl *replica.Replica) *replic
 	return &replicaTester{t, em, repl}
 }
 
-func (wt *replicaTester) writeRandom(header *rfpb.Header, partition string, sizeBytes int64) *rfpb.FileRecord {
+func (wt *replicaTester) writeRandom(header *rfpb.Header, partition string, sizeBytes int64) *sgpb.FileRecord {
 	fr, buf := randomRecord(wt.t, partition, sizeBytes)
 	wc := writer(wt.t, wt.em, wt.repl, header, fr)
 	_, err := wc.Write(buf)
@@ -206,7 +225,7 @@ func (wt *replicaTester) writeRandom(header *rfpb.Header, partition string, size
 	return fr
 }
 
-func (wt *replicaTester) delete(fileRecord *rfpb.FileRecord) {
+func (wt *replicaTester) delete(fileRecord *sgpb.FileRecord) {
 	fs := filestore.New()
 	key, err := fs.PebbleKey(fileRecord)
 	require.NoError(wt.t, err)
@@ -226,6 +245,10 @@ func (wt *replicaTester) delete(fileRecord *rfpb.FileRecord) {
 func TestReplicaDirectReadWrite(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -234,7 +257,7 @@ func TestReplicaDirectReadWrite(t *testing.T) {
 	em := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em, repl.Replica)
 
-	md := &rfpb.FileMetadata{StoredSizeBytes: 123}
+	md := &sgpb.FileMetadata{StoredSizeBytes: 123}
 	val, err := proto.Marshal(md)
 	require.NoError(t, err)
 
@@ -251,26 +274,79 @@ func TestReplicaDirectReadWrite(t *testing.T) {
 	require.Equal(t, 1, len(writeRsp))
 
 	// Do a DirectRead and verify the value is was written.
-	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectReadRequest{
-		Key: []byte("key-name"),
-	}).ToBuf()
+	rsp, err := directRead(t, repl, []byte("key-name"))
 	require.NoError(t, err)
-	readRsp, err := repl.Lookup(buf)
-	require.NoError(t, err)
-
-	readBatch := rbuilder.NewBatchResponse(readRsp)
-	directRead, err := readBatch.DirectReadResponse(0)
-	require.NoError(t, err)
-
-	require.Equal(t, val, directRead.GetKv().GetValue())
-
-	err = repl.Close()
-	require.NoError(t, err)
+	require.Equal(t, val, rsp.GetKv().GetValue())
 }
 
-func TestReplicaIncrement(t *testing.T) {
+// The generic KV writers must refuse file-record keys: records must be written
+// through SetRequest (and mutated via UpdateAtime/Delete) so validation and any
+// state derived from record writes can rely on those paths being exhaustive.
+func TestDirectWriteRefusesFileRecordKeys(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		require.NoError(t, repl.Close())
+	})
+
+	stopc := make(chan struct{})
+	_, err := repl.Open(stopc)
+	require.NoError(t, err)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	r, _ := testdigest.RandomCASResourceBuf(t, 100)
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
+			CacheType:   rspb.CacheType_CAS,
+			PartitionId: "default",
+			GroupId:     interfaces.AuthAnonymousUser,
+		},
+		Digest:         r.GetDigest(),
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+	fs := filestore.New()
+	key, err := fs.PebbleKey(fileRecord)
+	require.NoError(t, err)
+	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	require.NoError(t, err)
+
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+		Kv: &rfpb.KV{Key: fileMetadataKey, Value: []byte("unindexed")},
+	}))
+	writeRsp, err := repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	err = rbuilder.NewBatchResponse(writeRsp[0].Result.Data).AnyError()
+	require.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument, got: %v", err)
+
+	// CAS is the same generic writer and must refuse too. rbuilder already
+	// rejects CAS on splittable keys client-side, so hand-roll the batch to
+	// prove the apply-path guard holds for callers that bypass rbuilder.
+	casBatch, err := proto.Marshal(&rfpb.BatchCmdRequest{
+		Union: []*rfpb.RequestUnion{{Value: &rfpb.RequestUnion_Cas{
+			Cas: &rfpb.CASRequest{
+				Kv: &rfpb.KV{Key: fileMetadataKey, Value: []byte("unindexed")},
+			},
+		}}},
+	})
+	require.NoError(t, err)
+	casRsp, err := repl.Update([]dbsm.Entry{{Cmd: casBatch, Index: 3}})
+	require.NoError(t, err)
+	err = rbuilder.NewBatchResponse(casRsp[0].Result.Data).AnyError()
+	require.True(t, status.IsInvalidArgumentError(err), "expected InvalidArgument, got: %v", err)
+
+	// Neither write may have landed.
+	_, err = directRead(t, repl, fileMetadataKey)
+	require.True(t, status.IsNotFoundError(err), "expected NotFound, got: %v", err)
+}
+
+func TestReplicaIncrementSnapshotRestore(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -286,7 +362,7 @@ func TestReplicaIncrement(t *testing.T) {
 
 	// Do a DirectWrite.
 	entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
-		Key:   []byte("incr-key"),
+		Key:   constants.LastRangeIDKey,
 		Delta: 1,
 	}))
 	writeRsp, err := repl.Update([]dbsm.Entry{entry})
@@ -299,6 +375,12 @@ func TestReplicaIncrement(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), incrRsp.GetValue())
 
+	// Make sure the stored value is direct-readable.
+	rsp, err := directRead(t, repl, constants.LastRangeIDKey)
+	require.NoError(t, err)
+	val := binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(1), val)
+
 	// Write the same request again.
 	writeRsp, err = repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
@@ -310,10 +392,15 @@ func TestReplicaIncrement(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), incrRsp.GetValue())
 
+	rsp, err = directRead(t, repl, constants.LastRangeIDKey)
+	require.NoError(t, err)
+	val = binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(1), val)
+
 	session.Index = 2
 	// Increment the same key again by a different value.
 	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
-		Key:   []byte("incr-key"),
+		Key:   constants.LastRangeIDKey,
 		Delta: 3,
 	}))
 	writeRsp, err = repl.Update([]dbsm.Entry{entry})
@@ -325,9 +412,14 @@ func TestReplicaIncrement(t *testing.T) {
 	incrRsp, err = incrBatch.IncrementResponse(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), incrRsp.GetValue())
+
+	rsp, err = directRead(t, repl, constants.LastRangeIDKey)
+	require.NoError(t, err)
+	val = binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(4), val)
 
 	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
-		Key:   []byte("incr-key"),
+		Key:   constants.LastRangeIDKey,
 		Delta: 3,
 	}))
 	writeRsp, err = repl.Update([]dbsm.Entry{entry})
@@ -339,14 +431,69 @@ func TestReplicaIncrement(t *testing.T) {
 	incrRsp, err = incrBatch.IncrementResponse(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(4), incrRsp.GetValue())
-
-	err = repl.Close()
+	rsp, err = directRead(t, repl, constants.LastRangeIDKey)
 	require.NoError(t, err)
+	val = binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(4), val)
+
+	// Create a snapshot of the replica.
+	snapI, err := repl.PrepareSnapshot()
+	require.NoError(t, err)
+
+	baseDir := testfs.MakeTempDir(t)
+	snapFile, err := os.CreateTemp(baseDir, "snapfile-*")
+	require.NoError(t, err)
+	snapFileName := snapFile.Name()
+	defer os.Remove(snapFileName)
+
+	err = repl.SaveSnapshot(snapI, snapFile, nil /*=quitChan*/)
+	require.NoError(t, err)
+	snapFile.Seek(0, 0)
+
+	// Restore a new replica from the created snapshot.
+	repl2 := testutil.NewTestingReplica(t, 1, 2)
+	require.NotNil(t, repl2)
+	t.Cleanup(func() {
+		err := repl2.Close()
+		require.NoError(t, err)
+	})
+	_, err = repl2.Open(stopc)
+	require.NoError(t, err)
+
+	// read from the key, it should hold the same value
+	rsp, err = directRead(t, repl, constants.LastRangeIDKey)
+	require.NoError(t, err)
+	val = binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(4), val)
+
+	// Increment still work after restored from snapshot
+	session.Index = 3
+	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
+		Key:   constants.LastRangeIDKey,
+		Delta: 2,
+	}))
+	writeRsp, err = repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(writeRsp))
+
+	// Make sure the response holds the new value.
+	incrBatch = rbuilder.NewBatchResponse(writeRsp[0].Result.Data)
+	incrRsp, err = incrBatch.IncrementResponse(0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), incrRsp.GetValue())
+	rsp, err = directRead(t, repl, constants.LastRangeIDKey)
+	require.NoError(t, err)
+	val = binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+	require.Equal(t, uint64(6), val)
 }
 
 func TestSessionIndexMismatchError(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -362,7 +509,7 @@ func TestSessionIndexMismatchError(t *testing.T) {
 
 	// Do a DirectWrite.
 	entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
-		Key:   []byte("incr-key"),
+		Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key")),
 		Delta: 1,
 	}))
 	writeRsp, err := repl.Update([]dbsm.Entry{entry})
@@ -371,16 +518,34 @@ func TestSessionIndexMismatchError(t *testing.T) {
 
 	session.Index = 0
 	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.IncrementRequest{
-		Key:   []byte("incr-key"),
+		Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key")),
 		Delta: 1,
 	}))
-	_, err = repl.Update([]dbsm.Entry{entry})
-	require.ErrorContains(t, err, fmt.Sprintf("session (id=%q) index mismatch", session.Id))
+	entries, err := repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(entries))
+	result := entries[0].Result
+	require.Equal(t, constants.EntryErrorValue, int(result.Value))
+
+	status := &statuspb.Status{}
+	err = proto.Unmarshal(result.Data, status)
+	require.NoError(t, err)
+	require.Contains(t, status.String(), fmt.Sprintf("session (id=\\\"%s\\\") index mismatch", session.Id))
 }
 
-func TestReplicaCAS(t *testing.T) {
+// TestSessionRangeIDNamespace verifies that sessions are namespaced by
+// (id, range_id) on the replica: a write with the same id+lower-index but
+// a different range_id does not collide with a prior write. This is what
+// makes cross-range retries (e.g. after a split) safe — they will miss
+// dedup on the destination range rather than getting stuck behind a
+// stored entry that happens to share the same id.
+func TestSessionRangeIDNamespace(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -389,30 +554,77 @@ func TestReplicaCAS(t *testing.T) {
 	em := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em, repl.Replica)
 
-	// Do a write.
-	rt := newWriteTester(t, em, repl.Replica)
-	header := &rfpb.Header{RangeId: 1, Generation: 1}
-	fr := rt.writeRandom(header, defaultPartition, 100)
+	id := []byte(uuid.New())
 
-	fs := filestore.New()
-	key, err := fs.PebbleKey(fr)
-	require.NoError(t, err)
+	// errorMessage returns the encoded gRPC status from a state-machine
+	// entry result, or empty string if the result is not an error.
+	errorMessage := func(r dbsm.Result) string {
+		if int(r.Value) != constants.EntryErrorValue {
+			return ""
+		}
+		st := &statuspb.Status{}
+		require.NoError(t, proto.Unmarshal(r.Data, st))
+		return st.String()
+	}
 
-	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	// Write with (id, idx=5, range_id=2). Stores dedup record under
+	// `session-<id>-2`.
+	sessionA := &rfpb.Session{Id: id, Index: 5, RangeId: 2}
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(sessionA).Add(&rfpb.IncrementRequest{
+		Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key-a")),
+		Delta: 1,
+	}))
+	rsp, err := repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
+	require.Empty(t, errorMessage(rsp[0].Result))
 
-	// Do a DirectRead and verify the value was written.
-	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectReadRequest{
-		Key: fileMetadataKey,
-	}).ToBuf()
+	// Write with the same id, lower index, but a different range_id.
+	// Stores under `session-<id>-9` — separate namespace, so this is not
+	// a replay and not stale. Must succeed.
+	sessionB := &rfpb.Session{Id: id, Index: 3, RangeId: 9}
+	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(sessionB).Add(&rfpb.IncrementRequest{
+		Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key-b")),
+		Delta: 1,
+	}))
+	rsp, err = repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
-	readRsp, err := repl.Lookup(buf)
-	require.NoError(t, err)
-	readBatch := rbuilder.NewBatchResponse(readRsp)
-	directRead, err := readBatch.DirectReadResponse(0)
-	require.NoError(t, err)
+	require.Empty(t, errorMessage(rsp[0].Result))
 
-	mdBuf := directRead.GetKv().GetValue()
+	// Within range_id=2's namespace, a lower index is still stale.
+	sessionStale := &rfpb.Session{Id: id, Index: 4, RangeId: 2}
+	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(sessionStale).Add(&rfpb.IncrementRequest{
+		Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key-a")),
+		Delta: 1,
+	}))
+	rsp, err = repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	require.Contains(t, errorMessage(rsp[0].Result), "index mismatch")
+}
+
+func TestReplicaCAS(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	lastAppliedIndex, err := repl.Open(stopc)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastAppliedIndex)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	// CAS is only permitted on non-splittable keys, so seed a
+	// system-prefix key with an initial value via DirectWrite.
+	casKey := keys.MakeKey(constants.SystemPrefix, []byte("cas-key"))
+	initialValue := []byte("initial")
+	seed := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+		Kv: &rfpb.KV{Key: casKey, Value: initialValue},
+	}))
+	_, err = repl.Update([]dbsm.Entry{seed})
+	require.NoError(t, err)
 
 	// Do a CAS and verify:
 	//   1) the value is not set
@@ -423,7 +635,7 @@ func TestReplicaCAS(t *testing.T) {
 	}
 	entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.CASRequest{
 		Kv: &rfpb.KV{
-			Key:   fileMetadataKey,
+			Key:   casKey,
 			Value: []byte{},
 		},
 		ExpectedValue: []byte("bogus-expected-value"),
@@ -431,20 +643,20 @@ func TestReplicaCAS(t *testing.T) {
 	writeRsp, err := repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
 
-	readBatch = rbuilder.NewBatchResponse(writeRsp[0].Result.Data)
+	readBatch := rbuilder.NewBatchResponse(writeRsp[0].Result.Data)
 	casRsp, err := readBatch.CASResponse(0)
 	require.True(t, status.IsFailedPreconditionError(err))
-	require.Equal(t, mdBuf, casRsp.GetKv().GetValue())
+	require.Equal(t, initialValue, casRsp.GetKv().GetValue())
 
 	// Do a CAS with the correct expected value and ensure
 	// the value was written.
 	session.Index++
 	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.CASRequest{
 		Kv: &rfpb.KV{
-			Key:   fileMetadataKey,
+			Key:   casKey,
 			Value: []byte{},
 		},
-		ExpectedValue: mdBuf,
+		ExpectedValue: initialValue,
 	}))
 	writeRsp, err = repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
@@ -457,10 +669,10 @@ func TestReplicaCAS(t *testing.T) {
 	// Do the same CAS again with same session
 	entry = em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session).Add(&rfpb.CASRequest{
 		Kv: &rfpb.KV{
-			Key:   fileMetadataKey,
+			Key:   casKey,
 			Value: []byte{},
 		},
-		ExpectedValue: mdBuf,
+		ExpectedValue: initialValue,
 	}))
 	writeRsp, err = repl.Update([]dbsm.Entry{entry})
 	require.NoError(t, err)
@@ -469,14 +681,15 @@ func TestReplicaCAS(t *testing.T) {
 	casRsp, err = readBatch.CASResponse(0)
 	require.NoError(t, err)
 	require.Nil(t, casRsp.GetKv().GetValue())
-
-	err = repl.Close()
-	require.NoError(t, err)
 }
 
 func TestReplicaScan(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -577,14 +790,149 @@ func TestReplicaScan(t *testing.T) {
 	require.Equal(t, []byte("range-1"), scanRsp.GetKvs()[0].GetValue())
 	require.Equal(t, []byte("range-2"), scanRsp.GetKvs()[1].GetValue())
 	require.Equal(t, []byte("range-3"), scanRsp.GetKvs()[2].GetValue())
+}
 
-	err = repl.Close()
+func TestReplicaFetchRanges(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	lastAppliedIndex, err := repl.Open(stopc)
 	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastAppliedIndex)
+	em := newEntryMaker(t)
+	ranges := []*rfpb.RangeDescriptor{
+		{
+			Start:      constants.MetaRangePrefix,
+			End:        keys.Key{constants.UnsplittableMaxByte},
+			RangeId:    1,
+			Generation: 1,
+			Replicas: []*rfpb.ReplicaDescriptor{
+				{RangeId: 1, ReplicaId: 1, Nhid: proto.String("nhid-1")},
+			},
+		},
+		{
+			Start:      keys.Key{constants.UnsplittableMaxByte},
+			End:        keys.Key("a"),
+			RangeId:    2,
+			Generation: 1,
+			Replicas: []*rfpb.ReplicaDescriptor{
+				{RangeId: 2, ReplicaId: 1, Nhid: proto.String("nhid-1")},
+				{RangeId: 2, ReplicaId: 2, Nhid: proto.String("nhid-2")},
+			},
+		},
+		{
+			Start:      keys.Key("a"),
+			End:        keys.Key("b"),
+			RangeId:    3,
+			Generation: 1,
+			Replicas: []*rfpb.ReplicaDescriptor{
+				{RangeId: 3, ReplicaId: 1, Nhid: proto.String("nhid-2")},
+			},
+		},
+		{
+			Start:      keys.Key("b"),
+			End:        keys.MaxByte,
+			RangeId:    4,
+			Generation: 1,
+			Replicas: []*rfpb.ReplicaDescriptor{
+				{RangeId: 4, ReplicaId: 1, Nhid: proto.String("nhid-3")},
+			},
+		},
+	}
+
+	for _, rd := range ranges {
+		writeMetaRangeDescriptor(t, em, repl.Replica, rd)
+	}
+
+	testCases := []struct {
+		name        string
+		req         *rfpb.FetchRangesRequest
+		expected    []*rfpb.RangeDescriptor
+		expectError bool
+	}{
+		{
+			name: "filter by range IDs",
+			req: &rfpb.FetchRangesRequest{
+				RangeIds: []uint64{3, 4},
+			},
+			expected: []*rfpb.RangeDescriptor{ranges[2], ranges[3]},
+		},
+		{
+			name: "filter by nhid-1",
+			req: &rfpb.FetchRangesRequest{
+				Nhid: "nhid-1",
+			},
+			expected: []*rfpb.RangeDescriptor{ranges[0], ranges[1]},
+		},
+		{
+			name: "filter by nhid-2",
+			req: &rfpb.FetchRangesRequest{
+				Nhid: "nhid-2",
+			},
+			expected: []*rfpb.RangeDescriptor{ranges[1], ranges[2]},
+		},
+		{
+			name: "OR logic: range_ids and nhid",
+			req: &rfpb.FetchRangesRequest{
+				RangeIds: []uint64{1},
+				Nhid:     "nhid-2",
+			},
+			expected: []*rfpb.RangeDescriptor{ranges[0], ranges[1], ranges[2]},
+		},
+		{
+			name: "OR logic: non-overlapping sets",
+			req: &rfpb.FetchRangesRequest{
+				RangeIds: []uint64{4},
+				Nhid:     "nhid-1",
+			},
+			expected: []*rfpb.RangeDescriptor{ranges[0], ranges[1], ranges[3]},
+		},
+		{
+			name: "non-existent nhid",
+			req: &rfpb.FetchRangesRequest{
+				Nhid: "nhid-nonexistent",
+			},
+			expected: []*rfpb.RangeDescriptor{},
+		},
+		{
+			name:        "neither range_ids nor nhid specified",
+			req:         &rfpb.FetchRangesRequest{},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, err := rbuilder.NewBatchBuilder().Add(tc.req).ToBuf()
+			require.NoError(t, err)
+			readRsp, err := repl.Lookup(buf)
+			require.NoError(t, err)
+
+			readBatch := rbuilder.NewBatchResponse(readRsp)
+			fetchRsp, err := readBatch.FetchRangesResponse(0)
+
+			if tc.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.ElementsMatch(t, tc.expected, fetchRsp.GetRanges())
+			}
+		})
+	}
 }
 
 func TestReplicaFileWriteSnapshotRestore(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -596,8 +944,8 @@ func TestReplicaFileWriteSnapshotRestore(t *testing.T) {
 	// Write a file to the replica's data dir.
 	r, buf := testdigest.RandomCASResourceBuf(t, 1000)
 
-	fileRecord := &rfpb.FileRecord{
-		Isolation: &rfpb.Isolation{
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
 			CacheType:   rspb.CacheType_CAS,
 			PartitionId: "default",
 			GroupId:     interfaces.AuthAnonymousUser,
@@ -635,6 +983,10 @@ func TestReplicaFileWriteSnapshotRestore(t *testing.T) {
 	// Restore a new replica from the created snapshot.
 	repl2 := testutil.NewTestingReplica(t, 2, 2)
 	require.NotNil(t, repl2)
+	t.Cleanup(func() {
+		err := repl2.Close()
+		require.NoError(t, err)
+	})
 	_, err = repl2.Open(stopc)
 	require.NoError(t, err)
 
@@ -650,6 +1002,10 @@ func TestReplicaFileWriteSnapshotRestore(t *testing.T) {
 func TestApplySnapshotEntriesDeleted(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -663,7 +1019,7 @@ func TestApplySnapshotEntriesDeleted(t *testing.T) {
 	fr1 := rt.writeRandom(header, defaultPartition, 1000)
 	fr2 := rt.writeRandom(header, defaultPartition, 1000)
 
-	localSessionKey := keys.MakeKey(constants.LocalSessionPrefix, []byte("abcd"))
+	localSessionKey := keys.MakeKey(constants.SessionPrefix, []byte("abcd"))
 
 	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -730,9 +1086,8 @@ func TestApplySnapshotEntriesDeleted(t *testing.T) {
 
 	// verify local session is deleted
 	{
-		localSessionKey = keys.MakeKey(constants.LocalPrefix, []byte("c0001n0002-"), localSessionKey)
-		_, _, err := repl2.DB().Get(localSessionKey)
-		require.ErrorIs(t, err, pebble.ErrNotFound)
+		_, err := directRead(t, repl2, localSessionKey)
+		require.True(t, status.IsNotFoundError(err))
 	}
 	// verify that fr2 is deleted
 	{
@@ -751,6 +1106,10 @@ func TestApplySnapshotEntriesDeleted(t *testing.T) {
 func TestClearStateBeforeApplySnapshot(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -758,26 +1117,42 @@ func TestClearStateBeforeApplySnapshot(t *testing.T) {
 
 	em := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em, repl.Replica)
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("zoo"),
+				Value: []byte("bar"),
+			},
+		}))
+		entries := []dbsm.Entry{entry}
+		rsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.NoError(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	}
+
+	// shrink the range descriptor.
 	rd := &rfpb.RangeDescriptor{
 		Start:      keys.Key("a"),
-		End:        keys.Key("z"),
+		End:        keys.Key("g"),
 		RangeId:    1,
 		Generation: 2,
 	}
 	writeLocalRangeDescriptor(t, em, repl.Replica, rd)
 
-	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
-		Kv: &rfpb.KV{
-			Key:   []byte("foo"),
-			Value: []byte("bar"),
-		},
-	}))
-	entries := []dbsm.Entry{entry}
-	rsp, err := repl.Update(entries)
-	require.NoError(t, err)
-	require.NoError(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("foo"),
+				Value: []byte("bar"),
+			},
+		}))
+		entries := []dbsm.Entry{entry}
+		rsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.NoError(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	}
 
-	wb := repl.DB().NewBatch()
+	wb := repl.DB().NewIndexedBatch()
 	txid := []byte("TX1")
 	cmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -814,8 +1189,23 @@ func TestClearStateBeforeApplySnapshot(t *testing.T) {
 	em2 := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em2, repl2.Replica)
 
+	// write an entry that is in the default range, but not in the updated range
+	// in the snapshot
+	{
+		entry := em2.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("zoo"),
+				Value: []byte("bar"),
+			},
+		}))
+		entries := []dbsm.Entry{entry}
+		rsp, err := repl2.Update(entries)
+		require.NoError(t, err)
+		require.NoError(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	}
+
 	// Prepare a transaction before recovering from snapshot
-	wb2 := repl2.DB().NewBatch()
+	wb2 := repl2.DB().NewIndexedBatch()
 	txid2 := []byte("TX2")
 	cmd2, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -835,24 +1225,30 @@ func TestClearStateBeforeApplySnapshot(t *testing.T) {
 
 	// Verify that local range key exists, and the value is the same as the local
 	// range in the snapshot.
-	localRangeKey := keys.MakeKey(constants.LocalPrefix, []byte("c0001n0002-"), constants.LocalRangeKey)
-	buf, closer, err := repl2.DB().Get(localRangeKey)
-	require.NotEmpty(t, buf)
-	require.NoError(t, err)
-	gotRD := &rfpb.RangeDescriptor{}
-	err = proto.Unmarshal(buf, gotRD)
-	require.NoError(t, err)
-	require.True(t, proto.Equal(rd, gotRD))
-	closer.Close()
+	verifyReplicaHasLocalRange(t, repl2, rd)
 
 	// Verify that local last applied index key exists, and the value is not zero.
-	localIndexKey := keys.MakeKey(constants.LocalPrefix, []byte("c0001n0002-"), constants.LastAppliedIndexKey)
-	buf, closer, err = repl2.DB().Get(localIndexKey)
-	require.NotEmpty(t, buf)
-	require.NoError(t, err)
-	gotIndex := binary.LittleEndian.Uint64(buf)
-	require.Greater(t, gotIndex, uint64(0))
-	closer.Close()
+	{
+		rsp, err := directRead(t, repl2, constants.LastAppliedIndexKey)
+		require.NoError(t, err)
+		gotIndex := binary.LittleEndian.Uint64(rsp.GetKv().GetValue())
+		require.Greater(t, gotIndex, uint64(0))
+	}
+
+	// Verify that "foo" should exist in repl2; this should be written from snapshot.
+	{
+		buf, closer, err := repl2.DB().Get([]byte("foo"))
+		require.NoError(t, err)
+		closer.Close()
+		require.Equal(t, []byte("bar"), buf)
+	}
+	// Verify that "zoo" is not cleared.
+	{
+		buf, closer, err := repl2.DB().Get([]byte("zoo"))
+		require.NoError(t, err)
+		closer.Close()
+		require.Equal(t, []byte("bar"), buf)
+	}
 
 	// Verify that we should not be able to commit the txn in the snapshot.
 	err = repl2.CommitTransaction(txid)
@@ -868,6 +1264,10 @@ func TestReplicaFileWriteDelete(t *testing.T) {
 	fs := filestore.New()
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -878,8 +1278,8 @@ func TestReplicaFileWriteDelete(t *testing.T) {
 
 	// Write a file to the replica's data dir.
 	r, buf := testdigest.RandomCASResourceBuf(t, 1000)
-	fileRecord := &rfpb.FileRecord{
-		Isolation: &rfpb.Isolation{
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
 			CacheType:   rspb.CacheType_CAS,
 			PartitionId: "default",
 			GroupId:     interfaces.AuthAnonymousUser,
@@ -926,16 +1326,149 @@ func TestReplicaFileWriteDelete(t *testing.T) {
 	}
 }
 
+func TestFileWriteAndFind(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	lastAppliedIndex, err := repl.Open(stopc)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastAppliedIndex)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	now := time.Now().UnixMicro()
+	// Write a file to the replica's data dir.
+	r, _ := testdigest.RandomCASResourceBuf(t, 1000)
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
+			CacheType:   rspb.CacheType_CAS,
+			PartitionId: "default",
+			GroupId:     interfaces.AuthAnonymousUser,
+		},
+		Digest:         r.GetDigest(),
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+
+	md := &sgpb.FileMetadata{
+		FileRecord: fileRecord,
+		StorageMetadata: &sgpb.StorageMetadata{
+			GcsMetadata: &sgpb.StorageMetadata_GCSMetadata{
+				BlobName: "blob",
+			},
+		},
+		StoredSizeBytes: 1000,
+		LastAccessUsec:  now,
+	}
+
+	fs := filestore.New()
+
+	key, err := fs.PebbleKey(fileRecord)
+	require.NoError(t, err)
+	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	require.NoError(t, err)
+
+	// Write the record.
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.SetRequest{
+		Key:          fileMetadataKey,
+		FileMetadata: md,
+	}))
+	entries := []dbsm.Entry{entry}
+	writeRsp, err := repl.Update(entries)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(writeRsp))
+
+	// Do a find
+	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.FindRequest{
+		Key: fileMetadataKey,
+	}).ToBuf()
+	require.NoError(t, err)
+	readRsp, err := repl.Lookup(buf)
+	require.NoError(t, err)
+
+	readBatch := rbuilder.NewBatchResponse(readRsp)
+	findRsp, err := readBatch.FindResponse(0)
+	require.NoError(t, err)
+
+	require.True(t, findRsp.GetPresent())
+	require.Equal(t, now, findRsp.GetLastAccessUsec())
+	require.Equal(t, "blob", findRsp.GetGcsMetadata().GetBlobName())
+}
+
+// A zero-length record is an anomaly the read path rejects, so Find must report
+// it absent.
+func TestFileFindZeroLengthReportsAbsent(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		require.NoError(t, repl.Close())
+	})
+
+	stopc := make(chan struct{})
+	_, err := repl.Open(stopc)
+	require.NoError(t, err)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	r, _ := testdigest.RandomCASResourceBuf(t, 1000)
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
+			CacheType:   rspb.CacheType_CAS,
+			PartitionId: "default",
+			GroupId:     interfaces.AuthAnonymousUser,
+		},
+		Digest:         r.GetDigest(),
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+	md := &sgpb.FileMetadata{
+		FileRecord:      fileRecord,
+		StoredSizeBytes: 0, // zero-length anomaly
+		LastAccessUsec:  time.Now().UnixMicro(),
+	}
+
+	fs := filestore.New()
+	key, err := fs.PebbleKey(fileRecord)
+	require.NoError(t, err)
+	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	require.NoError(t, err)
+
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.SetRequest{
+		Key:          fileMetadataKey,
+		FileMetadata: md,
+	}))
+	_, err = repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+
+	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.FindRequest{
+		Key: fileMetadataKey,
+	}).ToBuf()
+	require.NoError(t, err)
+	readRsp, err := repl.Lookup(buf)
+	require.NoError(t, err)
+
+	findRsp, err := rbuilder.NewBatchResponse(readRsp).FindResponse(0)
+	require.NoError(t, err)
+	require.False(t, findRsp.GetPresent(), "zero-length record must report absent")
+}
+
 func TestUsage(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
 	require.NoError(t, err)
 
 	em := newEntryMaker(t)
-	writeDefaultRangeDescriptor(t, em, repl.Replica)
+	rd := writeDefaultRangeDescriptor(t, em, repl.Replica)
 
 	rt := newWriteTester(t, em, repl.Replica)
 
@@ -947,23 +1480,10 @@ func TestUsage(t *testing.T) {
 	rt.writeRandom(header, anotherPartition, 300)
 
 	repl.DB().Flush()
-	rd := repl.RangeDescriptor()
 	{
 		ru, err := repl.Usage()
 		require.NoError(t, err)
 		require.InDelta(t, 2100, ru.GetEstimatedDiskBytesUsed(), 600.0)
-		require.Len(t, ru.GetPartitions(), 2)
-
-		for _, usage := range ru.GetPartitions() {
-			switch usage.GetPartitionId() {
-			case defaultPartition:
-				require.EqualValues(t, 1500, usage.GetSizeBytes())
-				require.EqualValues(t, 2, usage.GetTotalCount())
-			case anotherPartition:
-				require.EqualValues(t, 600, usage.GetSizeBytes())
-				require.EqualValues(t, 3, usage.GetTotalCount())
-			}
-		}
 	}
 
 	// Delete a single record and verify updated usage.
@@ -975,23 +1495,16 @@ func TestUsage(t *testing.T) {
 		ru, err := repl.Usage()
 		require.NoError(t, err)
 		require.InDelta(t, 1100, ru.GetEstimatedDiskBytesUsed(), 500.0)
-
-		for _, usage := range ru.GetPartitions() {
-			switch usage.GetPartitionId() {
-			case defaultPartition:
-				require.EqualValues(t, 500, usage.GetSizeBytes())
-				require.EqualValues(t, 1, usage.GetTotalCount())
-			case anotherPartition:
-				require.EqualValues(t, 600, usage.GetSizeBytes())
-				require.EqualValues(t, 3, usage.GetTotalCount())
-			}
-		}
 	}
 }
 
 func TestTransactionPrepareAndCommit(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -1000,7 +1513,7 @@ func TestTransactionPrepareAndCommit(t *testing.T) {
 	em := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em, repl.Replica)
 
-	wb := repl.DB().NewBatch()
+	wb := repl.DB().NewIndexedBatch()
 	txid := []byte("TX1")
 	cmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -1014,7 +1527,7 @@ func TestTransactionPrepareAndCommit(t *testing.T) {
 	require.NoError(t, wb.Commit(pebble.Sync))
 	require.NoError(t, wb.Close())
 
-	wb = repl.DB().NewBatch()
+	wb = repl.DB().NewIndexedBatch()
 	txid2 := []byte("TX2")
 	badCmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -1047,9 +1560,118 @@ func TestTransactionPrepareAndCommit(t *testing.T) {
 	require.Equal(t, []byte("bar"), buf)
 }
 
+func TestTransactionLockingMappedRange(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	_, err := repl.Open(stopc)
+	require.NoError(t, err)
+
+	em := newEntryMaker(t)
+
+	rd := &rfpb.RangeDescriptor{
+		Start:      keys.Key("a"),
+		End:        keys.Key("c"),
+		RangeId:    1,
+		Generation: 1,
+	}
+	writeLocalRangeDescriptor(t, em, repl.Replica, rd)
+
+	wb := repl.DB().NewIndexedBatch()
+	txid := []byte("TX1")
+	rd.End = keys.Key("b")
+	rd.Generation = 2
+	rdBuf, err := proto.Marshal(rd)
+	require.NoError(t, err)
+	cmd, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+		Kv: &rfpb.KV{
+			Key:   constants.LocalRangeKey,
+			Value: rdBuf,
+		},
+	}).SetLockMappedRange(true).ToProto()
+	require.NoError(t, err)
+	_, err = repl.PrepareTransaction(wb, txid, cmd)
+	require.NoError(t, err)
+
+	require.NoError(t, wb.Commit(pebble.Sync))
+	require.NoError(t, wb.Close())
+
+	// cannot write to [a, c)
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("azzz"),
+				Value: []byte("just-an-innocent-write"),
+			},
+		}))
+		entries := []dbsm.Entry{entry}
+		rsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.Error(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	}
+
+	// cannot write to [a, c) in a txn
+	{
+		wb = repl.DB().NewIndexedBatch()
+		txid2 := []byte("TX2")
+		badCmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("azzzz"),
+				Value: []byte("baz"),
+			},
+		}).ToProto()
+		_, err = repl.PrepareTransaction(wb, txid2, badCmd)
+		require.Error(t, err)
+		require.NoError(t, wb.Close())
+	}
+
+	err = repl.CommitTransaction(txid)
+	require.NoError(t, err)
+
+	verifyReplicaHasLocalRange(t, repl, rd)
+
+	// should be able to write to [a, b)
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("azzz"),
+				Value: []byte("just-an-innocent-write"),
+			},
+		}))
+		entries := []dbsm.Entry{entry}
+		rsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.NoError(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
+	}
+
+	// should be able to write to [a, c) in a txn
+	{
+		wb = repl.DB().NewIndexedBatch()
+		txid2 := []byte("TX2")
+		badCmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("azzzz"),
+				Value: []byte("baz"),
+			},
+		}).ToProto()
+		_, err = repl.PrepareTransaction(wb, txid2, badCmd)
+		require.NoError(t, err)
+		require.NoError(t, wb.Close())
+	}
+}
+
 func TestTransactionPrepareAndRollback(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -1058,7 +1680,7 @@ func TestTransactionPrepareAndRollback(t *testing.T) {
 	em := newEntryMaker(t)
 	writeDefaultRangeDescriptor(t, em, repl.Replica)
 
-	wb := repl.DB().NewBatch()
+	wb := repl.DB().NewIndexedBatch()
 	txid := []byte("TX1")
 	cmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 		Kv: &rfpb.KV{
@@ -1072,12 +1694,110 @@ func TestTransactionPrepareAndRollback(t *testing.T) {
 	require.NoError(t, wb.Commit(pebble.Sync))
 	require.NoError(t, wb.Close())
 
-	err = repl.RollbackTransaction(txid)
+	wb = repl.DB().NewIndexedBatch()
+	err = repl.RollbackTransaction(wb, txid, time.Now().UnixMicro())
 	require.NoError(t, err)
+	require.NoError(t, wb.Commit(pebble.Sync))
+	require.NoError(t, wb.Close())
 
 	buf, _, err := repl.DB().Get([]byte("foo"))
 	require.Error(t, err)
 	require.Nil(t, buf)
+}
+
+func TestRollbackMarkerSurvivesRestartAndRejectsPrepare(t *testing.T) {
+	txid := []byte("TX1")
+	em := newEntryMaker(t)
+	var leaser pebble.Leaser
+
+	{
+		repl := testutil.NewTestingReplica(t, 1, 1)
+		leaser = repl.Leaser()
+		require.NotNil(t, repl)
+
+		stopc := make(chan struct{})
+		_, err := repl.Open(stopc)
+		require.NoError(t, err)
+
+		writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+		wb := repl.DB().NewIndexedBatch()
+		err = repl.RollbackTransaction(wb, txid, time.Now().UnixMicro())
+		require.NoError(t, err)
+		require.NoError(t, wb.Commit(pebble.Sync))
+		require.NoError(t, wb.Close())
+
+		err = repl.Close()
+		require.NoError(t, err)
+	}
+
+	{
+		repl := testutil.NewTestingReplicaWithLeaser(t, 1, 1, leaser)
+		require.NotNil(t, repl)
+		t.Cleanup(func() {
+			err := repl.Close()
+			require.NoError(t, err)
+		})
+
+		stopc := make(chan struct{})
+		_, err := repl.Open(stopc)
+		require.NoError(t, err)
+
+		wb := repl.DB().NewIndexedBatch()
+		cmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
+			Kv: &rfpb.KV{
+				Key:   []byte("foo"),
+				Value: []byte("bar"),
+			},
+		}).ToProto()
+		_, err = repl.PrepareTransaction(wb, txid, cmd)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), constants.TxnRolledBackMessage)
+		require.NoError(t, wb.Close())
+	}
+}
+
+func TestRollbackMarkerGCFiltersByTimestamp(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	_, err := repl.Open(stopc)
+	require.NoError(t, err)
+
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	now := time.Now()
+	oldTxid := []byte("old-tx")
+	newTxid := []byte("new-tx")
+	wb := repl.DB().NewIndexedBatch()
+	require.NoError(t, repl.RollbackTransaction(wb, oldTxid, now.Add(-4*24*time.Hour).UnixMicro()))
+	require.NoError(t, repl.RollbackTransaction(wb, newTxid, now.UnixMicro()))
+	require.NoError(t, wb.Commit(pebble.Sync))
+	require.NoError(t, wb.Close())
+
+	hasMarkers, err := repl.HasTxnRollbackMarkersBeforeForTest(now.Add(-3 * 24 * time.Hour).UnixMicro())
+	require.NoError(t, err)
+	require.True(t, hasMarkers)
+
+	batch := rbuilder.NewBatchBuilder().Add(&rfpb.DeleteTxnRollbackMarkersBeforeRequest{
+		CutoffUsec: now.Add(-3 * 24 * time.Hour).UnixMicro(),
+	})
+	entry := em.makeEntry(batch)
+	writeRsp, err := repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	require.NoError(t, rbuilder.NewBatchResponse(writeRsp[0].Result.Data).AnyError())
+
+	_, err = directRead(t, repl, keys.MakeKey(constants.LocalTxnRollbackMarkerPrefix, oldTxid))
+	require.Error(t, err)
+
+	_, err = directRead(t, repl, keys.MakeKey(constants.LocalTxnRollbackMarkerPrefix, newTxid))
+	require.NoError(t, err)
 }
 
 func TestTransactionsSurviveRestart(t *testing.T) {
@@ -1100,7 +1820,7 @@ func TestTransactionsSurviveRestart(t *testing.T) {
 		em := newEntryMaker(t)
 		writeDefaultRangeDescriptor(t, em, repl.Replica)
 
-		wb := repl.DB().NewBatch()
+		wb := repl.DB().NewIndexedBatch()
 		cmd, _ := rbuilder.NewBatchBuilder().Add(&rfpb.DirectWriteRequest{
 			Kv: &rfpb.KV{
 				Key:   []byte("foo"),
@@ -1129,6 +1849,10 @@ func TestTransactionsSurviveRestart(t *testing.T) {
 	{
 		repl := testutil.NewTestingReplicaWithLeaser(t, 1, 1, leaser)
 		require.NotNil(t, repl)
+		t.Cleanup(func() {
+			err := repl.Close()
+			require.NoError(t, err)
+		})
 
 		stopc := make(chan struct{})
 		_, err := repl.Open(stopc)
@@ -1158,6 +1882,10 @@ func TestTransactionsSurviveRestart(t *testing.T) {
 	{
 		repl := testutil.NewTestingReplicaWithLeaser(t, 1, 1, leaser)
 		require.NotNil(t, repl)
+		t.Cleanup(func() {
+			err := repl.Close()
+			require.NoError(t, err)
+		})
 
 		stopc := make(chan struct{})
 		_, err := repl.Open(stopc)
@@ -1168,6 +1896,10 @@ func TestTransactionsSurviveRestart(t *testing.T) {
 func TestBatchTransaction(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	_, err := repl.Open(stopc)
@@ -1221,17 +1953,9 @@ func TestBatchTransaction(t *testing.T) {
 		require.Error(t, rbuilder.NewBatchResponse(rsp[0].Result.Data).AnyError())
 	}
 	{ // Do a DirectRead and verify the value is still `bar`.
-		buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectReadRequest{
-			Key: []byte("foo"),
-		}).ToBuf()
+		rsp, err := directRead(t, repl, []byte("foo"))
 		require.NoError(t, err)
-		readRsp, err := repl.Lookup(buf)
-		require.NoError(t, err)
-
-		readBatch := rbuilder.NewBatchResponse(readRsp)
-		directRead, err := readBatch.DirectReadResponse(0)
-		require.NoError(t, err)
-		require.Equal(t, []byte("bar"), directRead.GetKv().GetValue())
+		require.Equal(t, []byte("bar"), rsp.GetKv().GetValue())
 	}
 	session.Index++
 	{ // Commit the transaction
@@ -1258,17 +1982,9 @@ func TestBatchTransaction(t *testing.T) {
 		require.True(t, status.IsNotFoundError(err), "CommitTransaction should return NotFound error")
 	}
 	{ // Do a DirectRead and verify the value was updated by the txn.
-		buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.DirectReadRequest{
-			Key: []byte("foo"),
-		}).ToBuf()
+		rsp, err := directRead(t, repl, []byte("foo"))
 		require.NoError(t, err)
-		readRsp, err := repl.Lookup(buf)
-		require.NoError(t, err)
-
-		readBatch := rbuilder.NewBatchResponse(readRsp)
-		directRead, err := readBatch.DirectReadResponse(0)
-		require.NoError(t, err)
-		require.Equal(t, []byte("transaction-succeeded"), directRead.GetKv().GetValue())
+		require.Equal(t, []byte("transaction-succeeded"), rsp.GetKv().GetValue())
 	}
 	session.Index++
 	{ // Value should be direct writable again (no more pending txns)
@@ -1289,6 +2005,10 @@ func TestScanSharedDB(t *testing.T) {
 	{
 		repl1 := testutil.NewTestingReplica(t, 1, 1)
 		require.NotNil(t, repl1)
+		t.Cleanup(func() {
+			err := repl1.Close()
+			require.NoError(t, err)
+		})
 
 		repl2 := testutil.NewTestingReplicaWithLeaser(t, 2, 1, repl1.Leaser())
 		require.NotNil(t, repl2)
@@ -1337,18 +2057,16 @@ func TestScanSharedDB(t *testing.T) {
 		gotRD := &rfpb.RangeDescriptor{}
 		require.NoError(t, proto.Unmarshal(scanRsp.GetKvs()[0].GetValue(), gotRD))
 		require.Equal(t, keys.Key("z"), keys.Key(gotRD.GetEnd()))
-
-		err = repl1.Close()
-		require.NoError(t, err)
-
-		err = repl2.Close()
-		require.NoError(t, err)
 	}
 }
 
 func TestDeleteSessions(t *testing.T) {
 	repl := testutil.NewTestingReplica(t, 1, 1)
 	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
 
 	stopc := make(chan struct{})
 	lastAppliedIndex, err := repl.Open(stopc)
@@ -1368,7 +2086,7 @@ func TestDeleteSessions(t *testing.T) {
 	{
 		// Write session 1
 		entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session1).Add(&rfpb.IncrementRequest{
-			Key:   []byte("incr-key"),
+			Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key")),
 			Delta: 1,
 		}))
 		writeRsp, err := repl.Update([]dbsm.Entry{entry})
@@ -1391,7 +2109,7 @@ func TestDeleteSessions(t *testing.T) {
 	{
 		// Write session 2
 		entry := em.makeEntry(rbuilder.NewBatchBuilder().SetSession(session2).Add(&rfpb.IncrementRequest{
-			Key:   []byte("incr-key"),
+			Key:   keys.MakeKey(constants.SystemPrefix, []byte("incr-key")),
 			Delta: 1,
 		}))
 		writeRsp, err := repl.Update([]dbsm.Entry{entry})
@@ -1425,7 +2143,7 @@ func TestDeleteSessions(t *testing.T) {
 		require.NoError(t, err)
 	}
 	// Verify that session 1 is deleted and session 2 is not
-	start, end := keys.Range(constants.LocalSessionPrefix)
+	start, end := keys.Range(constants.SessionPrefix)
 	buf, err := rbuilder.NewBatchBuilder().Add(&rfpb.ScanRequest{
 		Start:    start,
 		End:      end,
@@ -1450,4 +2168,217 @@ func TestDeleteSessions(t *testing.T) {
 	session2.EntryIndex = proto.Uint64(3)
 	session3.EntryIndex = proto.Uint64(4)
 	require.ElementsMatch(t, got, []*rfpb.Session{session2, session3})
+}
+
+func TestUpdateATime(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	lastAppliedIndex, err := repl.Open(stopc)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastAppliedIndex)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	// Create a file record and write initial metadata with an access time
+	r, _ := testdigest.RandomCASResourceBuf(t, 1000)
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
+			CacheType:   rspb.CacheType_CAS,
+			PartitionId: "default",
+			GroupId:     interfaces.AuthAnonymousUser,
+		},
+		Digest:         r.GetDigest(),
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+
+	initialATime := int64(1_000_000)
+	md := &sgpb.FileMetadata{
+		FileRecord: fileRecord,
+		StorageMetadata: &sgpb.StorageMetadata{
+			InlineMetadata: &sgpb.StorageMetadata_InlineMetadata{
+				Data: []byte("test-data"),
+			},
+		},
+		LastAccessUsec: initialATime,
+	}
+
+	fs := filestore.New()
+	key, err := fs.PebbleKey(fileRecord)
+	require.NoError(t, err)
+	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	require.NoError(t, err)
+
+	// Write the initial file metadata
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.SetRequest{
+		Key:          fileMetadataKey,
+		FileMetadata: md,
+	}))
+	entries := []dbsm.Entry{entry}
+	writeRsp, err := repl.Update(entries)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(writeRsp))
+
+	// Test case 1: New atime comes before old atime - should not update
+	olderATime := int64(500_000)
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.UpdateAtimeRequest{
+			Key:            fileMetadataKey,
+			AccessTimeUsec: olderATime,
+		}))
+		entries := []dbsm.Entry{entry}
+		updateRsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.Equal(t, 1, len(updateRsp))
+		require.NoError(t, rbuilder.NewBatchResponse(updateRsp[0].Result.Data).AnyError())
+
+		// Verify that atime was NOT updated (should still be initialATime)
+		rsp, err := directRead(t, repl, fileMetadataKey)
+		require.NoError(t, err)
+
+		gotMd := &sgpb.FileMetadata{}
+		err = proto.Unmarshal(rsp.GetKv().GetValue(), gotMd)
+		require.NoError(t, err)
+		require.Equal(t, initialATime, gotMd.GetLastAccessUsec(), "atime should not be updated when new atime is older")
+	}
+
+	// Test case 2: New atime comes after old atime - should update
+	newerATime := int64(2_000_000)
+	{
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.UpdateAtimeRequest{
+			Key:            fileMetadataKey,
+			AccessTimeUsec: newerATime,
+		}))
+		entries := []dbsm.Entry{entry}
+		updateRsp, err := repl.Update(entries)
+		require.NoError(t, err)
+		require.Equal(t, 1, len(updateRsp))
+		require.NoError(t, rbuilder.NewBatchResponse(updateRsp[0].Result.Data).AnyError())
+
+		// Verify that atime was updated to newerATime
+		rsp, err := directRead(t, repl, fileMetadataKey)
+		require.NoError(t, err)
+
+		gotMd := &sgpb.FileMetadata{}
+		err = proto.Unmarshal(rsp.GetKv().GetValue(), gotMd)
+		require.NoError(t, err)
+		require.Equal(t, newerATime, gotMd.GetLastAccessUsec(), "atime should be updated when new atime is newer")
+	}
+}
+
+func TestUpdateATimeGCSCustomTime(t *testing.T) {
+	repl := testutil.NewTestingReplica(t, 1, 1)
+	require.NotNil(t, repl)
+	t.Cleanup(func() {
+		err := repl.Close()
+		require.NoError(t, err)
+	})
+
+	stopc := make(chan struct{})
+	lastAppliedIndex, err := repl.Open(stopc)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), lastAppliedIndex)
+	em := newEntryMaker(t)
+	writeDefaultRangeDescriptor(t, em, repl.Replica)
+
+	r, _ := testdigest.RandomCASResourceBuf(t, 1000)
+	fileRecord := &sgpb.FileRecord{
+		Isolation: &sgpb.Isolation{
+			CacheType:   rspb.CacheType_CAS,
+			PartitionId: "default",
+			GroupId:     interfaces.AuthAnonymousUser,
+		},
+		Digest:         r.GetDigest(),
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+
+	initialCustomTime := int64(1_000_000)
+	md := &sgpb.FileMetadata{
+		FileRecord: fileRecord,
+		StorageMetadata: &sgpb.StorageMetadata{
+			GcsMetadata: &sgpb.StorageMetadata_GCSMetadata{
+				BlobName:           "test-blob",
+				LastCustomTimeUsec: initialCustomTime,
+			},
+		},
+		LastAccessUsec: int64(1_000_000),
+	}
+
+	fs := filestore.New()
+	key, err := fs.PebbleKey(fileRecord)
+	require.NoError(t, err)
+	fileMetadataKey, err := key.Bytes(filestore.Version5)
+	require.NoError(t, err)
+
+	entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(&rfpb.SetRequest{
+		Key:          fileMetadataKey,
+		FileMetadata: md,
+	}))
+	writeRsp, err := repl.Update([]dbsm.Entry{entry})
+	require.NoError(t, err)
+	require.Equal(t, 1, len(writeRsp))
+
+	updateATime := func(t *testing.T, req *rfpb.UpdateAtimeRequest) *sgpb.FileMetadata {
+		t.Helper()
+		entry := em.makeEntry(rbuilder.NewBatchBuilder().Add(req))
+		updateRsp, err := repl.Update([]dbsm.Entry{entry})
+		require.NoError(t, err)
+		require.Equal(t, 1, len(updateRsp))
+		require.NoError(t, rbuilder.NewBatchResponse(updateRsp[0].Result.Data).AnyError())
+
+		rsp, err := directRead(t, repl, fileMetadataKey)
+		require.NoError(t, err)
+		gotMd := &sgpb.FileMetadata{}
+		require.NoError(t, proto.Unmarshal(rsp.GetKv().GetValue(), gotMd))
+		return gotMd
+	}
+
+	// An update that did not refresh the object's custom time leaves the
+	// recorded custom time alone.
+	{
+		gotMd := updateATime(t, &rfpb.UpdateAtimeRequest{
+			Key:            fileMetadataKey,
+			AccessTimeUsec: int64(2_000_000),
+		})
+		require.Equal(t, int64(2_000_000), gotMd.GetLastAccessUsec())
+		require.Equal(t, initialCustomTime, gotMd.GetStorageMetadata().GetGcsMetadata().GetLastCustomTimeUsec(), "custom time should be untouched when the request does not set one")
+	}
+
+	// A refreshed custom time is recorded.
+	newCustomTime := int64(3_000_000)
+	{
+		gotMd := updateATime(t, &rfpb.UpdateAtimeRequest{
+			Key:                fileMetadataKey,
+			AccessTimeUsec:     int64(3_000_000),
+			LastCustomTimeUsec: newCustomTime,
+		})
+		require.Equal(t, newCustomTime, gotMd.GetStorageMetadata().GetGcsMetadata().GetLastCustomTimeUsec(), "refreshed custom time should be recorded")
+	}
+
+	// The custom time only moves forward, so a replayed or reordered update
+	// cannot make a live object look older than it is.
+	{
+		gotMd := updateATime(t, &rfpb.UpdateAtimeRequest{
+			Key:                fileMetadataKey,
+			AccessTimeUsec:     int64(4_000_000),
+			LastCustomTimeUsec: int64(2_000_000),
+		})
+		require.Equal(t, newCustomTime, gotMd.GetStorageMetadata().GetGcsMetadata().GetLastCustomTimeUsec(), "custom time should not move backwards")
+	}
+
+	// A stale atime does not block recording a newer custom time.
+	{
+		gotMd := updateATime(t, &rfpb.UpdateAtimeRequest{
+			Key:                fileMetadataKey,
+			AccessTimeUsec:     int64(1),
+			LastCustomTimeUsec: int64(5_000_000),
+		})
+		require.Equal(t, int64(4_000_000), gotMd.GetLastAccessUsec(), "atime should not move backwards")
+		require.Equal(t, int64(5_000_000), gotMd.GetStorageMetadata().GetGcsMetadata().GetLastCustomTimeUsec(), "custom time should be recorded even when the atime is stale")
+	}
 }

@@ -6,17 +6,22 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/block_io"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/cpuset"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 
@@ -35,6 +40,10 @@ const (
 var (
 	// ErrV1NotSupported is returned when a function does not support cgroup V1.
 	ErrV1NotSupported = fmt.Errorf("cgroup v1 is not supported")
+
+	// true if we've ever gotten EOPNOTSUPP when trying to read a PSI file. This
+	// can happen for some cloud platforms which have PSI disabled by default.
+	psiNotSupported atomic.Bool
 )
 
 // GetCurrent returns the cgroup of which the current process is a member.
@@ -50,20 +59,19 @@ func GetCurrent() (string, error) {
 	if s == "" {
 		return "", nil
 	}
-	lines := strings.Split(s, "\n")
+	line, _, found := strings.Cut(s, "\n")
 	// In cgroup v1, a process can be a member of multiple cgroup hierarchies.
-	if len(lines) > 1 {
+	if found {
 		return "", ErrV1NotSupported
 	}
-	parts := strings.Split(lines[0], ":")
-	if len(parts) < 3 {
+	_, parts, _ := strings.Cut(line, ":")
+	controllers, path, found := strings.Cut(parts, ":")
+	if !found {
 		return "", fmt.Errorf("invalid /proc/self/cgroup value %q", err)
 	}
-	if controllers := parts[1]; controllers != "" {
+	if controllers != "" {
 		return "", ErrV1NotSupported
 	}
-	// re-join in case the path itself contains ":"
-	path := strings.Join(parts[2:], ":")
 	// Strip leading "/"
 	path = strings.TrimPrefix(path, string(os.PathSeparator))
 	return path, nil
@@ -80,28 +88,117 @@ func Setup(ctx context.Context, path string, s *scpb.CgroupSettings, blockDevice
 	if len(m) == 0 {
 		return nil
 	}
-	enabledControllers, err := ParentEnabledControllers(path)
+	enabledControllers, err := EnabledControllers(path)
 	if err != nil {
 		return fmt.Errorf("read enabled controllers: %w", err)
 	}
 	for name, value := range m {
 		controller, _, _ := strings.Cut(name, ".")
 		if !enabledControllers[controller] {
-			log.CtxWarningf(ctx, "Skipping cgroup %q setting for disabled cgroup controller %q", name, controller)
-			continue
+			// Attempt to enable the controller if it's not already enabled.
+			if err := EnableController(path, controller); err != nil {
+				log.CtxWarningf(ctx, "Failed to enable cgroup controller %q for cgroup %q: %s", controller, path, err)
+				continue
+			}
+			enabledControllers[controller] = true
 		}
 		settingFilePath := filepath.Join(path, name)
 		if err := os.WriteFile(settingFilePath, []byte(value), 0); err != nil {
+			logSetupPermissionDeniedDiagnostics(ctx, path, name, value, err)
 			return fmt.Errorf("write %q to cgroup file %q: %w", value, name, err)
 		}
 	}
 	return nil
 }
 
-// ParentEnabledControllers returns the cgroup controllers that are enabled for
-// the parent cgroup of a given cgroup.
-func ParentEnabledControllers(path string) (map[string]bool, error) {
-	b, err := os.ReadFile(filepath.Join(path, "..", "cgroup.subtree_control"))
+func logSetupPermissionDeniedDiagnostics(ctx context.Context, path, settingName, settingValue string, writeErr error) {
+	if !errors.Is(writeErr, fs.ErrPermission) && !errors.Is(writeErr, syscall.EPERM) && !errors.Is(writeErr, syscall.EACCES) {
+		return
+	}
+	settingPath := filepath.Join(path, settingName)
+	parent := ParentPath(path)
+	grandparent := ParentPath(parent)
+	currentCgroup, currentCgroupErr := GetCurrent()
+	currentCgroupInfo := currentCgroup
+	if currentCgroupErr != nil {
+		currentCgroupInfo = fmt.Sprintf("<%s>", currentCgroupErr)
+	}
+
+	fields := []string{
+		fmt.Sprintf("setting=%q", settingName),
+		fmt.Sprintf("value=%q", settingValue),
+		fmt.Sprintf("file=%q", settingPath),
+		fmt.Sprintf("path=%q", path),
+		fmt.Sprintf("parent=%q", parent),
+		fmt.Sprintf("grandparent=%q", grandparent),
+		fmt.Sprintf("uid=%d euid=%d gid=%d egid=%d", os.Getuid(), os.Geteuid(), os.Getgid(), os.Getegid()),
+		fmt.Sprintf("self_cgroup=%q", currentCgroupInfo),
+		describePath(path),
+		describePath(parent),
+		describePath(grandparent),
+		describeFile(settingPath),
+		describeCgroupFiles(path),
+		describeCgroupFiles(parent),
+		describeCgroupFiles(grandparent),
+	}
+
+	log.CtxWarningf(ctx, "cgroup write permission diagnostics: %s", strings.Join(fields, " | "))
+}
+
+func describePath(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Sprintf("stat(%q):<%s>", path, err)
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Sprintf("stat(%q):mode=%s", path, fi.Mode().String())
+	}
+	return fmt.Sprintf("stat(%q):mode=%s uid=%d gid=%d", path, fi.Mode().String(), stat.Uid, stat.Gid)
+}
+
+func describeFile(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Sprintf("file(%q):<%s>", path, err)
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Sprintf("file(%q):mode=%s", path, fi.Mode().String())
+	}
+	return fmt.Sprintf("file(%q):mode=%s uid=%d gid=%d", path, fi.Mode().String(), stat.Uid, stat.Gid)
+}
+
+func describeCgroupFiles(path string) string {
+	files := []string{"cgroup.type", "cgroup.controllers", "cgroup.subtree_control", "cgroup.procs"}
+	var parts []string
+	for _, name := range files {
+		value, err := readTrimmedCgroupValue(filepath.Join(path, name))
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("%s:<%s>", name, err))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s:%q", name, value))
+	}
+	return fmt.Sprintf("cgroup(%q){%s}", path, strings.Join(parts, ", "))
+}
+
+func readTrimmedCgroupValue(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSpace(string(b))
+	if len(s) > 200 {
+		s = s[:200] + "...(truncated)"
+	}
+	return s, nil
+}
+
+// EnabledControllers returns the controllers enabled for the cgroup at the
+// given absolute path.
+func EnabledControllers(path string) (map[string]bool, error) {
+	b, err := os.ReadFile(filepath.Join(path, "cgroup.controllers"))
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +208,81 @@ func ParentEnabledControllers(path string) (map[string]bool, error) {
 		enabled[f] = true
 	}
 	return enabled, nil
+}
+
+// EnableController enables the given controller for the cgroup at the given
+// path. It recursively enables the controller for all ancestor cgroups as
+// needed. Note that this will fail if any non-root ancestors have processes in
+// them, since non-root cgroups cannot have child cgroups if they have
+// processes.
+func EnableController(path string, controller string) error {
+	path = filepath.Clean(path)
+	log.Debugf("Enabling cgroup controller %q for %q", controller, path)
+	// Stack of cgroup paths to enable the controller for.
+	var stack []string
+	for {
+		enabled, err := EnabledControllers(path)
+		if err != nil {
+			return fmt.Errorf("read enabled controllers for %q: %w", path, err)
+		}
+		if enabled[controller] {
+			break
+		}
+		path = ParentPath(path)
+		stack = append(stack, path)
+		if path == RootPath {
+			break
+		}
+	}
+	for _, s := range slices.Backward(stack) {
+		log.Infof("Enabling cgroup subtree controller %q for %q", controller, s)
+		if err := WriteSubtreeControl(s, map[string]bool{controller: true}); err != nil {
+			return fmt.Errorf("write subtree control for %q: %w", s, err)
+		}
+	}
+	return nil
+}
+
+// ParentPath returns the parent cgroup path for the given cgroup path.
+func ParentPath(path string) string {
+	path = filepath.Clean(path)
+	if path == RootPath {
+		return RootPath
+	}
+	return filepath.Dir(path)
+}
+
+// WriteSubtreeControl writes to the "cgroup.subtree_control" file under the
+// given cgroup absolute path. For each map entry in settings, the key indicates
+// the controller name, and the value sets the controller's enabled status.
+// Controllers not present in the map are unaffected.
+func WriteSubtreeControl(path string, settings map[string]bool) error {
+	strs := make([]string, 0, len(settings))
+	for controller, enabled := range settings {
+		var statusPrefix string
+		if enabled {
+			statusPrefix = "+"
+		} else {
+			statusPrefix = "-"
+		}
+		strs = append(strs, statusPrefix+controller)
+	}
+	b := []byte(strings.Join(strs, " "))
+	return os.WriteFile(filepath.Join(path, "cgroup.subtree_control"), b, 0)
+}
+
+// DelegateControllers reads the currently enabled controllers for the given
+// cgroup absolute path and makes those controllers available to child cgroups
+// by writing to the "cgroup.subtree_control" file.
+func DelegateControllers(path string) error {
+	controllers, err := EnabledControllers(path)
+	if err != nil {
+		return fmt.Errorf("read enabled controllers for %q: %w", path, err)
+	}
+	if err := WriteSubtreeControl(path, controllers); err != nil {
+		return fmt.Errorf("write cgroup.subtree_control for %q: %w", path, err)
+	}
+	return nil
 }
 
 func settingsMap(s *scpb.CgroupSettings, blockDevice *block_io.Device) (map[string]string, error) {
@@ -193,6 +365,12 @@ func settingsMap(s *scpb.CgroupSettings, blockDevice *block_io.Device) (map[stri
 			m["io.max"] = fmt.Sprintf("%d:%d %s", blockDevice.Maj, blockDevice.Min, strings.Join(limitFields, " "))
 		}
 	}
+	if len(s.GetCpusetCpus()) > 0 {
+		m["cpuset.cpus"] = cpuset.Format(s.GetCpusetCpus()...)
+	}
+	if s.NumaNode != nil {
+		m["cpuset.mems"] = cpuset.Format(s.GetNumaNode())
+	}
 	return m, nil
 }
 
@@ -213,6 +391,10 @@ func fmtPercent(v float32) string {
 // A single instance should be shared across all containers of the same
 // isolation type, since the first call to Stats() walks the cgroupfs tree in
 // order to discover the cgroup path locations.
+//
+// This struct supports both v1 and v2. If only v2 support is required and the
+// full cgroup path is known, consider calling Stats() directly, passing in
+// the cgroup v2 path.
 type Paths struct {
 	mu sync.RWMutex
 
@@ -236,6 +418,12 @@ func (p *Paths) CgroupVersion() int {
 	return 0 // unknown
 }
 
+// V2Dir returns the cgroup v2 directory for the container with the given name
+// (cgroup v2 only).
+func (p *Paths) V2Dir(name string) string {
+	return strings.ReplaceAll(p.V2DirTemplate, cidPlaceholder, name)
+}
+
 // Stats returns cgroup stats for the cgroup matching the given name. If
 // blockDevice is non-nil, IO stats are included for the device, otherwise IO
 // stats are not reported.
@@ -249,8 +437,145 @@ func (p *Paths) Stats(ctx context.Context, name string, blockDevice *block_io.De
 	}
 
 	// cgroup v2 has all cgroup files under a single dir.
-	dir := strings.ReplaceAll(p.V2DirTemplate, cidPlaceholder, name)
+	return Stats(ctx, p.V2Dir(name), blockDevice)
+}
 
+// ReadCgroupProcs returns the process IDs of the processes in the cgroup at
+// the given path, including processes in descendant cgroups. Descendants are
+// included because a cgroup with child cgroups usually has no processes of
+// its own; for example, some container runtime configurations place container
+// processes in a child cgroup of the container's top-level cgroup.
+func ReadCgroupProcs(path string) (map[int]struct{}, error) {
+	pids := make(map[int]struct{})
+	err := filepath.WalkDir(path, func(entryPath string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			// Tolerate descendant cgroups that are removed while walking, but
+			// report a missing root so that callers can tell that the cgroup
+			// itself is gone.
+			if entryPath != path && errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		b, err := os.ReadFile(filepath.Join(entryPath, "cgroup.procs"))
+		if err != nil {
+			if entryPath != path && errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("read cgroup.procs: %w", err)
+		}
+		for field := range strings.FieldsSeq(string(b)) {
+			pid, err := strconv.Atoi(field)
+			if err != nil {
+				return fmt.Errorf("parse cgroup PID %q: %w", field, err)
+			}
+			if pid <= 0 {
+				return fmt.Errorf("cgroup PID is out of range (%d)", pid)
+			}
+			pids[pid] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pids, nil
+}
+
+// ReadMemoryEvents reads the "memory.events" file under the given cgroup
+// directory and returns the counter values as a map. The directory should be an
+// absolute path, including the /sys/fs/cgroup prefix.
+func ReadMemoryEvents(dir string) (map[string]int64, error) {
+	return readAllInt64Fields(filepath.Join(dir, "memory.events"))
+}
+
+// ReadMemoryCurrent reads the "memory.current" file under the given cgroup
+// directory and returns the current memory usage in bytes. The directory should
+// be an absolute path, including the /sys/fs/cgroup prefix.
+func ReadMemoryCurrent(dir string) (int64, error) {
+	return readInt64FromFile(filepath.Join(dir, "memory.current"))
+}
+
+// ReadMemoryMax reads the "memory.max" file under the given cgroup directory
+// and returns the configured memory limit in bytes, or nil if the limit is
+// "max" (unlimited). The directory should be an absolute path, including the
+// /sys/fs/cgroup prefix.
+func ReadMemoryMax(dir string) (*int64, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "memory.max"))
+	if err != nil {
+		return nil, err
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "max" {
+		return nil, nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// ReadEffectiveMemoryLimit returns the smallest "memory.max" limit in effect
+// for the cgroup at the given absolute path and the absolute path of the
+// cgroup setting that limit, taking ancestor cgroup limits into account. It
+// returns an empty path and nil limit if neither the cgroup nor any of its
+// ancestors sets a limit. When the same smallest limit is set at multiple
+// levels, it returns the outermost such cgroup, because memory charged to an
+// ancestor by siblings counts against the shared limit and should be included
+// when the returned cgroup's usage is measured. The walk includes the cgroupfs
+// root. The real cgroup v2 root has no memory.max file and is treated as
+// unlimited, but under a cgroup namespace the root directory is a non-root
+// cgroup on the host, and any limit set on it applies.
+func ReadEffectiveMemoryLimit(dir string) (string, *int64, error) {
+	var limitCgroupPath string
+	var limit *int64
+	for dir = filepath.Clean(dir); dir == RootPath || strings.HasPrefix(dir, RootPath+string(os.PathSeparator)); dir = ParentPath(dir) {
+		v, err := ReadMemoryMax(dir)
+		if err != nil {
+			if dir == RootPath && os.IsNotExist(err) {
+				break
+			}
+			return "", nil, err
+		}
+		if v != nil && (limit == nil || *v <= *limit) {
+			limitCgroupPath = dir
+			limit = v
+		}
+		if dir == RootPath {
+			break
+		}
+	}
+	return limitCgroupPath, limit, nil
+}
+
+// ReadMemoryStatField reads the given field from the "memory.stat" file under
+// the given cgroup directory. The directory should be an absolute path,
+// including the /sys/fs/cgroup prefix.
+func ReadMemoryStatField(dir, field string) (int64, error) {
+	return readCgroupInt64Field(filepath.Join(dir, "memory.stat"), field)
+}
+
+// ReadMemoryStat reads the "memory.stat" file under the given cgroup directory
+// and returns the field values as a map. The directory should be an absolute
+// path, including the /sys/fs/cgroup prefix.
+func ReadMemoryStat(dir string) (map[string]int64, error) {
+	return readAllInt64Fields(filepath.Join(dir, "memory.stat"))
+}
+
+// ReadPidsEvents reads the "pids.events" file under the given cgroup
+// directory and returns the counter values as a map. The directory should be an
+// absolute path, including the /sys/fs/cgroup prefix.
+func ReadPidsEvents(dir string) (map[string]int64, error) {
+	return readAllInt64Fields(filepath.Join(dir, "pids.events"))
+}
+
+// Stats reads all stats from the given cgroup2 directory. The directory should
+// be an absolute path, including the /sys/fs/cgroup prefix.
+func Stats(ctx context.Context, dir string, blockDevice *block_io.Device) (*repb.UsageStats, error) {
 	// Read CPU usage.
 	// cpu.stat file contains a line like "usage_usec <N>"
 	// It contains other lines like user_usec, system_usec etc. but we just
@@ -262,8 +587,7 @@ func (p *Paths) Stats(ctx context.Context, name string, blockDevice *block_io.De
 	}
 
 	// Read memory usage
-	memUsagePath := filepath.Join(dir, "memory.current")
-	memoryBytes, err := readInt64FromFile(memUsagePath)
+	memoryBytes, err := ReadMemoryCurrent(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -287,24 +611,24 @@ func (p *Paths) Stats(ctx context.Context, name string, blockDevice *block_io.De
 	}
 
 	// Read PSI metrics.
-	// Note that PSI may not be supported in all environments,
-	// so ignore NotExist errors.
+	// Note that PSI may not be supported in all environments. The files may
+	// either be missing, or reads may return EOPNOTSUPP if PSI is disabled.
 
 	cpuPressurePath := filepath.Join(dir, "cpu.pressure")
-	cpuPressure, err := readPSIFile(cpuPressurePath)
-	if err != nil && !os.IsNotExist(err) {
+	cpuPressure, err := readPSIFileIfSupported(cpuPressurePath)
+	if err != nil {
 		return nil, err
 	}
 
 	memPressurePath := filepath.Join(dir, "memory.pressure")
-	memPressure, err := readPSIFile(memPressurePath)
-	if err != nil && !os.IsNotExist(err) {
+	memPressure, err := readPSIFileIfSupported(memPressurePath)
+	if err != nil {
 		return nil, err
 	}
 
 	ioPressurePath := filepath.Join(dir, "io.pressure")
-	ioPressure, err := readPSIFile(ioPressurePath)
-	if err != nil && !os.IsNotExist(err) {
+	ioPressure, err := readPSIFileIfSupported(ioPressurePath)
+	if err != nil {
 		return nil, err
 	}
 
@@ -444,6 +768,55 @@ func readCgroupInt64Field(path, fieldName string) (int64, error) {
 	return 0, status.NotFoundErrorf("could not find field %q in %s", fieldName, path)
 }
 
+// readAllInt64Fields reads a cgroupfs file containing a list of lines like
+// "<name> <int64_value>" and returns the mapping of names to values.
+func readAllInt64Fields(path string) (map[string]int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(b))
+	m := map[string]int64{}
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("malformed cgroup file contents: line %q does not match '<name> <int64_value>' format", scanner.Text())
+		}
+		val, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed cgroup file contents: line %q does not match '<name> <int64_value>' format", scanner.Text())
+		}
+		m[fields[0]] = val
+	}
+	return m, nil
+}
+
+func readPSIFileIfSupported(path string) (*repb.PSI, error) {
+	if psiNotSupported.Load() {
+		return nil, nil
+	}
+	psi, err := readPSIFile(path)
+	if err != nil {
+		// TODO: can NotExist happen in cases where PSI is supported (e.g.
+		// occasionally, due to race conditions or other edge cases)? If not,
+		// maybe set psiNotSupported=true to match the EOPNOTSUPP case below.
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		// On some systems, PSI files may exist, but trying to read them
+		// returns EOPNOTSUPP. Detect this case lazily and prevent future PSI
+		// reads.
+		if errors.Is(err, syscall.EOPNOTSUPP) {
+			if psiNotSupported.CompareAndSwap(false, true) {
+				log.Infof("Linux PSI is unavailable: reading cgroup pressure file %q returned EOPNOTSUPP. BuildBuddy will omit PSI metrics; CPU, memory, and IO usage stats are still collected, but task autosizing may be less accurate. To enable PSI, boot executor nodes with kernel parameter psi=1.", path)
+			}
+			return nil, nil
+		}
+		return nil, err
+	}
+	return psi, nil
+}
+
 func readPSIFile(path string) (*repb.PSI, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -478,7 +851,7 @@ func readPSI(r io.Reader) (*repb.PSI, error) {
 		}
 		// Parse avgs
 		var avgs [3]float32
-		for i := 0; i < len(avgs); i++ {
+		for i := range len(avgs) {
 			field := fields[i+1]
 			name, rawValue, ok := strings.Cut(field, "=")
 			if !ok {

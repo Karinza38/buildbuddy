@@ -177,6 +177,45 @@ message FrontendConfig {
 
   // Whether the community links is enabled in the UI.
   bool community_links_enabled = 58;
+
+  // If set, the login page will default to using this slug.
+  string default_login_slug = 59;
+
+  // IF set, the BuildBuddy logo will flip on hover.
+  bool flip_logo_on_hover = 60;
+
+  // Whether the read-only BuildBuddy GitHub app is enabled.
+  bool read_only_github_app_enabled = 61;
+
+  bool targets_page_enabled = 62;
+
+  bool user_lists_ui_enabled = 63;
+
+  // Whether action result origin metadata is recorded and can be displayed.
+  bool action_result_origin_enabled = 64;
+
+  // Whether dark mode UI is enabled.
+  bool dark_mode_enabled = 65;
+
+  // Whether API key values can be retrieved after they are created.
+  // If false, API key metadata should still be accessible, but values should
+  // be omitted from read APIs.
+  // If this field is absent, clients should treat it as true.
+  optional bool api_key_value_readback_enabled = 66;
+
+  // Whether organization membership requests via the /join flow are enabled.
+  // If this field is absent, clients should treat membership requests as
+  // enabled.
+  optional bool group_membership_requests_enabled = 67;
+
+  // Whether usage alerts are enabled.
+  bool usage_alerts_enabled = 68;
+
+  // Maximum timing profile size that the UI will load.
+  int64 timing_profile_max_size_bytes = 69;
+
+  // Whether cache proxy keys can be created.
+  bool cache_proxy_key_creation_enabled = 70;
 }
 
 message Region {

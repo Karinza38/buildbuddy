@@ -4,9 +4,13 @@ load(":defs.bzl", "bazel_pkg_tar")
 bazel_pkg_tar(
     name = "bazel_binaries_tar",
     versions = [
-        "5.3.2",
         "6.5.0",
-        "7.1.0",
+        "7.7.1",
+        "8.3.1",
+        "8.4.2",
+        "8.5.0",
+        "9.0.0rc3",
+        "9.1.1",  # used by testbazel
     ],
     visibility = ["//visibility:public"],
 )
@@ -17,6 +21,7 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/bazel",
     visibility = ["//visibility:public"],
     deps = [
+        "//cli/parser/bazel_command",
         "//server/util/log",
         "//server/util/status",
     ],

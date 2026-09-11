@@ -1,9 +1,7 @@
 syntax = "proto3";
 
-import "proto/resource.proto";
-import "proto/remote_execution.proto";
+import "proto/storage.proto";
 import "google/rpc/status.proto";
-import "github.com/planetscale/vtprotobuf/vtproto/ext.proto";
 
 package raft;
 
@@ -19,130 +17,23 @@ message KV {
   bytes value = 2;
 }
 
-// Isolation represents the cache isolation type of a particular item.
-message Isolation {
-  resource.CacheType cache_type = 1;
-  string remote_instance_name = 2;
-  string partition_id = 3;
-  string group_id = 4;
-}
-
-message Encryption {
-  string key_id = 1;
-}
-
-message FileRecord {
-  Isolation isolation = 1;
-  build.bazel.remote.execution.v2.Digest digest = 2;
-  build.bazel.remote.execution.v2.Compressor.Value compressor = 3;
-  Encryption encryption = 4;
-  build.bazel.remote.execution.v2.DigestFunction.Value digest_function = 5;
-}
-
-message StorageMetadata {
-  message FileMetadata {
-    string filename = 1;
-  }
-  FileMetadata file_metadata = 1;
-
-  message PebbleMetadata {
-    // The root key for all stored chunks.
-    bytes key = 1;
-
-    // The number of chunks stored in pebble
-    // for this file. Chunks are 1-indexed.
-    // Ex. If chunks == 2, a reader would expect to
-    // read: [chunk-1, chunk-2].
-    int64 chunks = 2;
-  }
-  PebbleMetadata pebble_metadata = 2;
-
-  message InlineMetadata {
-    bytes data = 1;
-    int64 created_at_nsec = 2;
-  }
-  InlineMetadata inline_metadata = 3;
-
-  message ChunkedMetadata {
-    repeated resource.ResourceName resource = 1;
-  }
-  ChunkedMetadata chunked_metadata = 4;
-
-  // Insert other storage types (gcs, etc) here.
-  // Upon read, the server will first read this record and then serve the
-  // contents of the the specified location.
-}
-
-message FileMetadata {
-  option (vtproto.mempool) = true;
-  FileRecord file_record = 1;
-  StorageMetadata storage_metadata = 2;
-  EncryptionMetadata encryption_metadata = 6;
-
-  // If data is compressed, this will be the compressed size
-  int64 stored_size_bytes = 3;
-
-  // Last access time of the record.
-  int64 last_access_usec = 4;
-
-  // Last modify time of the record
-  int64 last_modify_usec = 5;
-
-  enum FileType {
-    UNKNOWN_FILE_TYPE = 0;
-    // This is a complete file.
-    COMPLETE_FILE_TYPE = 1;
-    // This is a chunk coming from a larger file.
-    CHUNK_FILE_TYPE = 2;
-  }
-
-  FileType file_type = 7;
-}
-
-message EncryptionMetadata {
-  string encryption_key_id = 1;
-  int64 version = 2;
-}
-
-message PartitionMetadata {
-  int64 size_bytes = 1;
-  // CAS count and AC count are not populated by Raft cache.
-  int64 cas_count = 2;
-  int64 ac_count = 3;
-  int64 total_count = 4;
-  string partition_id = 5;
-}
-
-message PartitionMetadatas {
-  repeated PartitionMetadata metadata = 1;
-}
-
-// Next tag: 4
-message VersionMetadata {
-  // The int64 representation of a PebbleKeyVersion.
-  // This is the minimum version of data stored in the DB.
-  int64 min_version = 1;
-
-  // The int64 representation of a PebbleKeyVersion.
-  // This is the maximum version of data stored in the DB.
-  int64 max_version = 3;
-
-  // The time when the version was last changed.
-  int64 last_modify_usec = 2;
-}
-
+// State-idempotent (overwrite same value), response-idempotent (empty
+// response). Safe on splittable keys.
 message DirectWriteRequest {
   KV kv = 1;
 }
 
 message DirectWriteResponse {}
 
+// State-idempotent (delete-absent is a no-op), response-idempotent
+// (empty response). Safe on splittable keys.
 message DirectDeleteRequest {
   bytes key = 1;
 }
 
 message DirectDeleteResponse {}
 
+// Read. Response-idempotent. Safe on splittable keys.
 message DirectReadRequest {
   bytes key = 1;
 }
@@ -151,6 +42,10 @@ message DirectReadResponse {
   KV kv = 1;
 }
 
+// Not state-idempotent (delta is added on every apply) and not
+// response-idempotent (returns running sum). Not safe on splittable
+// keys: a cross-split retry would double-count. IncrementRequest must
+// only target non-splittable keys (local, meta, or system prefixes).
 message IncrementRequest {
   bytes key = 1;
   uint64 delta = 2;  // how much to increment by.
@@ -182,6 +77,15 @@ message ScanResponse {
 
 // Compare And Set Request
 // not the other CAS...
+//
+// State-idempotent: a second apply sees current != expected and does
+// not write, so the net state matches a single apply. Not response-
+// idempotent: the first apply returns success, the second returns
+// CASErrorMessage. Not safe on splittable keys — the caller of a
+// retry that lands on the new range after a split would observe a
+// false CAS failure even when the first apply succeeded. CASRequest
+// must only target non-splittable keys (local, meta, or system
+// prefixes).
 message CASRequest {
   KV kv = 1;
 
@@ -195,17 +99,44 @@ message CASResponse {
   KV kv = 1;
 }
 
+// Read. Response-idempotent. Safe on splittable keys.
 message FindSplitPointRequest {}
 message FindSplitPointResponse {
   bytes split_key = 1;
 }
 
+// State-idempotent (re-sweep finds nothing left to delete) and
+// response-idempotent (empty response). Operates on replica-local
+// session keys.
 message DeleteSessionsRequest {
   // Delete all client sessions created before created_at_usec;
   int64 created_at_usec = 1;
 }
 
 message DeleteSessionsResponse {}
+
+// State-idempotent (re-sweep finds nothing left to delete) and
+// response-idempotent (empty response). Operates on replica-local rollback
+// marker keys.
+message DeleteTxnRollbackMarkersBeforeRequest {
+  // Delete all txn rollback markers created before or at this timestamp.
+  int64 cutoff_usec = 1;
+}
+
+message DeleteTxnRollbackMarkersBeforeResponse {}
+
+message FetchRangesRequest {
+  // The filters are ORed.
+
+  // If set, filter ranges with the specified range ids.
+  repeated uint64 range_ids = 1;
+  // If set, filter ranges that have a replica with this NHID.
+  string nhid = 2;
+}
+
+message FetchRangesResponse {
+  repeated RangeDescriptor ranges = 1;
+}
 
 // Raft CMD API, used to encode raft commands that are replicated via raft and
 // written to a log. Everything written via SyncPropose must be a RequestUnion
@@ -220,6 +151,9 @@ message RequestUnion {
     CASRequest cas = 5;
     FindSplitPointRequest find_split_point = 14;
     DeleteSessionsRequest delete_sessions = 16;
+    FetchRangesRequest fetch_ranges = 17;
+    DeleteTxnRollbackMarkersBeforeRequest delete_txn_rollback_markers_before =
+        18;
 
     // The following operations are for getting and setting FileMetadata blobs.
     GetRequest get = 7;
@@ -249,6 +183,9 @@ message ResponseUnion {
     CASResponse cas = 6;
     FindSplitPointResponse find_split_point = 15;
     DeleteSessionsResponse delete_sessions = 17;
+    FetchRangesResponse fetch_ranges = 18;
+    DeleteTxnRollbackMarkersBeforeResponse delete_txn_rollback_markers_before =
+        19;
 
     // The following operations are for getting and setting FileMetadata blobs.
     GetResponse get = 8;
@@ -264,8 +201,27 @@ message ResponseUnion {
 
 message SnapshotClusterHook {}
 
+message StartShardHook {
+  uint64 range_id = 1;
+  map<uint64, string> initial_member = 2;
+}
+
 message PostCommitHook {
   SnapshotClusterHook snapshot_cluster = 1;
+  StartShardHook start_shard = 2;
+}
+
+message TransactionHook {
+  enum Phase {
+    UNKNOWN_PHASE = 0;
+    // Run this hook at the end of prepare-phase
+    PREPARE = 1;
+    // Run this hook at the end of commit-phase
+    COMMIT = 2;
+  }
+
+  Phase phase = 1;
+  PostCommitHook hook = 2;
 }
 
 message TxnRequest {
@@ -274,6 +230,17 @@ message TxnRequest {
     reserved 1;
     BatchCmdRequest raw_batch = 2;
     RangeDescriptor range = 3;
+    repeated TransactionHook hooks = 4;
+
+    // Is range validation required for the statement?
+    //
+    // It's required for the existing range This is to make sure the range
+    // descriptor on the range lease holder or current leader is up-to-date w/o
+    // a linearizable read to the meta range.
+    //
+    // However, for new ranges and meta range when itself is not updated. More
+    // details can be found at go/raft-range-validation-in-txn.
+    bool range_validation_required = 5;
   }
   repeated Statement statements = 2;
 }
@@ -317,6 +284,13 @@ message Session {
   // monotonically increasing.
   // Example: 1717100891000000000
   uint64 index = 2;
+  // Optional. The range_id the session is scoped to. When set, the replica
+  // namespaces its dedup record by (id, range_id). This prevents a retry that
+  // crosses ranges (e.g. on a split) from colliding with a destination range's
+  // entries that happen to share the same id. Left unset (0) by callers that
+  // never cross ranges (rangelease, bringup, deleteSessions); set by Sender
+  // in runPropose.
+  uint64 range_id = 3;
   // The timestamp when the session is created.
   int64 created_at_usec = 5;
 
@@ -348,6 +322,19 @@ message BatchCmdRequest {
 
   // Session is used to guarantee idempotency for writes on the state machine.
   optional Session session = 6;
+
+  // If set, the mapped_range will be locked when we prepare a transaction, no
+  // writes will be allowed; it will be unlocked when the transaction is
+  // committed or rolled back.
+  bool lock_mapped_range = 7;
+
+  // Wall-clock time (micros) at which the coordinator/janitor issued this
+  // finalize, stamped by the proposer so it is deterministic across replicas.
+  // On ROLLBACK it becomes the participant-local rollback marker's retention
+  // timestamp (see RollbackTransaction); startup GC deletes markers this old.
+  // Kept separate from `session` so marker retention does not depend on session
+  // lifetime semantics.
+  int64 txn_finalized_at_usec = 8;
 }
 
 message BatchCmdResponse {
@@ -369,8 +356,10 @@ message BatchCmdResponse {
 // which has knowledge of the queried node may respond with a
 // RegistryQueryResponse.
 message RegistryQueryRequest {
+  // Either (range_id, replica_Id) or nhid needs to be specified
   uint64 range_id = 1;
   uint64 replica_id = 2;
+  string nhid = 3;
 }
 
 message RegistryQueryResponse {
@@ -382,6 +371,18 @@ message RegistryQueryResponse {
   string raft_address = 3;
 }
 
+message GetRegistryRequest {}
+
+message ConnectionInfo {
+  string nhid = 1;
+  string grpc_address = 2;
+  string raft_address = 3;
+}
+
+message GetRegistryResponse {
+  repeated ConnectionInfo connections = 1;
+}
+
 message RegistryPushRequest {
   // Required.
   string nhid = 1;
@@ -389,8 +390,6 @@ message RegistryPushRequest {
   // Optional.
   string grpc_address = 2;
   string raft_address = 3;
-
-  repeated ReplicaDescriptor replicas = 4;
 }
 
 // The auto-bringup protocol is very simple: if no previous data is found on
@@ -455,7 +454,7 @@ message ReplicaUsage {
   int64 read_qps = 5;
   int64 raft_propose_qps = 6;
 
-  repeated PartitionMetadata partitions = 7;
+  reserved 7;
 }
 
 message StoreUsage {
@@ -466,18 +465,22 @@ message StoreUsage {
   int64 raft_propose_qps = 5;
   int64 total_bytes_used = 6;
   int64 total_bytes_free = 7;
+  // is_ready is set to true when the server finished initializing all
+  // replicas and also the server hasn't been called to stop
+  bool is_ready = 8;
 }
 
 message NodePartitionUsage {
   NodeDescriptor node = 1;
 
-  repeated PartitionMetadata partition_usage = 2;
+  repeated storage.PartitionMetadata partition_usage = 2;
 }
 
 message NodeDescriptor {
   string nhid = 1;
   string raft_address = 2;
   string grpc_address = 3;
+  string zone = 4;
 }
 
 message ReplicaDescriptor {
@@ -507,8 +510,29 @@ message Header {
 
   // Session is used to guarantee idempotency for writes on the state machine.
   optional Session session = 5;
+
+  // If set, skip the range descriptor generation check
+  bool skip_generation_check = 6;
 }
 
+message PartitionDescriptor {
+  string id = 1;
+  int64 initial_num_ranges = 2;
+  uint64 first_range_id = 3;
+
+  enum State {
+    UNKNOWN_STATE = 0;
+    // Partition is in the process of being set up
+    INITIALIZING = 1;
+    // Partition is fully set up and ready to serve requests
+    INITIALIZED = 2;
+    // Partition has been soft-deleted and should not serve new requests
+    SOFT_DELETED = 3;
+  }
+  State state = 4;
+
+  uint64 generation = 5;
+}
 message RangeSet {
   repeated RangeDescriptor ranges = 1;
 }
@@ -517,6 +541,7 @@ message RangeDescriptor {
   bytes start = 1;
   bytes end = 2;
 
+  string partition_id = 11;
   uint64 range_id = 3;
   repeated ReplicaDescriptor replicas = 4;
 
@@ -524,6 +549,20 @@ message RangeDescriptor {
 
   optional uint64 last_added_replica_id = 6;
   optional int64 last_replica_added_at_usec = 7;
+
+  // Replicas marked to be removed from the raft and pebble systems. Once a
+  // a replica is removed from the system successfully, it will be removed from
+  // this list.
+  repeated ReplicaDescriptor removed = 8;
+
+  // Replicas marked as staging are going to be added to the raft system. Once
+  // they are successfully added to raft, we will move the replica descriptor
+  // from staging to the replicas field above.
+  repeated ReplicaDescriptor staging = 9;
+
+  // If set, this range descriptor is deleted. Don't move, up-replicate,
+  // down-replicate or rebalance.
+  bool deleted = 10;
 }
 
 // SyncPropose, in proto form.
@@ -551,9 +590,7 @@ message StartShardRequest {
   uint64 replica_id = 2;
   map<uint64, string> initial_member = 3;
 
-  // The following commands will be SyncProposed on the local
-  // nodehost after the cluster has been created.
-  BatchCmdRequest batch = 4;
+  reserved 4;
 
   bool join = 5;
 
@@ -566,7 +603,7 @@ message StartShardRequest {
 }
 
 message StartShardResponse {
-  BatchCmdResponse batch = 1;
+  reserved 1;
 }
 
 message RemoveDataRequest {
@@ -574,9 +611,14 @@ message RemoveDataRequest {
   uint64 replica_id = 2;
   bytes start = 3;
   bytes end = 4;
+
+  RangeDescriptor range = 5;
 }
 
-message RemoveDataResponse {}
+message RemoveDataResponse {
+  // The range with the specified node removed.
+  RangeDescriptor range = 1;
+}
 
 message AddReplicaRequest {
   RangeDescriptor range = 1;
@@ -587,13 +629,36 @@ message AddReplicaResponse {
   RangeDescriptor range = 1;
 }
 
+// RemoveReplicaRequest specifies a request to remove the replica from raft
+// memberhsip, and remove the replica from the range descriptor. It does *not*
+// remove the data from the machine.
 message RemoveReplicaRequest {
+  // Either specify range or range_id:
+  //  -- When a range is provided, it is expected that the range is up-to-date.
+  //  The
+  // call removes the replica from the range descriptor and also from the raft
+  // membership.
+  //  -- When a range_id is provided, it is expected that the replica_id is
+  // already removed from the range descriptor. For example, when we detected a
+  // zombie.
   RangeDescriptor range = 1;
+  uint64 range_id = 3;
+
   uint64 replica_id = 2;
 }
+
 message RemoveReplicaResponse {
-  // The range with the specified node removed.
+  // The range with the specified node marked as removed.
   RangeDescriptor range = 1;
+}
+
+message CheckRangeOverlapsRequest {
+  bytes start = 1;
+  bytes end = 2;
+}
+
+message CheckRangeOverlapsResponse {
+  repeated RangeDescriptor ranges = 1;
 }
 
 message SplitRangeRequest {
@@ -604,13 +669,6 @@ message SplitRangeRequest {
 message SplitRangeResponse {
   RangeDescriptor left = 1;
   RangeDescriptor right = 2;
-}
-
-message ListReplicasRequest {}
-
-message ListReplicasResponse {
-  NodeDescriptor node = 1;
-  repeated ReplicaDescriptor replicas = 2;
 }
 
 message CreateSnapshotRequest {
@@ -651,18 +709,20 @@ message FindResponse {
   bool present = 1;
   // The last time this file record was accessed.
   int64 last_access_usec = 2;
+  // The gcs_metadata of this file record, if exist.
+  storage.StorageMetadata.GCSMetadata gcs_metadata = 3;
 }
 
 message GetRequest {
   bytes key = 1;
 }
 message GetResponse {
-  FileMetadata file_metadata = 1;
+  storage.FileMetadata file_metadata = 1;
 }
 
 message SetRequest {
   bytes key = 1;
-  FileMetadata file_metadata = 2;
+  storage.FileMetadata file_metadata = 2;
 }
 message SetResponse {}
 
@@ -675,8 +735,58 @@ message DeleteRequest {
 }
 message DeleteResponse {}
 
+// State-idempotent (values only move forward), response-idempotent
+// (empty response). Safe on splittable keys.
 message UpdateAtimeRequest {
   bytes key = 1;
   int64 access_time_usec = 2;
+  // The custom time now set on the backing GCS object. Only set when the
+  // sender successfully refreshed that object's custom time; 0 leaves the
+  // recorded value untouched.
+  int64 last_custom_time_usec = 3;
 }
 message UpdateAtimeResponse {}
+
+message RaftMembership {
+  repeated ReplicaDescriptor voters = 1;
+  repeated ReplicaDescriptor non_voters = 2;
+  repeated ReplicaDescriptor witnesses = 3;
+  repeated uint64 removed = 4;
+}
+
+message RaftLeaderInfo {
+  uint64 leader_id = 1;
+  uint64 term = 2;
+  bool valid = 3;
+}
+
+message GetRangeDebugInfoRequest {
+  uint64 range_id = 1;
+}
+
+message GetRangeDebugInfoResponse {
+  string nhid = 1;
+  RangeDescriptor range_descriptor = 2;
+  RangeDescriptor range_descriptor_in_meta_range = 6;
+  RaftLeaderInfo leader = 3;
+  bool has_lease = 4;
+  RaftMembership membership = 5;
+  uint64 last_replica_id = 7;
+}
+
+message RangeDescriptorChange {
+  RangeDescriptor old_descriptor = 1;
+  RangeDescriptor new_descriptor = 2;
+}
+
+message PartitionDescriptorChange {
+  PartitionDescriptor old_descriptor = 1;
+  PartitionDescriptor new_descriptor = 2;
+}
+
+message AdminUpdateDescriptorRequest {
+  RangeDescriptorChange range_descriptor_change = 1;
+  repeated PartitionDescriptorChange partition_descriptor_change = 2;
+}
+
+message AdminUpdateDescriptorResponse {}

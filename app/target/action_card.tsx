@@ -1,9 +1,9 @@
-import React from "react";
-import SetupCodeComponent from "../docs/setup_code";
-import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
-import { TerminalComponent } from "../terminal/terminal";
-import rpcService from "../service/rpc_service";
 import { PauseCircle, PlayCircle } from "lucide-react";
+import React from "react";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
+import SetupCodeComponent from "../docs/setup_code";
+import rpcService from "../service/rpc_service";
+import { TerminalComponent } from "../terminal/terminal";
 
 interface Props {
   buildEvent?: build_event_stream.BuildEvent;
@@ -29,7 +29,6 @@ export default class ActionCardComponent extends React.Component<Props, State> {
   };
 
   componentDidMount() {
-    console.log(this.props.buildEvent);
     this.fetchStdErr();
     this.fetchStdOut();
   }
@@ -111,7 +110,7 @@ export default class ActionCardComponent extends React.Component<Props, State> {
             className={`card ${this.state.cacheEnabled && (this.props.dark ? "dark" : "light-terminal")} ${
               action?.success ? "card-success" : "card-failure"
             }`}>
-            <PauseCircle className={`icon rotate-90 ${this.props.dark ? "white" : ""}`} />
+            <PauseCircle className={`rotate-90 ${this.props.dark ? "white" : ""}`} />
             <div className="content">
               {!this.state.cacheEnabled && (
                 <>
@@ -146,7 +145,7 @@ export default class ActionCardComponent extends React.Component<Props, State> {
 
         {action?.stdout?.uri && (
           <div className={`card ${this.state.cacheEnabled && (this.props.dark ? "dark" : "light-terminal")}`}>
-            <PauseCircle className={`icon rotate-90 ${this.props.dark ? "white" : ""}`} />
+            <PauseCircle className={`rotate-90 ${this.props.dark ? "white" : ""}`} />
             <div className="content">
               {!this.state.cacheEnabled && (
                 <>
@@ -180,7 +179,7 @@ export default class ActionCardComponent extends React.Component<Props, State> {
 
         {(action?.failureDetail?.message?.length ?? 0) > 0 && (
           <div className={`card ${this.props.dark ? "dark" : "light-terminal"}`}>
-            <PauseCircle className={`icon rotate-90 ${this.props.dark ? "white" : ""}`} />
+            <PauseCircle className={`rotate-90 ${this.props.dark ? "white" : ""}`} />
             <div className="content">
               <TerminalComponent
                 title={<div className="title">Failure Message</div>}
@@ -192,7 +191,7 @@ export default class ActionCardComponent extends React.Component<Props, State> {
         )}
 
         <div className={`card ${action?.success ? "card-success" : "card-failure"}`}>
-          <PlayCircle className="icon" />
+          <PlayCircle />
           <div className="content">
             <div className="title">{action?.label}</div>
             <div className="test-subtitle">

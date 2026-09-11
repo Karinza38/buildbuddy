@@ -84,6 +84,14 @@ message BuildEventId {
   message FetchId {
     // The external resource that was fetched from.
     string url = 1;
+
+    enum Downloader {
+      UNKNOWN = 0;
+      HTTP = 1;
+      GRPC = 2;
+    }
+    // The downloader used to fetch the resource.
+    Downloader downloader = 2;
   }
 
   // Identifier of an event indicating that a target pattern has been expanded
@@ -287,6 +295,13 @@ message BuildEventId {
   // default arguments and runtime files.
   message RunTargetAnalyzedId {}
 
+  // Identifier of an event reporting stats about the git fetches performed
+  // by a remote runner (i.e. Workflows or remote bazel) while setting up the
+  // git repository. Only published when the runner performs the automatic
+  // checkout; not published if auto-checkout is skipped (e.g. remote bazel
+  // runs with --skip_auto_checkout).
+  message GitFetchCompletedId {}
+
   oneof id {
     UnknownBuildEventId unknown = 1;
     ProgressId progress = 2;
@@ -326,6 +341,7 @@ message BuildEventId {
     ChildInvocationsConfiguredId child_invocations_configured = 1002;
     ChildInvocationCompletedId child_invocation_completed = 1003;
     RunTargetAnalyzedId run_target_analyzed = 1004;
+    GitFetchCompletedId git_fetch_completed = 1005;
   }
 }
 
@@ -432,6 +448,12 @@ message BuildStarted {
 
   // The process ID of the Bazel server.
   int64 server_pid = 8;
+
+  // The short hostname of the machine where the build is running.
+  string host = 10;
+
+  // The username of the user who started the build.
+  string user = 11;
 }
 
 // Configuration related to the blaze workspace and output tree.
@@ -575,13 +597,6 @@ message File {
   int64 length = 6;
 }
 
-message Tree {
-  // Where the tree is to be planted.
-  string name = 1;
-  // Bytestream URI for the tree digest.
-  string uri = 2;
-}
-
 // Payload of a message to describe a set of files, usually build artifacts, to
 // be referred to later by their name. In this way, files that occur identically
 // as outputs of several targets have to be named only once.
@@ -626,8 +641,10 @@ message ActionExecuted {
   // The command-line of the action, if the action is a command.
   repeated string command_line = 9;
 
+  // TODO: This has been removed at HEAD, but may still be used by older
+  // versions of Bazel.
   // List of paths to log files
-  repeated File action_metadata_logs = 10;
+  repeated File action_metadata_logs = 10 [deprecated = true];
 
   // Only populated if success = false, and sometimes not even then.
   failure_details.FailureDetail failure_detail = 11;
@@ -893,7 +910,15 @@ message TargetSummary {
   // Conjunction of TargetComplete events for this target, including aspects.
   bool overall_build_success = 1;
 
-  // Repeats TestSummary's overall_status if available.
+  // For non-test targets, set to NO_STATUS. For test targets, identical to
+  // TestSummary.overall_status.
+  //
+  // There are some cases where the `build` command on a test target succeeds,
+  // but the `test` command on the same target results in FAILED_TO_BUILD. In
+  // such cases, TargetComplete.overall_build_success is true, but this field is
+  // FAILED_TO_BUILD, and TestSummary may be missing.
+  // TODO - b/186996003: TestSummary is a child of TargetComplete and should be
+  //  posted.
   TestStatus overall_test_status = 2;
 }
 
@@ -1096,6 +1121,9 @@ message BuildMetrics {
     // The elapsed wall time in milliseconds until the first action execution
     // started (excluding workspace status actions).
     int64 actions_execution_start_in_ms = 5;
+
+    // The elapsed wall time in milliseconds that the critical path took.
+    google.protobuf.Duration critical_path_time = 6;
   }
   TimingMetrics timing_metrics = 5;
 
@@ -1392,6 +1420,31 @@ message BuildMetrics {
   }
 
   DynamicExecutionMetrics dynamic_execution_metrics = 12;
+
+  // Statistics about remote analysis caching
+  message RemoteAnalysisCacheStatistics {
+    int64 cache_hits = 1;
+    int64 cache_misses = 2;
+    int64 value_store_value_bytes_received = 3;
+    int64 value_store_value_bytes_sent = 4;
+    int64 value_store_key_bytes_sent = 5;
+    int64 value_store_write_ops = 6;
+    int64 value_store_read_ops_successful = 7;
+    int64 value_store_read_ops_not_found = 8;
+    int64 value_store_read_batches = 10;
+    int64 value_store_write_batches = 11;
+    int64 analysis_cache_bytes_received = 12;
+    int64 analysis_cache_key_bytes_sent = 13;
+    int64 analysis_cache_ops = 14;
+    int64 analysis_cache_batches = 15;
+
+    // TODO: Add the required analysis_cache_service_metadata_status.proto when
+    // we have to use this field.
+    // The result of the Skycache metadata lookup.
+    // devtools_blaze_proto.TopLevelTargetsMatchStatus metadata_lookup_result =
+    // 16;
+  }
+  RemoteAnalysisCacheStatistics remote_analysis_cache_statistics = 13;
 }
 
 // Event providing additional statistics/logs after completion of the build.
@@ -1595,17 +1648,56 @@ message ChildInvocationCompleted {
   google.protobuf.Duration duration = 5;
 }
 
+message Tree {
+  // Where the tree is to be planted.
+  string name = 1;
+  // Bytestream URI for the tree digest.
+  string uri = 2;
+}
+
+// A runtime file dependency and its metadata.
+message Runfile {
+  File file = 1;
+  bool is_executable = 2;
+}
+
 // Event describing the runtime properties of a runnable target.
 message RunTargetAnalyzed {
   // Default arguments configured for the target, typically in the BUILD file.
   // e.g. [--monitoring_port=8888, --max_shutdown_duration=30s]
   repeated string arguments = 1;
-  // Path to the root of the runfiles directory.
+  // Path to the working directory within the runfiles directory.
   string runfiles_root = 2;
   // Any runtime file dependencies for the runnable target.
-  repeated File runfiles = 3;
+  repeated Runfile runfile_entries = 6;
   // Any runtime directory dependencies for the runnable target.
   repeated Tree runfileDirectories = 4;
+  // Workspace-relative path to the executable selected by `bazel run`.
+  string executable_path = 5;
+
+  repeated File runfiles = 3 [deprecated = true];
+}
+
+// Event reporting stats about the git fetches performed by a remote runner
+// (i.e. Workflows or remote bazel) while setting up the git repository.
+// Only published when the runner performs the automatic checkout; not
+// published if auto-checkout is skipped (e.g. remote bazel runs with
+// --skip_auto_checkout). Fetches performed by the action itself, such as
+// bazel-triggered fetches of external git repos, are not counted.
+message GitFetchCompleted {
+  // Total number of bytes fetched, parsed from git trace2 event logs. This
+  // includes objects fetched lazily during checkout and merge, which happens
+  // when fetch filters such as blob:none are used.
+  int64 total_bytes = 1;
+
+  // Total time spent running git commands that fetch from the remote. In
+  // addition to git fetch commands, this counts git checkout and git merge
+  // commands in full, since with fetch filters in use the bulk of their time
+  // is typically spent lazily fetching filtered-out objects.
+  google.protobuf.Duration duration = 2;
+
+  // Total number of git command retries after low-speed transfer aborts.
+  int64 retry_count = 3;
 }
 
 // Message describing a build event. Events will have an identifier that
@@ -1654,5 +1746,6 @@ message BuildEvent {
     ChildInvocationsConfigured child_invocations_configured = 1002;
     ChildInvocationCompleted child_invocation_completed = 1003;
     RunTargetAnalyzed run_target_analyzed = 1004;
+    GitFetchCompleted git_fetch_completed = 1005;
   }
 }

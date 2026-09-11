@@ -3,6 +3,7 @@ package server
 import (
 	"archive/zip"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -10,50 +11,32 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/codesearch/annotations"
+	"github.com/buildbuddy-io/buildbuddy/codesearch/github"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/index"
-	"github.com/buildbuddy-io/buildbuddy/codesearch/kythestorage"
+	"github.com/buildbuddy-io/buildbuddy/codesearch/nav"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/performance"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/query"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/schema"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/searcher"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/types"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
-	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
-	"github.com/buildbuddy-io/buildbuddy/server/util/background"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/git"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lockmap"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/sstable"
 	"golang.org/x/sync/errgroup"
-
-	"kythe.io/kythe/go/services/filetree"
-	"kythe.io/kythe/go/services/graph"
-	"kythe.io/kythe/go/services/xrefs"
-	"kythe.io/kythe/go/serving/identifiers"
-	"kythe.io/kythe/go/storage/keyvalue"
-	"kythe.io/kythe/go/storage/table"
 
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/index"
 	srpb "github.com/buildbuddy-io/buildbuddy/proto/search"
-	flagyaml "github.com/buildbuddy-io/buildbuddy/server/util/flagutil/yaml"
-	ftsrv "kythe.io/kythe/go/serving/filetree"
-	gsrv "kythe.io/kythe/go/serving/graph"
-	xsrv "kythe.io/kythe/go/serving/xrefs"
 )
 
 const (
-	maxFileLen = 10_000_000
-
-	// The maximum amount of bytes from a file to use for language and
-	// mimetype detection.
-	detectionBufferSize = 1000
-
 	// Used to control how many results may be returned at a time.
 	defaultNumResults = 10
 	maxNumResults     = 1000
@@ -61,38 +44,27 @@ const (
 
 var isAlphaNumPath = regexp.MustCompile(`^[A-Za-z/0-9]*$`).MatchString
 
-func init() {
-	flagyaml.IgnoreFlagForYAML("experimental_cross_reference_indirection_kinds")
-}
+// The kythe Decorations/CrossReferences endpoints carry no namespace (kythe
+// data was group-scoped); nav data is namespace-scoped, so for now we read from
+// a configured namespace, defaulting to the group's default namespace. Carrying
+// the namespace on the request is a follow-up.
+var treeSitterNavNamespace = flag.String("codesearch.treesitter_nav_namespace", "",
+	"Namespace (within the authenticated group) to serve tree-sitter navigation from.")
 
 func New(env environment.Env, rootDirectory, scratchDirectory string) (*codesearchServer, error) {
-	ctx := context.Background()
-
 	if err := disk.EnsureDirectoryExists(scratchDirectory); err != nil {
 		return nil, err
 	}
-	db, err := pebble.Open(rootDirectory, &pebble.Options{})
+	db, err := index.OpenPebbleDB(rootDirectory)
 	if err != nil {
 		return nil, err
 	}
-
-	kdb := kythestorage.OpenRaw(env, db)
-	tbl := &table.KVProto{DB: kdb}
-	gs := gsrv.NewCombinedTable(tbl)
-	ft := &ftsrv.Table{Proto: tbl, PrefixedKeys: true}
-	it := &identifiers.Table{Proto: tbl}
-	xs := xsrv.NewService(ctx, kdb)
 
 	return &codesearchServer{
 		env:              env,
 		db:               db,
 		scratchDirectory: scratchDirectory,
-
-		kdb: kdb,
-		xs:  xs,
-		gs:  gs,
-		it:  it,
-		ft:  ft,
+		repoLocks:        lockmap.New[string](),
 	}, nil
 }
 
@@ -101,12 +73,7 @@ type codesearchServer struct {
 	db               *pebble.DB
 	scratchDirectory string
 
-	// Kythe services.
-	kdb keyvalue.DB
-	xs  xrefs.Service
-	gs  graph.Service
-	it  identifiers.Service
-	ft  filetree.Service
+	repoLocks lockmap.Locker[string]
 }
 
 // apiArchiveURL takes a url like https://github.com/buildbuddy-io/buildbuddy
@@ -138,7 +105,7 @@ func (css *codesearchServer) getUserNamespace(ctx context.Context, requestedName
 	if !isAlphaNumPath(requestedNamespace) {
 		return "", status.InvalidArgumentError("namespace must match a/b/c")
 	}
-	gid, err := prefix.UserPrefix(ctx, css.env)
+	gid, err := prefix.UserPrefix(ctx, css.env.GetAuthenticator())
 	if err != nil {
 		return "", err
 	}
@@ -146,13 +113,131 @@ func (css *codesearchServer) getUserNamespace(ctx context.Context, requestedName
 	return namespace, nil
 }
 
-func (css *codesearchServer) syncIndex(_ context.Context, req *inpb.IndexRequest) (*inpb.IndexResponse, error) {
+func (css *codesearchServer) incrementalUpdate(ctx context.Context, req *inpb.IndexRequest) (*inpb.IndexResponse, error) {
 	repoURLString := req.GetGitRepo().GetRepoUrl()
+	repoURL, err := git.ParseGitHubRepoURL(repoURLString)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("Starting incremental update %q", repoURL)
+
+	r := index.NewReader(ctx, css.db, req.GetNamespace(), schema.MetadataSchema())
+	lastIndexedSHA, err := github.GetLastIndexedCommitSha(r, repoURL)
+	if err != nil {
+		if status.IsNotFoundError(err) {
+			return nil, status.InvalidArgumentError(fmt.Sprintf("No previous indexing found for repo %s. Use FULL_REINDEX instead of INCREMENTAL_REINDEX.", repoURL))
+		} else {
+			return nil, err
+		}
+	}
+
+	commits := req.GetUpdate().GetCommits()
+
+	if len(commits) == 0 {
+		// Nothing to do, bye
+		return &inpb.IndexResponse{}, nil
+	}
+
+	firstIndexToProcess := -1
+	for i, commit := range commits {
+		// We currently only support sequential commits, with no gaps.
+		// We could do a topological sort, but we just don't need that right now.
+		if i >= 1 && commit.GetParentSha() != commits[i-1].GetSha() {
+			return nil, status.InvalidArgumentErrorf("commits must be sequential. Commit %s has parent %s, but is not preceded by that commit", commit.GetSha(), commit.GetParentSha())
+		}
+		if commit.GetParentSha() == lastIndexedSHA {
+			firstIndexToProcess = i
+		}
+	}
+	if firstIndexToProcess == -1 {
+		return nil, status.InvalidArgumentErrorf("last processed commit was %s; no commits found with this parent", lastIndexedSHA)
+	}
+
+	commits = commits[firstIndexToProcess:]
+
+	// The module path was stored at full-reindex time; refresh it if a commit
+	// being processed modifies the root go.mod. Commit filenames are
+	// repo-relative, so the RepoContext has no root dir.
+	modulePath, err := github.GetRepoModulePath(r, repoURL)
+	if err != nil {
+		return nil, err
+	}
+	for _, commit := range commits {
+		for _, add := range commit.GetAddsAndUpdates() {
+			// Only overwrite on a successful parse: an unparsable or removed
+			// go.mod must not wipe the previously-resolved module path.
+			if add.GetFilepath() == "go.mod" {
+				if mp := annotations.GoModulePath(add.GetContent()); mp != "" {
+					modulePath = mp
+				}
+			}
+		}
+	}
+	rctx := annotations.NewRepoContext("", modulePath)
+
+	iw, err := index.NewWriter(css.db, req.GetNamespace())
+	if err != nil {
+		return nil, err
+	}
+
+	for _, commit := range commits {
+		if err := github.ProcessCommit(iw, rctx, repoURL, commit); err != nil {
+			return nil, status.InternalErrorf("failed to process commit %s: %v", commit.GetSha(), err)
+		}
+	}
+
+	err = github.SetRepoMetadata(iw, repoURL, commits[len(commits)-1].GetSha(), modulePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to finalize update: %w", err)
+	}
+
+	if err := iw.Flush(); err != nil {
+		return nil, err
+	}
+
+	log.Infof("finished incremental update on %s from %s to %s", repoURL, commits[0].GetSha(), commits[len(commits)-1].GetSha())
+
+	return &inpb.IndexResponse{}, nil
+}
+
+// moduleFromArchive returns the Go module path declared in the archive's root
+// go.mod, or "" if there is none. Archive entries are nested under a single
+// top-level directory, which is stripped to match the indexing loop.
+func moduleFromArchive(files []*zip.File) (string, error) {
+	for _, file := range files {
+		parts := strings.Split(file.Name, string(filepath.Separator))
+		if len(parts) > 1 && filepath.Join(parts[1:]...) == "go.mod" {
+			rc, err := file.Open()
+			if err != nil {
+				return "", err
+			}
+			buf, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				return "", err
+			}
+			return annotations.GoModulePath(buf), nil
+		}
+	}
+	return "", nil
+}
+
+func (css *codesearchServer) fullyReindex(_ context.Context, req *inpb.IndexRequest) (*inpb.IndexResponse, error) {
+	// TODO(jdelfino): This implementation does not remove files which have been deleted since the
+	// the previously indexed version of the repository. Note that a namespace can include multiple
+	// repos, so implementing this would require explicit iteration and deletion of each document
+	// tagged with the given repo URL.
 	commitSHA := req.GetRepoState().GetCommitSha()
 	username := req.GetGitRepo().GetUsername()
 	accessToken := req.GetGitRepo().GetAccessToken()
 
-	archiveURL, err := apiArchiveURL(repoURLString, commitSHA, username, accessToken)
+	repoURL, err := git.ParseGitHubRepoURL(req.GetGitRepo().GetRepoUrl())
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("Starting index of %q@%s", repoURL, commitSHA)
+
+	archiveURL, err := apiArchiveURL(repoURL.String(), commitSHA, username, accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +257,6 @@ func (css *codesearchServer) syncIndex(_ context.Context, req *inpb.IndexRequest
 	if _, err := io.Copy(tmpFile, httpRsp.Body); err != nil {
 		return nil, err
 	}
-	log.Debugf("Copied archive to %q", tmpFile.Name())
 
 	zipReader, err := zip.OpenReader(tmpFile.Name())
 	if err != nil {
@@ -185,16 +269,25 @@ func (css *codesearchServer) syncIndex(_ context.Context, req *inpb.IndexRequest
 		return nil, err
 	}
 
-	repoURL, err := git.ParseGitHubRepoURL(repoURLString)
+	// Read the module path from the archive's root go.mod up front, so every
+	// file is indexed with the repo context that resolves Go import
+	// identities. Archive filenames are repo-relative, so rctx has no root dir.
+	modulePath, err := moduleFromArchive(zipReader.File)
 	if err != nil {
 		return nil, err
 	}
+	rctx := annotations.NewRepoContext("", modulePath)
 
 	for _, file := range zipReader.File {
 		parts := strings.Split(file.Name, string(filepath.Separator))
 		if len(parts) == 1 {
 			continue
 		}
+
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
 		filename := filepath.Join(parts[1:]...)
 
 		rc, err := file.Open()
@@ -206,42 +299,68 @@ func (css *codesearchServer) syncIndex(_ context.Context, req *inpb.IndexRequest
 		if err != nil {
 			return nil, err
 		}
-		doc, err := schema.MakeDocument(filename, commitSHA, repoURL, buf)
+
+		err = github.AddFileToIndex(iw, rctx, repoURL, commitSHA, filename, buf)
 		if err != nil {
-			log.Debug(err.Error())
+			log.Infof("File %s can't be indexed, skipping: %v", filename, err)
 			continue
 		}
-		if err := iw.UpdateDocument(doc.Field(schema.IDField), doc); err != nil {
-			return nil, err
-		}
+	}
+
+	if err := github.SetRepoMetadata(iw, repoURL, commitSHA, modulePath); err != nil {
+		return nil, err
 	}
 
 	if err := iw.Flush(); err != nil {
 		return nil, err
 	}
 
+	log.Infof("Finished indexing %s at commit %s", req.GetGitRepo().GetRepoUrl(), req.GetRepoState().GetCommitSha())
+
 	return &inpb.IndexResponse{}, nil
 }
 
 func (css *codesearchServer) Index(ctx context.Context, req *inpb.IndexRequest) (*inpb.IndexResponse, error) {
-	namespace, err := css.getUserNamespace(ctx, req.GetNamespace())
+	// Validate namespace against side-channel auth
+	validatedNamespace, err := css.getUserNamespace(ctx, req.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
 
-	// Rewrite the request namespace before passing it to syncIndex.
-	req.Namespace = namespace
+	req.Namespace = validatedNamespace
 
 	var rsp *inpb.IndexResponse
 	eg := &errgroup.Group{}
 	eg.Go(func() error {
-		r, err := css.syncIndex(ctx, req)
+		// Only one update at a time is allowed per repo.
+		// If multiple threads update the same repo at the same time, they risk
+		// adding multiple different versions of the same file.
+
+		// Note that, while go Mutexes do guarantee non-starvation, they don't provide FIFO
+		// ordering. So, if multiple repo re-indexes are requested concurrently, it is not
+		// guaranteed that they will be processed in any particular order.
+
+		lockKey := fmt.Sprintf("%s-%s", validatedNamespace, req.GetGitRepo().GetRepoUrl())
+		unlockFn := css.repoLocks.Lock(lockKey)
+		defer unlockFn()
+
+		var err error
+		switch req.GetReplacementStrategy() {
+		case inpb.ReplacementStrategy_INCREMENTAL:
+			rsp, err = css.incrementalUpdate(ctx, req)
+		case inpb.ReplacementStrategy_REPLACE_REPO:
+			rsp, err = css.fullyReindex(ctx, req)
+		case inpb.ReplacementStrategy_DROP_NAMESPACE:
+			rsp, err = css.dropNamespace(req)
+		default:
+			return status.InvalidArgumentErrorf("Invalid replacement strategy %s", req.GetReplacementStrategy())
+		}
+
 		if err != nil {
 			log.Errorf("Failed indexing %q: %s", req.GetGitRepo().GetRepoUrl(), err)
 			return err
 		}
-		rsp = r
-		log.Infof("Finished indexing %s", req.GetGitRepo().GetRepoUrl())
+
 		return nil
 	})
 	if req.GetAsync() {
@@ -251,6 +370,52 @@ func (css *codesearchServer) Index(ctx context.Context, req *inpb.IndexRequest) 
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (css *codesearchServer) dropNamespace(req *inpb.IndexRequest) (*inpb.IndexResponse, error) {
+	log.Infof("Dropping namespace %s", req.GetNamespace())
+
+	writer, err := index.NewWriter(css.db, req.GetNamespace())
+	if err != nil {
+		return nil, status.InternalErrorf("failed to create index writer for namespace %s: %v", req.GetNamespace(), err)
+	}
+
+	if err := writer.DropNamespace(); err != nil {
+		return nil, status.InternalErrorf("failed to drop namespace %s: %v", req.GetNamespace(), err)
+	}
+
+	err = writer.Flush()
+	if err != nil {
+		return nil, status.InternalErrorf("failed to flush index writer for namespace %s: %v", req.GetNamespace(), err)
+	}
+
+	log.Infof("Dropped namespace %s", req.GetNamespace())
+	return &inpb.IndexResponse{}, nil
+}
+
+func (css *codesearchServer) RepoStatus(ctx context.Context, req *inpb.RepoStatusRequest) (*inpb.RepoStatusResponse, error) {
+	namespace, err := css.getUserNamespace(ctx, req.GetNamespace())
+	if err != nil {
+		return nil, err
+	}
+
+	repoURL, err := git.ParseGitHubRepoURL(req.GetRepoUrl())
+	if err != nil {
+		return nil, err
+	}
+	r := index.NewReader(ctx, css.db, namespace, schema.MetadataSchema())
+
+	rev, err := github.GetLastIndexedCommitSha(r, repoURL)
+	if err != nil {
+		// If there's no status, return an empty commit SHA, but don't error.
+		if !status.IsNotFoundError(err) {
+			return nil, err
+		}
+	}
+
+	return &inpb.RepoStatusResponse{
+		LastIndexedCommitSha: rev,
+	}, nil
 }
 
 func (css *codesearchServer) Search(ctx context.Context, req *srpb.SearchRequest) (*srpb.SearchResponse, error) {
@@ -266,7 +431,7 @@ func (css *codesearchServer) Search(ctx context.Context, req *srpb.SearchRequest
 	if req.GetNumResults() > 0 && req.GetNumResults() < maxNumResults {
 		numResults = int(req.GetNumResults())
 	}
-	codesearcher := searcher.New(ctx, index.NewReader(ctx, css.db, namespace))
+	codesearcher := searcher.New(ctx, index.NewReader(ctx, css.db, namespace, schema.GitHubFileSchema()))
 	q, err := query.NewReQuery(ctx, req.GetQuery().GetTerm())
 	if err != nil {
 		return nil, err
@@ -287,6 +452,7 @@ func (css *codesearchServer) Search(ctx context.Context, req *srpb.SearchRequest
 	for _, doc := range docs {
 		regions := highlighter.Highlight(doc)
 		if len(regions) == 0 {
+			log.Warningf("No highlight regions found for doc: %s, dropping", doc.Field(schema.FilenameField).Contents())
 			continue
 		}
 
@@ -310,10 +476,23 @@ func (css *codesearchServer) Search(ctx context.Context, req *srpb.SearchRequest
 			MatchCount: int32(len(dedupedRegions)),
 			Sha:        string(doc.Field(schema.SHAField).Contents()),
 		}
-		for _, region := range dedupedRegions {
+		for i, region := range dedupedRegions {
+			// if the prev region abuts this one, don't print leading lines.
+			precedingLines := 1
+			if i-1 >= 0 && dedupedRegions[i-1].Line() == region.Line()-1 {
+				precedingLines = 0
+			}
+			// if next region abuts this one, don't print trailing lines.
+			trailingLines := 1
+			if i+1 < len(dedupedRegions) && dedupedRegions[i+1].Line() == region.Line()+1 {
+				trailingLines = 0
+			}
 			result.Snippets = append(result.Snippets, &srpb.Snippet{
-				Lines: region.CustomSnippet(1, 1),
+				Lines: region.CustomSnippet(precedingLines, trailingLines),
 			})
+		}
+		if req.GetIncludeContent() {
+			result.Content = doc.Field(schema.ContentField).Contents()
 		}
 		rsp.Results = append(rsp.Results, result)
 	}
@@ -333,153 +512,51 @@ func (css *codesearchServer) Search(ctx context.Context, req *srpb.SearchRequest
 	return rsp, nil
 }
 
+// navReader opens a GitHubFileSchema reader on the nav namespace within the
+// authenticated group. The kythe endpoints carry no namespace (kythe data was
+// group-scoped); nav data is namespace-scoped, so for now we read from a
+// configured namespace, defaulting to the group's default namespace — the same
+// one search reads when no namespace is requested. Carrying the namespace on
+// the request is a follow-up.
+func (css *codesearchServer) navReader(ctx context.Context) (*index.Reader, error) {
+	ns, err := css.getUserNamespace(ctx, *treeSitterNavNamespace)
+	if err != nil {
+		return nil, err
+	}
+	return index.NewReader(ctx, css.db, ns, schema.GitHubFileSchema()), nil
+}
+
+// KytheProxy answers the code browser's navigation requests. The endpoints and
+// reply protos are kythe's (the frontend speaks them), but the data is served
+// from tree-sitter over the codesearch index — kythe itself is gone. Request
+// types the browser doesn't use are unimplemented.
 func (css *codesearchServer) KytheProxy(ctx context.Context, req *srpb.KytheRequest) (*srpb.KytheResponse, error) {
-	var rsp = new(srpb.KytheResponse)
-	var err = status.UnimplementedError("method not implemented in codesearch backend")
-
+	r, err := css.navReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rsp := new(srpb.KytheResponse)
 	switch req.Value.(type) {
-	case *srpb.KytheRequest_CorpusRootsRequest:
-		corpusRootsReply, corpusRootsErr := css.ft.CorpusRoots(ctx, req.GetCorpusRootsRequest())
-		rsp.Value = &srpb.KytheResponse_CorpusRootsReply{
-			CorpusRootsReply: corpusRootsReply,
-		}
-		err = corpusRootsErr
-	case *srpb.KytheRequest_DirectoryRequest:
-		directoryReply, directoryErr := css.ft.Directory(ctx, req.GetDirectoryRequest())
-		rsp.Value = &srpb.KytheResponse_DirectoryReply{
-			DirectoryReply: directoryReply,
-		}
-		err = directoryErr
-	case *srpb.KytheRequest_NodesRequest:
-		nodesReply, nodesErr := css.gs.Nodes(ctx, req.GetNodesRequest())
-		rsp.Value = &srpb.KytheResponse_NodesReply{
-			NodesReply: nodesReply,
-		}
-		err = nodesErr
 	case *srpb.KytheRequest_DecorationsRequest:
-		decorationsReply, decorationsErr := css.xs.Decorations(ctx, req.GetDecorationsRequest())
-		rsp.Value = &srpb.KytheResponse_DecorationsReply{
-			DecorationsReply: decorationsReply,
-		}
-		err = decorationsErr
+		reply, err := nav.Decorations(ctx, r, req.GetDecorationsRequest())
+		rsp.Value = &srpb.KytheResponse_DecorationsReply{DecorationsReply: reply}
+		return rsp, err
 	case *srpb.KytheRequest_CrossReferencesRequest:
-		crossReferencesReply, crossReferencesErr := css.xs.CrossReferences(ctx, req.GetCrossReferencesRequest())
-		rsp.Value = &srpb.KytheResponse_CrossReferencesReply{
-			CrossReferencesReply: crossReferencesReply,
-		}
-		err = crossReferencesErr
+		reply, err := nav.CrossReferences(ctx, r, req.GetCrossReferencesRequest())
+		rsp.Value = &srpb.KytheResponse_CrossReferencesReply{CrossReferencesReply: reply}
+		return rsp, err
+	case *srpb.KytheRequest_ExtendedXrefsRequest:
+		reply, err := nav.ExtendedXrefs(ctx, r, req.GetExtendedXrefsRequest())
+		rsp.Value = &srpb.KytheResponse_ExtendedXrefsReply{ExtendedXrefsReply: reply}
+		return rsp, err
+	case *srpb.KytheRequest_DocsRequest:
+		reply, err := nav.Documentation(ctx, r, req.GetDocsRequest())
+		rsp.Value = &srpb.KytheResponse_DocsReply{DocsReply: reply}
+		return rsp, err
 	}
-
-	return rsp, err
-}
-
-func retrieveValue(lazyValue pebble.LazyValue) ([]byte, error) {
-	val, owned, err := lazyValue.Value(nil)
-	if err != nil {
-		return nil, err
-	}
-	if owned || val == nil {
-		return val, nil
-	}
-	copiedVal := make([]byte, len(val))
-	copy(copiedVal, val)
-	return copiedVal, nil
-}
-
-func (css *codesearchServer) syncIngestAnnotations(ctx context.Context, req *inpb.IngestAnnotationsRequest) (*inpb.IngestAnnotationsResponse, error) {
-	if req.GetAsync() {
-		xCtx, cancel := background.ExtendContextForFinalization(ctx, time.Minute)
-		defer cancel()
-		ctx = xCtx
-	}
-
-	tmpFile, err := os.CreateTemp(css.scratchDirectory, "kythe-*.sstable")
-	if err != nil {
-		return nil, err
-	}
-	fileName := tmpFile.Name()
-	defer func() {
-		tmpFile.Close()
-		os.Remove(fileName)
-	}()
-
-	sstableName := digest.ResourceNameFromProto(req.GetSstableName())
-	if err := cachetools.GetBlob(ctx, css.env.GetByteStreamClient(), sstableName, tmpFile); err != nil {
-		return nil, err
-	}
-
-	tmpFile.Seek(0, 0)
-	readHandler, err := sstable.NewSimpleReadable(tmpFile)
-	if err != nil {
-		return nil, err
-	}
-	reader, err := sstable.NewReader(readHandler, sstable.ReaderOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	iter, err := reader.NewIter(nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	writer, err := css.kdb.Writer(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	bufSize := 0
-	for iKey, iVal := iter.First(); iKey != nil; iKey, iVal = iter.Next() {
-		key := iKey.UserKey
-		val, err := retrieveValue(iVal)
-		if err != nil {
-			return nil, err
-		}
-		writer.Write(key, val)
-		bufSize += len(key) + len(val)
-		if bufSize >= 100*1e6 {
-			if err := writer.Close(); err != nil {
-				return nil, err
-			}
-			writer, err = css.kdb.Writer(ctx)
-			if err != nil {
-				return nil, err
-			}
-			bufSize = 0
-		}
-	}
-
-	if bufSize > 0 {
-		if err := writer.Close(); err != nil {
-			return nil, err
-		}
-	}
-	return &inpb.IngestAnnotationsResponse{}, nil
-}
-
-func (css *codesearchServer) IngestAnnotations(ctx context.Context, req *inpb.IngestAnnotationsRequest) (*inpb.IngestAnnotationsResponse, error) {
-	var rsp *inpb.IngestAnnotationsResponse
-	eg := &errgroup.Group{}
-	eg.Go(func() error {
-		r, err := css.syncIngestAnnotations(ctx, req)
-		if err != nil {
-			log.Errorf("Failed ingesting kythe table %+v: %s", req.GetSstableName(), err)
-			return err
-		}
-		rsp = r
-		log.Infof("Finished ingesting kythe table %+v", req.GetSstableName())
-		return nil
-	})
-	if req.GetAsync() {
-		return &inpb.IngestAnnotationsResponse{}, nil
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
-	return rsp, nil
+	return rsp, status.UnimplementedError("unsupported navigation request type")
 }
 
 func (css *codesearchServer) Close(ctx context.Context) {
-	css.kdb.Close(ctx)
+	css.db.Close()
 }

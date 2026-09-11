@@ -27,15 +27,14 @@ import (
 
 var (
 	workspaceContents = map[string]string{
-		"WORKSPACE": `workspace(name = "integration_test")`,
-		"BUILD":     `genrule(name = "hello_txt", outs = ["hello.txt"], cmd_bash = "echo 'Hello world' > $@")`,
+		"BUILD": `genrule(name = "hello_txt", outs = ["hello.txt"], cmd_bash = "echo 'Hello world' > $@")`,
 	}
 )
 
 func TestBuildWithBESFlags_Success(t *testing.T) {
 	app := buildbuddy.Run(t)
 	ctx := context.Background()
-	ws := testbazel.MakeTempWorkspace(t, workspaceContents)
+	ws := testbazel.MakeTempModule(t, workspaceContents)
 	buildFlags := []string{"//:hello.txt"}
 	buildFlags = append(buildFlags, app.BESBazelFlags()...)
 
@@ -61,14 +60,14 @@ func TestBuildWithRetry_InjectFailureAfterBuildFinished(t *testing.T) {
 	testInjectFailureAfterBazelEvent(t, &bespb.BuildEvent_Finished{})
 }
 
-func testInjectFailureAfterBazelEvent(t *testing.T, payloadMsg interface{}) {
+func testInjectFailureAfterBazelEvent(t *testing.T, payloadMsg any) {
 	app := buildbuddy.Run(t)
 	bepClient := app.PublishBuildEventClient(t)
 	proxy := StartBEPProxy(t, bepClient)
 	proxy.FailOnce(AfterForwardBazelEvent(t, payloadMsg))
 
 	ctx := context.Background()
-	ws := testbazel.MakeTempWorkspace(t, workspaceContents)
+	ws := testbazel.MakeTempModule(t, workspaceContents)
 	buildFlags := append([]string{"//:hello.txt"}, app.BESBazelFlags()...)
 	buildFlags = append(buildFlags, "--bes_backend="+proxy.GRPCAddress())
 
@@ -93,7 +92,7 @@ func TestBuildWithRetry_InjectFailureWhileServerIsSendingACKs(t *testing.T) {
 	proxy.FailOnce(BeforeServerSendsNthACK(2))
 
 	ctx := context.Background()
-	ws := testbazel.MakeTempWorkspace(t, workspaceContents)
+	ws := testbazel.MakeTempModule(t, workspaceContents)
 	buildFlags := append([]string{"//:hello.txt"}, app.BESBazelFlags()...)
 	buildFlags = append(buildFlags, "--bes_backend="+proxy.GRPCAddress())
 
@@ -137,7 +136,7 @@ type StreamErrorInjector func(*StreamEvent) error
 // a Bazel event with the same payload type as the given message is successfully
 // forwarded to the build event server. The given message must be assignable to
 // BuildEvent.Payload, otherwise the test immediately fails.
-func AfterForwardBazelEvent(t *testing.T, payloadMsg interface{}) StreamErrorInjector {
+func AfterForwardBazelEvent(t *testing.T, payloadMsg any) StreamErrorInjector {
 	payloadType := reflect.TypeOf(payloadMsg)
 	payloadSuperType := reflect.TypeOf(&(&bespb.BuildEvent{}).Payload).Elem()
 	if !payloadType.AssignableTo(payloadSuperType) {

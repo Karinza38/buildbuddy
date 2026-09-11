@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,30 +15,37 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/chunking"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
+	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"github.com/buildbuddy-io/buildbuddy/server/util/fastcopy"
+	"github.com/buildbuddy-io/buildbuddy/server/util/fspath"
+	"github.com/buildbuddy-io/buildbuddy/server/util/ioutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/third_party/singleflight"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
-	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
 )
 
 var (
-	enableDownloadCompresssion = flag.Bool("cache.client.enable_download_compression", true, "If true, enable compression of downloads from remote caches")
-	linkParallelism            = flag.Int("cache.client.filecache_link_parallelism", 0, "Number of goroutines to use when linking inputs from filecache. If 0 uses the value of GOMAXPROCS.")
-	inputTreeSetupParallelism  = flag.Int("cache.client.input_tree_setup_parallelism", -1, "Number of goroutines to use across all tasks when setting up the input tree structure. -1 means no queueing. 0 means GOMAXPROCS.")
+	enableDownloadCompression = flag.Bool("cache.client.enable_download_compression", true, "If true, enable compression of downloads from remote caches")
+	linkParallelism           = flag.Int("cache.client.filecache_link_parallelism", 0, "Number of goroutines to use when linking inputs from filecache. If 0 uses the value of GOMAXPROCS.")
+	inputTreeSetupParallelism = flag.Int("cache.client.input_tree_setup_parallelism", 1000, "Maximum number of concurrent filesystem operations to perform across all tasks when setting up the input tree structure. -1 means no limit.")
 
 	initInputTreeWrangler     sync.Once
 	inputTreeWranglerInstance *inputTreeWrangler
@@ -47,6 +56,10 @@ const (
 	// Should be big enough to feed the workers when they free up.
 	// Operations will block when the queue is full.
 	inputTreeOpsQueueSize = 4000
+	// BatchReadLimitBytes controls how big an object or batch can be to use
+	// the BatchReadBlobs RPC. In experiments, 2MiB blobs are 5-10% faster to
+	// read using the bytestream.Read api.
+	BatchReadLimitBytes = min(2*1024*1024, rpcutil.GRPCMaxSizeBytes)
 )
 
 func groupIDStringFromContext(ctx context.Context) string {
@@ -56,21 +69,27 @@ func groupIDStringFromContext(ctx context.Context) string {
 	return interfaces.AuthAnonymousUser
 }
 
-var DownloadDeduper = singleflight.Group[string, *FilePointer]{}
+// downloadDedupeKey controls the granularity at which we dedupe fetches.
+// The granularity is driven by file cache properties.
+// File cache contents is isolated by group, digest and executable attribute.
+type downloadDedupeKey struct {
+	groupID  string
+	fetchKey fetchKey
+}
+
+var DownloadDeduper = singleflight.Group[downloadDedupeKey, *FilePointer]{}
 
 type TransferInfo struct {
 	FileCount        int64
 	BytesTransferred int64
 	TransferDuration time.Duration
-	// Transfers tracks the files that were transferred, keyed by their
-	// workspace-relative paths.
-	Transfers map[string]*repb.FileNode
-	// Exists tracks the files that already existed, keyed by their
-	// workspace-relative paths.
-	Exists map[string]*repb.FileNode
 
 	LinkCount    int64
 	LinkDuration time.Duration
+
+	// InputFetchMetadata describes which input files were fetched from
+	// remote CAS while materializing the input tree.
+	InputFetchMetadata *espb.InputFetchMetadata
 }
 
 // DirHelper is a poor mans trie that helps us check if a partial path like
@@ -285,7 +304,7 @@ func (f *fileToUpload) FileNode() *repb.FileNode {
 	}
 }
 
-func uploadMissingFiles(ctx context.Context, uploader *cachetools.BatchCASUploader, env environment.Env, filesToUpload []*fileToUpload, instanceName string, digestFunction repb.DigestFunction_Value) (alreadyPresentBytes int64, _ error) {
+func uploadMissingFiles(ctx context.Context, uploader *cachetools.BatchCASUploader, env environment.Env, filesToUpload []*fileToUpload, instanceName string, digestFunction repb.DigestFunction_Value, addToFileCache bool) (alreadyPresentBytes int64, _ error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -298,18 +317,17 @@ func uploadMissingFiles(ctx context.Context, uploader *cachetools.BatchCASUpload
 	cas := env.GetContentAddressableStorageClient()
 
 	for batch := range slices.Chunk(filesToUpload, 1000) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			req := &repb.FindMissingBlobsRequest{
 				DigestFunction: digestFunction,
 				InstanceName:   instanceName,
+				Purpose:        repb.FindMissingBlobsRequest_EXECUTOR_OUTPUT_UPLOAD,
 			}
 			for _, f := range batch {
 				req.BlobDigests = append(req.BlobDigests, f.digest)
 			}
 			var presentBytes int64
-			resp, err := cas.FindMissingBlobs(ctx, req)
+			resp, err := cachetools.FindMissingBlobs(ctx, cas, req)
 			if err != nil {
 				log.CtxWarningf(ctx, "Failed to find missing output blobs: %s", err)
 			} else {
@@ -333,7 +351,7 @@ func uploadMissingFiles(ctx context.Context, uploader *cachetools.BatchCASUpload
 				// If the reader errored and returned, don't block forever
 			case batches <- batchResult{files: batch, presentBytes: presentBytes}:
 			}
-		}()
+		})
 	}
 
 	go func() {
@@ -344,17 +362,17 @@ func uploadMissingFiles(ctx context.Context, uploader *cachetools.BatchCASUpload
 	fc := env.GetFileCache()
 	for batch := range batches {
 		alreadyPresentBytes += batch.presentBytes
-		if err := uploadFiles(ctx, uploader, fc, batch.files); err != nil {
+		if err := uploadFiles(ctx, uploader, fc, batch.files, addToFileCache); err != nil {
 			return 0, err
 		}
 	}
 	return alreadyPresentBytes, nil
 }
 
-func uploadFiles(ctx context.Context, uploader *cachetools.BatchCASUploader, fc interfaces.FileCache, filesToUpload []*fileToUpload) error {
+func uploadFiles(ctx context.Context, uploader *cachetools.BatchCASUploader, fc interfaces.FileCache, filesToUpload []*fileToUpload, addToFileCache bool) error {
 	for _, uploadableFile := range filesToUpload {
 		// Add output files to the filecache.
-		if fc != nil {
+		if fc != nil && addToFileCache {
 			node := uploadableFile.FileNode()
 			if err := fc.AddFile(ctx, node, uploadableFile.fullPath); err != nil {
 				log.Warningf("Error adding file to filecache: %s", err)
@@ -398,6 +416,9 @@ func handleSymlink(dirHelper *DirHelper, rootDir string, cmd *repb.Command, acti
 	// Check whether the current client is using REAPI version before or after v2.1.
 	if len(cmd.OutputPaths) > 0 && len(cmd.OutputFiles) == 0 && len(cmd.OutputDirectories) == 0 {
 		// REAPI >= v2.1
+		if !dirHelper.IsOutputPath(fqfn) {
+			return nil
+		}
 		actionResult.OutputSymlinks = append(actionResult.OutputSymlinks, symlink)
 		// REAPI specification:
 		//   Servers that wish to be compatible with v2.0 API should still
@@ -420,31 +441,23 @@ func handleSymlink(dirHelper *DirHelper, rootDir string, cmd *repb.Command, acti
 		}
 		if symlinkInfo.IsDir() {
 			actionResult.OutputDirectorySymlinks = append(actionResult.OutputDirectorySymlinks, symlink)
-			return nil
+		} else {
+			actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
 		}
-
-		actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
 		return nil
 	}
 
 	// REAPI < v2.1
-	for _, expectedFile := range cmd.OutputFiles {
-		if symlink.Path == expectedFile {
-			actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
-			break
-		}
+	if slices.Contains(cmd.OutputFiles, symlink.Path) {
+		actionResult.OutputFileSymlinks = append(actionResult.OutputFileSymlinks, symlink)
 	}
-	for _, expectedDir := range cmd.OutputDirectories {
-		if symlink.Path == expectedDir {
-			actionResult.OutputDirectorySymlinks = append(actionResult.OutputDirectorySymlinks, symlink)
-			break
-		}
+	if slices.Contains(cmd.OutputDirectories, symlink.Path) {
+		actionResult.OutputDirectorySymlinks = append(actionResult.OutputDirectorySymlinks, symlink)
 	}
 	return nil
 }
 
-func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, instanceName string, digestFunction repb.DigestFunction_Value, rootDir string, cmd *repb.Command, actionResult *repb.ActionResult) (*TransferInfo, error) {
-	txInfo := &TransferInfo{}
+func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, instanceName string, digestFunction repb.DigestFunction_Value, rootDir string, cmd *repb.Command, actionResult *repb.ActionResult, addToFileCache bool, chunkingParams *repb.FastCdc2020Params) (*TransferInfo, error) {
 	startTime := time.Now()
 	outputDirectoryPaths := make([]string, 0)
 	filesToUpload := make([]*fileToUpload, 0)
@@ -502,8 +515,6 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 				if _, ok := dirHelper.FindParentOutputPath(childFullPath); !ok && !isOutputDirectory {
 					continue
 				}
-				txInfo.FileCount += 1
-				txInfo.BytesTransferred += dirNode.GetDigest().GetSizeBytes()
 				directory.Directories = append(directory.Directories, dirNode)
 			} else if info.Mode().IsRegular() {
 				if !dirHelper.ShouldUploadFile(childFullPath) {
@@ -513,8 +524,6 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 				if err != nil {
 					return nil, err
 				}
-				txInfo.FileCount += 1
-				txInfo.BytesTransferred += fileNode.GetDigest().GetSizeBytes()
 				directory.Files = append(directory.Files, fileNode)
 			} else if info.Mode()&os.ModeSymlink == os.ModeSymlink {
 				if err := handleSymlink(dirHelper, rootDir, cmd, actionResult, directory, childFullPath); err != nil {
@@ -534,11 +543,11 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 		return nil, err
 	}
 
-	uploader := cachetools.NewBatchCASUploader(ctx, env, instanceName, digestFunction)
+	uploader := cachetools.NewBatchCASUploader(ctx, env, instanceName, digestFunction, chunkingParams)
 
 	// Upload output files to the remote cache and also add them to the local
 	// cache since they are likely to be used as inputs to subsequent actions.
-	alreadyPresentBytes, err := uploadMissingFiles(ctx, uploader, env, filesToUpload, instanceName, digestFunction)
+	alreadyPresentBytes, err := uploadMissingFiles(ctx, uploader, env, filesToUpload, instanceName, digestFunction, addToFileCache)
 	if err != nil {
 		return nil, err
 	}
@@ -566,6 +575,22 @@ func UploadTree(ctx context.Context, env environment.Env, dirHelper *DirHelper, 
 			tree.Root = d.directory
 		} else if parentOutputPath, ok := dirHelper.FindParentOutputPath(d.fullPath); ok {
 			tree = outputDirectoryTrees[parentOutputPath]
+			if tree == nil {
+				// Format outputDirectoryPaths with %q so we can see the exact
+				// string contents.
+				formattedOutputDirectoryPaths := make([]string, 0, len(outputDirectoryPaths))
+				for _, p := range outputDirectoryPaths {
+					formattedOutputDirectoryPaths = append(formattedOutputDirectoryPaths, fmt.Sprintf("%q", p))
+				}
+				alert.UnexpectedEvent(
+					"malformed_parent_output_path",
+					"Tree was not initialized for output at %q "+
+						"with parent output path %q. "+
+						"Output directory trees were only initialized for output paths [%s], "+
+						"which do not contain the parent output path.",
+					d.fullPath, parentOutputPath, strings.Join(formattedOutputDirectoryPaths, ", "))
+				return nil, status.InternalErrorf("malformed parent output path")
+			}
 			tree.Children = append(tree.Children, d.directory)
 		}
 	}
@@ -603,14 +628,20 @@ type FilePointer struct {
 	// ex: some/package/some_input.go
 	RelativePath string
 	FileNode     *repb.FileNode
+	// BitsetIndex is the index of this file in a deterministic leaf-file order:
+	// files first, in the order they are listed in each Directory message, then
+	// leaf files from each child directory, recursively, in the order the child
+	// directories are listed in each Directory message.
+	BitsetIndex uint32
 }
 
 // removeExisting removes any existing file pointed to by the FilePointer if
-// it exists in the opts.Skip (pre-existing files) map. This is needed so that
+// it exists in the opts.KnownInputs map. This is needed so that
 // we overwrite existing files without silently dropping errors when linking
 // the file. (Note, it is not needed when writing a fresh copy of the file.)
 func removeExisting(fp *FilePointer, opts *DownloadTreeOpts) error {
-	if _, ok := opts.Skip[fp.RelativePath]; ok {
+	pathKey := fspath.NewKey(fp.RelativePath, opts.CaseInsensitive)
+	if _, ok := opts.KnownInputs[pathKey]; ok {
 		if err := os.Remove(fp.FullPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -618,7 +649,10 @@ func removeExisting(fp *FilePointer, opts *DownloadTreeOpts) error {
 	return nil
 }
 
-func writeFile(fp *FilePointer, data []byte) error {
+func writeFile(fp *FilePointer, data []byte, opts *DownloadTreeOpts) error {
+	if err := removeExisting(fp, opts); err != nil {
+		return err
+	}
 	var mode os.FileMode = 0644
 	if fp.FileNode.IsExecutable {
 		mode = 0755
@@ -632,6 +666,21 @@ func writeFile(fp *FilePointer, data []byte) error {
 	}
 	//	defer log.Printf("Wrote %d bytes to file %q", len(data), filePath)
 	return f.Close()
+}
+
+func (ff *BatchFileFetcher) writeToFileCache(fileNode *repb.FileNode, data []byte) error {
+	w, err := ff.env.GetFileCache().Writer(ff.ctx, fileNode, ff.digestFunction)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	if err := w.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func copyFile(src *FilePointer, dest *FilePointer, opts *DownloadTreeOpts) error {
@@ -650,62 +699,125 @@ func linkFileFromFileCache(ctx context.Context, fp *FilePointer, fc interfaces.F
 	return fc.FastLinkFile(ctx, fp.FileNode, fp.FullPath), nil
 }
 
+// fetchKey identifies an artifact to be fetched from a remote cache.
+type fetchKey struct {
+	digest.Key
+
+	// The file cache treats executable and non-executable files as separate
+	// entries since the attributes are shared when hardlinking.
+	// By differentiating executable and non-executable artifacts, we don't
+	// need to worry about attribute differences when interacting with the
+	// file cache.
+	executable bool
+}
+
+func newFetchKey(d *repb.Digest, executable bool) fetchKey {
+	return fetchKey{digest.NewKey(d), executable}
+}
+
 // FileMap is a map of digests to file pointers containing the contents
 // addressed by the digest.
-type FileMap map[digest.Key][]*FilePointer
+type FileMap map[fetchKey][]*FilePointer
 
 type BatchFileFetcher struct {
-	ctx            context.Context
-	env            environment.Env
-	instanceName   string
-	digestFunction repb.DigestFunction_Value
-	once           *sync.Once
-	compress       bool
-	treeWrangler   *inputTreeWrangler
+	ctx                     context.Context
+	env                     environment.Env
+	instanceName            string
+	digestFunction          repb.DigestFunction_Value
+	treeWrangler            *inputTreeWrangler
+	filesToFetch            FileMap
+	opts                    *DownloadTreeOpts
+	onlyDownloadToFileCache bool
+	doneErr                 chan error
+
+	mu               sync.Mutex
+	remainingFetches map[fetchKey]struct{}
+	fetchWaiters     map[fetchKey][]chan struct{}
+
+	bitmapMu        sync.Mutex
+	downloadsBitmap *roaring.Bitmap
 
 	statsMu sync.Mutex
 	stats   repb.IOStats
 }
 
-// NewBatchFileFetcher creates a CAS fetcher that can automatically batch small requests and stream large files.
+// newBatchFileFetcher creates a CAS fetcher that can automatically batch small requests and stream large files.
 // `fileCache` is optional. If present, it's used to cache a copy of the data for use by future reads.
 // `casClient` is optional. If not specified, all requests will use the ByteStream API.
-func NewBatchFileFetcher(ctx context.Context, env environment.Env, instanceName string, digestFunction repb.DigestFunction_Value) *BatchFileFetcher {
-	return &BatchFileFetcher{
-		ctx:            ctx,
-		env:            env,
-		treeWrangler:   getInputTreeWrangler(env),
-		instanceName:   instanceName,
-		digestFunction: digestFunction,
-		once:           &sync.Once{},
-		compress:       false,
+func newBatchFileFetcher(ctx context.Context, env environment.Env, instanceName string, digestFunction repb.DigestFunction_Value, filesToFetch FileMap, opts *DownloadTreeOpts) (*BatchFileFetcher, error) {
+	if env.GetByteStreamClient() == nil {
+		return nil, status.FailedPreconditionError("ByteStreamClient not available")
 	}
+
+	remainingFetches := make(map[fetchKey]struct{})
+	for k := range filesToFetch {
+		remainingFetches[k] = struct{}{}
+	}
+	var downloadsBitmap *roaring.Bitmap
+	if opts.RecordInputFetchMetadata {
+		downloadsBitmap = roaring.New()
+	}
+
+	return &BatchFileFetcher{
+		ctx:                     ctx,
+		env:                     env,
+		treeWrangler:            getInputTreeWrangler(env),
+		instanceName:            instanceName,
+		digestFunction:          digestFunction,
+		filesToFetch:            filesToFetch,
+		opts:                    opts,
+		onlyDownloadToFileCache: opts.RootDir == "",
+		doneErr:                 make(chan error, 1),
+		remainingFetches:        remainingFetches,
+		fetchWaiters:            make(map[fetchKey][]chan struct{}),
+		downloadsBitmap:         downloadsBitmap,
+	}, nil
 }
 
-func (ff *BatchFileFetcher) supportsCompression() bool {
-	ff.once.Do(func() {
-		if !*enableDownloadCompresssion {
-			return
-		}
-		capabilitiesClient := ff.env.GetCapabilitiesClient()
-		if capabilitiesClient == nil {
-			log.Warningf("Download compression was enabled but no capabilities client found. Cannot verify cache server capabilities")
-			return
-		}
-		enabled, err := cachetools.SupportsCompression(ff.ctx, capabilitiesClient)
-		if err != nil {
-			log.Errorf("Error determinining if cache server supports compression: %s", err)
-		}
-		if enabled {
-			ff.compress = true
-		} else {
-			log.Debugf("Download compression was enabled but remote server did not support compression")
-		}
-	})
-	return ff.compress
+func (ff *BatchFileFetcher) notifyFetchCompleted(fk fetchKey) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	delete(ff.remainingFetches, fk)
+	for _, w := range ff.fetchWaiters[fk] {
+		w <- struct{}{}
+	}
+	delete(ff.fetchWaiters, fk)
 }
 
-func (ff *BatchFileFetcher) batchDownloadFiles(ctx context.Context, req *repb.BatchReadBlobsRequest, filesToFetch FileMap, opts *DownloadTreeOpts) error {
+// completeRemoteFetch records a successful remote CAS download and notifies any
+// waiters blocked on the fetch key.
+func (ff *BatchFileFetcher) completeRemoteFetch(fk fetchKey, filePointers []*FilePointer) {
+	ff.markFilesDownloaded(filePointers)
+	ff.notifyFetchCompleted(fk)
+}
+
+// markFilesDownloaded records leaf-file indices for files that were fetched
+// from remote CAS. Files linked from the local file cache are not marked.
+func (ff *BatchFileFetcher) markFilesDownloaded(filePointers []*FilePointer) {
+	if len(filePointers) == 0 || ff.downloadsBitmap == nil {
+		return
+	}
+	indices := make([]uint32, 0, len(filePointers))
+	for _, fp := range filePointers {
+		indices = append(indices, fp.BitsetIndex)
+	}
+	ff.bitmapMu.Lock()
+	defer ff.bitmapMu.Unlock()
+	ff.downloadsBitmap.AddMany(indices)
+}
+
+// downloadedFileIndicesBitmap serializes the set of remotely downloaded leaf
+// file indices for inclusion in execution auxiliary metadata.
+func (ff *BatchFileFetcher) downloadedFileIndicesBitmap() ([]byte, error) {
+	if ff.downloadsBitmap == nil {
+		return nil, nil
+	}
+	ff.bitmapMu.Lock()
+	defer ff.bitmapMu.Unlock()
+	return ff.downloadsBitmap.MarshalBinary()
+}
+
+func (ff *BatchFileFetcher) batchDownloadFiles(ctx context.Context, req *repb.BatchReadBlobsRequest, opts *DownloadTreeOpts) error {
 	casClient := ff.env.GetContentAddressableStorageClient()
 	if casClient == nil {
 		return status.FailedPreconditionErrorf("cannot batch download files when casClient is not set")
@@ -733,55 +845,81 @@ func (ff *BatchFileFetcher) batchDownloadFiles(ctx context.Context, req *repb.Ba
 			return digest.MissingDigestError(res.Digest)
 		}
 		d := res.Digest
-		ptrs, ok := filesToFetch[digest.NewKey(d)]
-		if !ok {
-			return status.InternalErrorf("Fetched unrequested file: %q", d)
-		}
-		if len(ptrs) == 0 {
-			continue
-		}
-		ptr := ptrs[0]
-		if err := writeFile(ptr, res.Data); err != nil {
-			return err
-		}
-		if fileCache != nil {
-			if err := fileCache.AddFile(ff.ctx, ptr.FileNode, ptr.FullPath); err != nil {
-				log.Warningf("Error adding file to filecache: %s", err)
+		for _, executable := range []bool{false, true} {
+			fetchKey := newFetchKey(d, executable)
+			ptrs, ok := ff.filesToFetch[fetchKey]
+			if !ok || len(ptrs) == 0 {
+				continue
 			}
-		}
-		// Only need to write the first file explicitly; the rest of the files can
-		// be fast-copied from the first.
-		for _, dest := range ptrs[1:] {
-			if err := copyFile(ptr, dest, opts); err != nil {
-				return err
+			ptr := ptrs[0]
+			if ff.onlyDownloadToFileCache {
+				if err := ff.writeToFileCache(ptr.FileNode, res.Data); err != nil {
+					return err
+				}
+			} else {
+				if err := writeFile(ptr, res.Data, opts); err != nil {
+					return err
+				}
+				if fileCache != nil {
+					if err := fileCache.AddFile(ff.ctx, ptr.FileNode, ptr.FullPath); err != nil {
+						log.Warningf("Error adding file to filecache: %s", err)
+					}
+				}
+				// Only need to write the first file explicitly; the rest of the files can
+				// be fast-copied from the first.
+				for _, dest := range ptrs[1:] {
+					if err := copyFile(ptr, dest, opts); err != nil {
+						return err
+					}
+				}
 			}
+			ff.completeRemoteFetch(fetchKey, ptrs)
 		}
 	}
 	return nil
 }
 
-func (ff *BatchFileFetcher) linkFromFileCache(filePointers []*FilePointer, opts *DownloadTreeOpts) error {
-	err := ff.treeWrangler.LinkFromFileCache(ff.ctx, filePointers, opts)
-	if err == nil {
-		ff.statsMu.Lock()
-		ff.stats.LocalCacheHits += int64(len(filePointers))
-		ff.statsMu.Unlock()
+func (ff *BatchFileFetcher) checkAndMaybeLinkFromFileCache(filePointers []*FilePointer, opts *DownloadTreeOpts) error {
+	if ff.onlyDownloadToFileCache {
+		if len(filePointers) == 0 {
+			return status.FailedPreconditionErrorf("file pointers list is empty")
+		}
+		// All the file pointers refer to the same artifact so we only need to
+		// check once.
+		fp := filePointers[0]
+		if !ff.env.GetFileCache().ContainsFile(ff.ctx, fp.FileNode) {
+			return status.NotFoundErrorf("File %s not found in cache", fp.FileNode.Digest.Hash)
+		}
+	} else {
+		err := ff.treeWrangler.LinkFromFileCache(ff.ctx, filePointers, opts)
+		if err != nil {
+			return err
+		}
 	}
-	return err
+	ff.statsMu.Lock()
+	ff.stats.LocalCacheHits += int64(len(filePointers))
+	ff.statsMu.Unlock()
+	return nil
 }
 
 type digestToFetch struct {
-	d   *repb.Digest
+	key fetchKey
 	fps []*FilePointer
 }
 
-func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeOpts) error {
+func (ff *BatchFileFetcher) FetchFiles(opts *DownloadTreeOpts) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			ff.doneErr <- retErr
+		}
+	}()
+
 	newRequest := func() *repb.BatchReadBlobsRequest {
 		r := &repb.BatchReadBlobsRequest{
 			InstanceName:   ff.instanceName,
 			DigestFunction: ff.digestFunction,
 		}
-		if ff.supportsCompression() {
+		if *enableDownloadCompression {
 			r.AcceptableCompressors = append(r.AcceptableCompressors, repb.Compressor_ZSTD)
 		}
 		return r
@@ -809,15 +947,12 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 		//
 		// Attempt to link digests from the file cache. Digests that are not
 		// present in the filecache will be added to the fetchQueue channel.
-		for dk, filePointers := range filesToFetch {
-			d := dk.ToDigest()
-			filePointers := filePointers
+		for dk, filePointers := range ff.filesToFetch {
 
-			rn := digest.NewResourceName(dk.ToDigest(), ff.instanceName, rspb.CacheType_CAS, ff.digestFunction)
 			// Write empty files directly (skip checking cache and downloading).
-			if rn.IsEmpty() {
+			if digest.IsEmptyHash(dk.ToDigest(), ff.digestFunction) && !ff.onlyDownloadToFileCache {
 				for _, fp := range filePointers {
-					if err := writeFile(fp, []byte("")); err != nil {
+					if err := writeFile(fp, []byte(""), opts); err != nil {
 						return err
 					}
 				}
@@ -825,14 +960,15 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 			}
 
 			linkEG.Go(func() error {
-				// If we linked the digest from the file cache, there's nothing
+				// If the digest is in the file cache, there's nothing
 				// more to do.
-				if err := ff.linkFromFileCache(filePointers, opts); err == nil {
+				if err := ff.checkAndMaybeLinkFromFileCache(filePointers, opts); err == nil {
+					ff.notifyFetchCompleted(dk)
 					return nil
 				}
 
 				// Otherwise, queue the digest to be fetched.
-				fetchQueue <- digestToFetch{d: d, fps: filePointers}
+				fetchQueue <- digestToFetch{key: dk, fps: filePointers}
 				return nil
 			})
 		}
@@ -849,10 +985,18 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 			// If the file exceeds our gRPC max size, it'll never
 			// fit in the batch call, so we'll have to bytestream
 			// it.
-			size := f.d.GetSizeBytes()
-			if size > rpcutil.GRPCMaxSizeBytes || ff.env.GetContentAddressableStorageClient() == nil {
+			size := f.key.SizeBytes
+			if size > BatchReadLimitBytes || ff.env.GetContentAddressableStorageClient() == nil {
 				eg.Go(func() error {
-					return ff.bytestreamReadFiles(ctx, ff.instanceName, f.d, f.fps, opts)
+					if len(f.fps) == 0 {
+						return status.FailedPreconditionError("empty file pointer list for key")
+					}
+					dedupeKey := downloadDedupeKey{groupID: groupIDStringFromContext(ctx), fetchKey: f.key}
+					if ff.onlyDownloadToFileCache {
+						return ff.bytestreamReadToFilecache(ctx, ff.env.GetByteStreamClient(), dedupeKey, f.fps)
+					} else {
+						return ff.bytestreamReadToFilesystem(ctx, ff.env.GetByteStreamClient(), dedupeKey, f.fps, opts)
+					}
 				})
 				continue
 			}
@@ -860,10 +1004,10 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 			// If the digest would push our current batch request
 			// size over the gRPC max, dispatch the request and
 			// start a new one.
-			if currentBatchRequestSize+size > rpcutil.GRPCMaxSizeBytes {
+			if currentBatchRequestSize+size > BatchReadLimitBytes {
 				reqCopy := req
 				eg.Go(func() error {
-					return ff.batchDownloadFiles(ctx, reqCopy, filesToFetch, opts)
+					return ff.batchDownloadFiles(ctx, reqCopy, opts)
 				})
 				req = newRequest()
 				currentBatchRequestSize = 0
@@ -871,7 +1015,7 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 
 			// Add the file to our current batch request and
 			// increment our size.
-			req.Digests = append(req.Digests, f.d)
+			req.Digests = append(req.Digests, f.key.ToDigest())
 			currentBatchRequestSize += size
 		}
 
@@ -879,7 +1023,7 @@ func (ff *BatchFileFetcher) FetchFiles(filesToFetch FileMap, opts *DownloadTreeO
 		if len(req.Digests) > 0 {
 			reqCopy := req
 			eg.Go(func() error {
-				return ff.batchDownloadFiles(ctx, reqCopy, filesToFetch, opts)
+				return ff.batchDownloadFiles(ctx, reqCopy, opts)
 			})
 		}
 		return nil
@@ -903,51 +1047,107 @@ func (ff *BatchFileFetcher) GetStats() *repb.IOStats {
 	return ff.stats.CloneVT()
 }
 
-// bytestreamReadFiles reads the given digest from the bytestream and creates
-// files pointing to those contents.
-func (ff *BatchFileFetcher) bytestreamReadFiles(ctx context.Context, instanceName string, d *repb.Digest, fps []*FilePointer, opts *DownloadTreeOpts) error {
-	bsClient := ff.env.GetByteStreamClient()
-	if bsClient == nil {
-		return status.FailedPreconditionErrorf("cannot bytestream read files when bsClient is not set")
+func (ff *BatchFileFetcher) shouldDownloadChunked(fileNode *repb.FileNode) bool {
+	return ff.opts != nil &&
+		ff.opts.ChunkedInputFiles &&
+		ff.env.GetContentAddressableStorageClient() != nil &&
+		fileNode.GetDigest().GetSizeBytes() > chunking.MaxSupportedChunkSizeBytes()
+}
+
+// downloadBlobToFile writes fileNode into path, creating or truncating it.
+// For large blobs it tries the SplitBlob-based parallel chunked path first
+// when enabled, falling back to a plain ByteStream.Read on any error.
+func (ff *BatchFileFetcher) downloadBlobToFile(ctx context.Context, bsClient bspb.ByteStreamClient, fileNode *repb.FileNode, path string, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if ff.shouldDownloadChunked(fileNode) {
+		cas := ff.env.GetContentAddressableStorageClient()
+		rn := digest.NewCASResourceName(fileNode.GetDigest(), ff.instanceName, ff.digestFunction)
+		if *enableDownloadCompression {
+			rn.SetCompressor(repb.Compressor_ZSTD)
+		}
+		openLocal := func(ctx context.Context, node *repb.FileNode) (*os.File, error) {
+			if fc := ff.env.GetFileCache(); fc != nil {
+				return fc.Open(ctx, node)
+			}
+			return nil, os.ErrNotExist
+		}
+		err = cachetools.GetBlobChunked(ctx, bsClient, cas, rn, fileNode, f, openLocal)
+		if err == nil {
+			if err := f.Close(); err != nil {
+				return err
+			}
+			ff.statsMu.Lock()
+			ff.stats.FileDownloadSizeBytes += fileNode.GetDigest().GetSizeBytes()
+			ff.stats.FileDownloadCount += 1
+			ff.statsMu.Unlock()
+			return nil
+		}
+		if err := f.Truncate(0); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	return ff.bytestreamReadToWriter(ctx, bsClient, fileNode, ioutil.NewCustomCommitWriteCloser(f))
+}
+
+func (ff *BatchFileFetcher) bytestreamReadToWriter(ctx context.Context, bsClient bspb.ByteStreamClient, fileNode *repb.FileNode, w interfaces.CommittedWriteCloser) error {
+	resourceName := digest.NewCASResourceName(fileNode.Digest, ff.instanceName, ff.digestFunction)
+	if *enableDownloadCompression {
+		resourceName.SetCompressor(repb.Compressor_ZSTD)
 	}
 
-	if len(fps) == 0 {
-		return nil
+	if err := cachetools.GetBlob(ctx, bsClient, resourceName, w); err != nil {
+		_ = w.Close()
+		return err
 	}
 
-	dedupeKey := groupIDStringFromContext(ctx) + "-" + d.GetHash()
+	if err := w.Commit(); err != nil {
+		return status.WrapError(err, "could not commit byte stream writer")
+	}
+
+	if err := w.Close(); err != nil {
+		return status.WrapError(err, "could not close byte stream writer")
+	}
+
+	ff.statsMu.Lock()
+	ff.stats.FileDownloadSizeBytes += fileNode.GetDigest().SizeBytes
+	ff.stats.FileDownloadCount += 1
+	ff.statsMu.Unlock()
+
+	return nil
+}
+
+// bytestreamReadToFilesystem streams a blob to the filesystem locations
+// listed in fps. The blob is fetched once and linked into the remaining
+// locations.
+// The blob is optionally added to the file cache, if the file cache
+// is enabled.
+func (ff *BatchFileFetcher) bytestreamReadToFilesystem(ctx context.Context, bsClient bspb.ByteStreamClient, dedupeKey downloadDedupeKey, fps []*FilePointer, opts *DownloadTreeOpts) error {
 	fp, _, err := DownloadDeduper.Do(ctx, dedupeKey, func(ctx context.Context) (*FilePointer, error) {
 		fp0 := fps[0]
+
 		var mode os.FileMode = 0644
 		if fp0.FileNode.IsExecutable {
 			mode = 0755
 		}
-		f, err := os.OpenFile(fp0.FullPath, os.O_RDWR|os.O_CREATE, mode)
-		if err != nil {
-			return nil, err
-		}
-		resourceName := digest.NewResourceName(fp0.FileNode.Digest, instanceName, rspb.CacheType_CAS, ff.digestFunction)
-		if ff.supportsCompression() {
-			resourceName.SetCompressor(repb.Compressor_ZSTD)
-		}
-		if err := cachetools.GetBlob(ctx, bsClient, resourceName, f); err != nil {
+		if err := ff.downloadBlobToFile(ctx, bsClient, fp0.FileNode, fp0.FullPath, mode); err != nil {
 			return nil, err
 		}
 
-		ff.statsMu.Lock()
-		ff.stats.FileDownloadSizeBytes += d.GetSizeBytes()
-		ff.stats.FileDownloadCount += 1
-		ff.statsMu.Unlock()
-
-		if err := f.Close(); err != nil {
-			return nil, err
-		}
 		fileCache := ff.env.GetFileCache()
 		if fileCache != nil {
 			if err := fileCache.AddFile(ff.ctx, fp0.FileNode, fp0.FullPath); err != nil {
 				log.Warningf("Error adding file to filecache: %s", err)
 			}
 		}
+
 		return fp0, nil
 	})
 	if err != nil {
@@ -967,15 +1167,62 @@ func (ff *BatchFileFetcher) bytestreamReadFiles(ctx context.Context, instanceNam
 			return err
 		}
 	}
+
+	ff.completeRemoteFetch(dedupeKey.fetchKey, fps)
+
 	return nil
 }
 
-func fetchDir(ctx context.Context, bsClient bspb.ByteStreamClient, reqDigest *digest.ResourceName) (*repb.Directory, error) {
-	dir := &repb.Directory{}
-	if err := cachetools.GetBlobAsProto(ctx, bsClient, reqDigest, dir); err != nil {
-		return nil, err
+// bytestreamReadToFilecache streams a blob directly into the filecache.
+func (ff *BatchFileFetcher) bytestreamReadToFilecache(ctx context.Context, bsClient bspb.ByteStreamClient, dedupeKey downloadDedupeKey, fps []*FilePointer) error {
+	_, _, err := DownloadDeduper.Do(ctx, dedupeKey, func(ctx context.Context) (*FilePointer, error) {
+		fp0 := fps[0]
+
+		w, err := ff.env.GetFileCache().Writer(ctx, fp0.FileNode, ff.digestFunction)
+		if err != nil {
+			return nil, status.WrapError(err, "could not create filecache writer")
+		}
+
+		if err := ff.bytestreamReadToWriter(ctx, bsClient, fp0.FileNode, w); err != nil {
+			return nil, err
+		}
+
+		return fp0, nil
+	})
+	if err != nil {
+		return err
 	}
-	return dir, nil
+
+	ff.completeRemoteFetch(dedupeKey.fetchKey, fps)
+
+	return nil
+}
+
+// Fetch blocks until the specified input has been fetched.
+// TODO(vadim): prioritize fetches referenced through this call since this is
+// a signal that this input is immediately needed.
+func (ff *BatchFileFetcher) Fetch(ctx context.Context, node *repb.FileNode) error {
+	key := newFetchKey(node.GetDigest(), node.GetIsExecutable())
+
+	ff.mu.Lock()
+	// Check if the fetch has already completed.
+	if _, ok := ff.remainingFetches[key]; !ok {
+		ff.mu.Unlock()
+		return nil
+	}
+
+	done := make(chan struct{}, 1)
+	ff.fetchWaiters[key] = append(ff.fetchWaiters[key], done)
+	ff.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-ff.doneErr:
+		return status.WrapError(err, "fetcher failed")
+	case <-done:
+		return nil
+	}
 }
 
 func DirMapFromTree(tree *repb.Tree, digestFunction repb.DigestFunction_Value) (rootDigest *repb.Digest, dirMap map[digest.Key]*repb.Directory, err error) {
@@ -1009,16 +1256,29 @@ func checkSymlink(oldName, newName string) bool {
 }
 
 type DownloadTreeOpts struct {
-	// NonrootWritable specifies whether directories should be made writable
-	// by users other than root. Does not affect file permissions.
-	NonrootWritable bool
-	// Skip specifies file paths to skip, along with their file nodes. If the digest
-	// and executable bit of a file to be downloaded doesn't match the digest
-	// and executable bit of the file in this map, then it is re-downloaded (not skipped).
-	Skip map[string]*repb.FileNode
+	// CaseInsensitive specifies whether the filesystem is case-insensitive.
+	// If true, the paths will be normalized to lowercase.
+	CaseInsensitive bool
+	// KnownInputs maps workspace-relative input paths to file nodes retained
+	// from previous tasks. When TrackTransfers is enabled, paths also present
+	// in the current tree are returned in InputsState.Exist so cleanup can
+	// preserve them.
+	//
+	// When RootDir is set, unchanged known inputs are reused without downloading.
+	// When RootDir is empty, cache availability is checked independently since
+	// evicting cached contents does not remove the corresponding VFS entry.
+	KnownInputs map[fspath.Key]*repb.FileNode
+	// RootDir specifies the destination directory for the downloaded tree.
+	// If not specified, tree digests will be downloaded directly into the filecache.
+	RootDir string
 	// TrackTransfers specifies whether to record the full set of files downloaded
 	// and return them in TransferInfo.Transfers.
 	TrackTransfers bool
+	// ChunkedInputFiles enables SplitBlob-based input downloads for large files.
+	ChunkedInputFiles bool
+	// RecordInputFetchMetadata controls whether to record which inputs were
+	// fetched from remote CAS while materializing the tree.
+	RecordInputFetchMetadata bool
 }
 
 type inputTreeRequest interface {
@@ -1031,6 +1291,13 @@ type mkdirAllRequest struct {
 }
 
 func (mar *mkdirAllRequest) Do() error {
+	// Directories are created in tree traversal order, so parents should always
+	// exist. os.Mkdir should work and be faster than os.MkdirAll so try it
+	// first.
+	err := os.Mkdir(mar.path, mar.perm)
+	if err == nil {
+		return err
+	}
 	return os.MkdirAll(mar.path, mar.perm)
 }
 
@@ -1040,14 +1307,20 @@ type symlinkRequest struct {
 }
 
 func (slr *symlinkRequest) Do() error {
-	err := os.Symlink(slr.oldname, slr.newname)
+	oldname := slr.oldname
+	if oldname == "" {
+		// Bazel can encode target_path = "." as an empty REAPI SymlinkNode
+		// target. Linux rejects empty symlink targets.
+		oldname = "."
+	}
+	err := os.Symlink(oldname, slr.newname)
 	if err == nil {
 		return nil
 	}
 	if !os.IsExist(err) {
 		return err
 	}
-	if checkSymlink(slr.oldname, slr.newname) {
+	if checkSymlink(oldname, slr.newname) {
 		return nil
 	}
 	// Attempt to blow away the existing
@@ -1057,7 +1330,7 @@ func (slr *symlinkRequest) Do() error {
 	}
 	// Now that the symlink has been removed
 	// try one more time to link it.
-	if err := os.Symlink(slr.oldname, slr.newname); err != nil {
+	if err := os.Symlink(oldname, slr.newname); err != nil {
 		return err
 	}
 	return nil
@@ -1118,72 +1391,65 @@ func (tr *taskRequest) Do() {
 // performing too many operations on filesystems that don't do well beyond
 // a certain level of concurrency.
 type inputTreeWrangler struct {
-	env    environment.Env
-	direct bool
-	reqs   chan taskRequest
-	done   chan struct{}
+	env     environment.Env
+	limiter *semaphore.Weighted
+
+	mkdirAllLatencyUsec          prometheus.Observer
+	symlinkLatencyUsec           prometheus.Observer
+	linkFromFileCacheLatencyUsec prometheus.Observer
 }
 
 func newInputTreeWrangler(env environment.Env) *inputTreeWrangler {
 	w := &inputTreeWrangler{
-		env:  env,
-		done: make(chan struct{}),
-		reqs: make(chan taskRequest, inputTreeOpsQueueSize),
+		env:                          env,
+		mkdirAllLatencyUsec:          metrics.InputTreeSetupOpLatencyUsec.With(prometheus.Labels{metrics.OpLabel: "mkdirall"}),
+		symlinkLatencyUsec:           metrics.InputTreeSetupOpLatencyUsec.With(prometheus.Labels{metrics.OpLabel: "symlink"}),
+		linkFromFileCacheLatencyUsec: metrics.InputTreeSetupOpLatencyUsec.With(prometheus.Labels{metrics.OpLabel: "link_from_file_cache"}),
 	}
-	if *inputTreeSetupParallelism == -1 {
-		w.direct = true
-	} else {
-		w.Start()
-		env.GetHealthChecker().RegisterShutdownFunction(func(ctx context.Context) error {
-			w.Stop()
-			return nil
-		})
+	if *inputTreeSetupParallelism > 0 {
+		w.limiter = semaphore.NewWeighted(int64(*inputTreeSetupParallelism))
 	}
 	return w
 }
 
-func (w *inputTreeWrangler) Start() {
-	n := *inputTreeSetupParallelism
-	if n == 0 {
-		n = runtime.GOMAXPROCS(0)
-	}
-	for i := 0; i < n; i++ {
-		go func() {
-			for {
-				select {
-				case req := <-w.reqs:
-					req.Do()
-				case <-w.done:
-					return
-				}
-			}
-		}()
-	}
-}
-
-func (w *inputTreeWrangler) Stop() {
-	close(w.done)
-}
-
 func (w *inputTreeWrangler) scheduleRequest(ctx context.Context, req inputTreeRequest) error {
-	if w.direct {
-		return req.Do()
+	if w.limiter != nil {
+		if err := w.limiter.Acquire(ctx, 1); err != nil {
+			return err
+		}
+		defer w.limiter.Release(1)
 	}
-	respCh := make(chan error, 1)
-	w.reqs <- taskRequest{ctx: ctx, req: req, respCh: respCh}
-	return <-respCh
+	return req.Do()
 }
 
 func (w *inputTreeWrangler) MkdirAll(ctx context.Context, path string, perm os.FileMode) error {
-	return w.scheduleRequest(ctx, &mkdirAllRequest{path: path, perm: perm})
+	start := time.Now()
+	err := w.scheduleRequest(ctx, &mkdirAllRequest{path: path, perm: perm})
+	if err != nil {
+		return err
+	}
+	w.mkdirAllLatencyUsec.Observe(float64(time.Since(start).Microseconds()))
+	return nil
 }
 
 func (w *inputTreeWrangler) Symlink(ctx context.Context, oldname string, newname string) error {
-	return w.scheduleRequest(ctx, &symlinkRequest{oldname: oldname, newname: newname})
+	start := time.Now()
+	err := w.scheduleRequest(ctx, &symlinkRequest{oldname: oldname, newname: newname})
+	if err != nil {
+		return err
+	}
+	w.symlinkLatencyUsec.Observe(float64(time.Since(start).Microseconds()))
+	return nil
 }
 
 func (w *inputTreeWrangler) LinkFromFileCache(ctx context.Context, filePointers []*FilePointer, opts *DownloadTreeOpts) error {
-	return w.scheduleRequest(ctx, &linkFromFileCacheRequest{ctx: ctx, fileCache: w.env.GetFileCache(), filePointers: filePointers, opts: opts})
+	start := time.Now()
+	err := w.scheduleRequest(ctx, &linkFromFileCacheRequest{ctx: ctx, fileCache: w.env.GetFileCache(), filePointers: filePointers, opts: opts})
+	if err != nil {
+		return err
+	}
+	w.linkFromFileCacheLatencyUsec.Observe(float64(time.Since(start).Microseconds()))
+	return nil
 }
 
 func getInputTreeWrangler(env environment.Env) *inputTreeWrangler {
@@ -1195,66 +1461,142 @@ func getInputTreeWrangler(env environment.Env) *inputTreeWrangler {
 	return &w
 }
 
-func DownloadTree(ctx context.Context, env environment.Env, instanceName string, digestFunction repb.DigestFunction_Value, tree *repb.Tree, rootDir string, opts *DownloadTreeOpts) (*TransferInfo, error) {
-	treeWrangler := getInputTreeWrangler(env)
+type TreeFetcher struct {
+	ctx            context.Context
+	env            environment.Env
+	tree           *repb.Tree
+	instanceName   string
+	digestFunction repb.DigestFunction_Value
+	opts           *DownloadTreeOpts
 
-	txInfo := &TransferInfo{}
-	startTime := time.Now()
+	filesToFetch map[fetchKey][]*FilePointer
 
-	rootDirectoryDigest, dirMap, err := DirMapFromTree(tree, digestFunction)
+	ff             *BatchFileFetcher
+	txInfo         *TransferInfo
+	fetchStartTime time.Time
+	done           chan error
+}
+
+func DownloadTree(ctx context.Context, env environment.Env, instanceName string, digestFunction repb.DigestFunction_Value, tree *repb.Tree, opts *DownloadTreeOpts) (*TransferInfo, error) {
+	tf, err := NewTreeFetcher(ctx, env, instanceName, digestFunction, tree, opts)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tf.Start(); err != nil {
+		return nil, err
+	}
+	return tf.Wait()
+}
+
+type InputsState struct {
+	// NeedFetching tracks the input files that need to be fetched, keyed by
+	// their workspace-relative paths.
+	NeedFetching map[string]*repb.FileNode
+	// Exist tracks the files that already exist, keyed by their
+	// workspace-relative paths.
+	Exist map[fspath.Key]*repb.FileNode
+}
+
+func NewTreeFetcher(ctx context.Context, env environment.Env, instanceName string, digestFunction repb.DigestFunction_Value, tree *repb.Tree, opts *DownloadTreeOpts) (*TreeFetcher, error) {
+	return &TreeFetcher{
+		ctx:            ctx,
+		env:            env,
+		tree:           tree,
+		instanceName:   instanceName,
+		digestFunction: digestFunction,
+		opts:           opts,
+
+		txInfo: &TransferInfo{},
+
+		done: make(chan error, 1),
+	}, nil
+}
+
+// Starts begins fetching the tree asynchronously.
+func (f *TreeFetcher) Start() (*InputsState, error) {
+	ctx := f.ctx
+	treeWrangler := getInputTreeWrangler(f.env)
+
+	f.fetchStartTime = time.Now()
+
+	rootDirectoryDigest, dirMap, err := DirMapFromTree(f.tree, f.digestFunction)
 	if err != nil {
 		return nil, err
 	}
 
+	var needFetching map[string]*repb.FileNode
+	var exist map[fspath.Key]*repb.FileNode
 	trackTransfersFn := func(relPath string, node *repb.FileNode) {}
 	trackExistsFn := func(relPath string, node *repb.FileNode) {}
-	if opts.TrackTransfers {
-		txInfo.Transfers = map[string]*repb.FileNode{}
-		txInfo.Exists = map[string]*repb.FileNode{}
+	if f.opts.TrackTransfers {
+		needFetching = map[string]*repb.FileNode{}
+		exist = map[fspath.Key]*repb.FileNode{}
 		trackTransfersFn = func(relPath string, node *repb.FileNode) {
-			txInfo.Transfers[relPath] = node
+			needFetching[relPath] = node
 		}
 		trackExistsFn = func(relPath string, node *repb.FileNode) {
-			txInfo.Exists[relPath] = node
+			exist[fspath.NewKey(relPath, f.opts.CaseInsensitive)] = node
 		}
 	}
 
-	dirPerms := fs.FileMode(0755)
-	if opts.NonrootWritable {
-		dirPerms = 0777
-	}
-
-	filesToFetch := make(map[digest.Key][]*FilePointer, 0)
+	onlyDownloadToFileCache := f.opts.RootDir == ""
+	dirPerms := fs.FileMode(0777)
+	f.filesToFetch = make(map[fetchKey][]*FilePointer, 0)
+	nextBitsetIndex := uint32(0)
 	var fetchDirFn func(dir *repb.Directory, parentDir string) error
 	fetchDirFn = func(dir *repb.Directory, parentDir string) error {
+		// NOTE: the traversal order here is load-bearing. We assign bitmap
+		// indexes in a deterministic way - files first, then directories
+		// recursively. Note that files and directories are required by the spec
+		// to be sorted lexicographically.
 		for _, fileNode := range dir.GetFiles() {
 			func(node *repb.FileNode, location string) {
 				d := node.GetDigest()
 				fullPath := filepath.Join(location, node.Name)
-				relPath := trimPathPrefix(fullPath, rootDir)
-				skippedNode, ok := opts.Skip[relPath]
+				relPath := trimPathPrefix(fullPath, f.opts.RootDir)
+				bitsetIndex := uint32(0)
+				if f.opts.RecordInputFetchMetadata {
+					bitsetIndex = nextBitsetIndex
+					nextBitsetIndex++
+				}
+
+				pathKey := fspath.NewKey(relPath, f.opts.CaseInsensitive)
+				knownNode, ok := f.opts.KnownInputs[pathKey]
 				if ok {
 					trackExistsFn(relPath, node)
 				}
-				if ok && nodesEqual(node, skippedNode) {
+				// To avoid downloading inputs again when reusing a workspace,
+				// the caller supplies KnownInputs, a map of input paths and
+				// file metadata retained from previous tasks. If the file
+				// exists from a previous task and its contents haven't changed,
+				// we can skip downloading it.
+				//
+				// Edge case: for VFS prefetch, the file contents live in the
+				// file cache, which can evict them without removing the VFS
+				// entry. An unchanged known input therefore does not guarantee
+				// that the contents are available. Let prefetch check the file
+				// cache to decide whether another download is needed.
+				if ok && nodesEqual(node, knownNode) && !onlyDownloadToFileCache {
 					return
 				}
-				dk := digest.NewKey(d)
-				filesToFetch[dk] = append(filesToFetch[dk], &FilePointer{
+				dk := newFetchKey(d, node.IsExecutable)
+				f.filesToFetch[dk] = append(f.filesToFetch[dk], &FilePointer{
 					FileNode:     node,
 					FullPath:     fullPath,
 					RelativePath: relPath,
+					BitsetIndex:  bitsetIndex,
 				})
 				trackTransfersFn(relPath, node)
 			}(fileNode, parentDir)
 		}
 		for _, child := range dir.GetDirectories() {
 			newRoot := filepath.Join(parentDir, child.GetName())
-			if err := treeWrangler.MkdirAll(ctx, newRoot, dirPerms); err != nil {
-				return err
+			if !onlyDownloadToFileCache {
+				if err := treeWrangler.MkdirAll(ctx, newRoot, dirPerms); err != nil {
+					return err
+				}
 			}
-			rn := digest.NewResourceName(child.GetDigest(), instanceName, rspb.CacheType_CAS, digestFunction)
-			if rn.IsEmpty() && rn.GetDigest().SizeBytes == 0 {
+			if digest.IsEmptyHash(child.GetDigest(), f.digestFunction) && child.GetDigest().GetSizeBytes() == 0 {
 				continue
 			}
 			childDir, ok := dirMap[digest.NewKey(child.GetDigest())]
@@ -1268,38 +1610,73 @@ func DownloadTree(ctx context.Context, env environment.Env, instanceName string,
 				return err
 			}
 		}
-		for _, symlinkNode := range dir.GetSymlinks() {
-			nodeAbsPath := filepath.Join(parentDir, symlinkNode.GetName())
-			if err := treeWrangler.Symlink(ctx, symlinkNode.GetTarget(), nodeAbsPath); err != nil {
-				return err
+		if !onlyDownloadToFileCache {
+			for _, symlinkNode := range dir.GetSymlinks() {
+				nodeAbsPath := filepath.Join(parentDir, symlinkNode.GetName())
+				if err := treeWrangler.Symlink(ctx, symlinkNode.GetTarget(), nodeAbsPath); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	}
 	// Create the directory structure and track files to download.
-	if err := fetchDirFn(dirMap[digest.NewKey(rootDirectoryDigest)], rootDir); err != nil {
+	if err := fetchDirFn(dirMap[digest.NewKey(rootDirectoryDigest)], f.opts.RootDir); err != nil {
 		return nil, err
 	}
 
-	ff := NewBatchFileFetcher(ctx, env, instanceName, digestFunction)
-
-	// Download any files into the directory structure.
-	if err := ff.FetchFiles(filesToFetch, opts); err != nil {
+	ff, err := newBatchFileFetcher(ctx, f.env, f.instanceName, f.digestFunction, f.filesToFetch, f.opts)
+	if err != nil {
 		return nil, err
 	}
-	endTime := time.Now()
-	txInfo.TransferDuration = endTime.Sub(startTime)
-	stats := ff.GetStats()
-	txInfo.BytesTransferred = stats.GetFileDownloadSizeBytes()
-	txInfo.FileCount = stats.GetFileDownloadCount()
-	txInfo.LinkCount = stats.GetLocalCacheHits()
-	txInfo.LinkDuration = stats.GetLocalCacheLinkDuration().AsDuration()
+	f.ff = ff
 
-	return txInfo, nil
+	go func() {
+		// Download any files into the directory structure.
+		f.done <- f.ff.FetchFiles(f.opts)
+		close(f.done)
+	}()
+
+	return &InputsState{NeedFetching: needFetching, Exist: exist}, nil
+}
+
+// Wait blocks until all transfers are complete.
+// TODO(vadim): add method to cancel pending fetches
+func (f *TreeFetcher) Wait() (*TransferInfo, error) {
+	var err error
+	select {
+	case err = <-f.done:
+	case <-f.ctx.Done():
+		err = f.ctx.Err()
+	}
+
+	// Update the stats even if an error is returned.
+	stats := f.ff.GetStats()
+	f.txInfo.BytesTransferred = stats.GetFileDownloadSizeBytes()
+	f.txInfo.FileCount = stats.GetFileDownloadCount()
+	f.txInfo.LinkCount = stats.GetLocalCacheHits()
+	f.txInfo.LinkDuration = stats.GetLocalCacheLinkDuration().AsDuration()
+	f.txInfo.TransferDuration = time.Since(f.fetchStartTime)
+	if f.opts.RecordInputFetchMetadata {
+		bitmap, bitmapErr := f.ff.downloadedFileIndicesBitmap()
+		if bitmapErr != nil && err == nil {
+			err = status.WrapError(bitmapErr, "marshal input download bitmap")
+		}
+		f.txInfo.InputFetchMetadata = &espb.InputFetchMetadata{
+			DownloadedFileIndicesBitmap: bitmap,
+		}
+	}
+	return f.txInfo, err
+}
+
+// Fetch blocks until the specified node has been fetched.
+func (f *TreeFetcher) Fetch(ctx context.Context, node *repb.FileNode) error {
+	return f.ff.Fetch(ctx, node)
 }
 
 func nodesEqual(a *repb.FileNode, b *repb.FileNode) bool {
-	return a.GetDigest().GetHash() == b.GetDigest().GetHash() &&
+	return a.GetName() == b.GetName() &&
+		a.GetDigest().GetHash() == b.GetDigest().GetHash() &&
 		a.GetDigest().GetSizeBytes() == b.GetDigest().GetSizeBytes() &&
 		a.GetIsExecutable() == b.GetIsExecutable()
 }

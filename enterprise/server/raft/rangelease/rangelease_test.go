@@ -68,8 +68,6 @@ func newTestingProposerAndSenderAndReplica(t testing.TB) (*testutil.TestingPropo
 
 func TestAcquireAndRelease(t *testing.T) {
 	bgCtx := context.Background()
-	ctx, cancel := context.WithTimeout(bgCtx, 3*time.Second)
-	defer cancel()
 
 	proposer, sender, rep := newTestingProposerAndSenderAndReplica(t)
 	liveness := nodeliveness.New(bgCtx, "replicaID-1", sender)
@@ -85,8 +83,10 @@ func TestAcquireAndRelease(t *testing.T) {
 			{RangeId: 1, ReplicaId: 3},
 		},
 	}
-	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd, rep)
+	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd.GetRangeId(), rep)
 
+	ctx, cancel := context.WithTimeout(bgCtx, 3*time.Second)
+	defer cancel()
 	// Should be able to get a rangelease.
 	err := l.Lease(ctx)
 	require.NoError(t, err)
@@ -95,7 +95,7 @@ func TestAcquireAndRelease(t *testing.T) {
 	valid := l.Valid(ctx)
 	require.True(t, valid)
 
-	log.Printf("RangeLease: %s", l.Desc(ctx))
+	log.Infof("RangeLease: %s", l.Desc(ctx))
 
 	// Should be able to release a rangelease.
 	err = l.Release(ctx)
@@ -108,8 +108,6 @@ func TestAcquireAndRelease(t *testing.T) {
 
 func TestAcquireAndReleaseMetaRange(t *testing.T) {
 	bgCtx := context.Background()
-	ctx, cancel := context.WithTimeout(bgCtx, 3*time.Second)
-	defer cancel()
 
 	proposer, sender, rep := newTestingProposerAndSenderAndReplica(t)
 	liveness := nodeliveness.New(bgCtx, "replicaID-2", sender)
@@ -125,9 +123,11 @@ func TestAcquireAndReleaseMetaRange(t *testing.T) {
 			{RangeId: 1, ReplicaId: 3},
 		},
 	}
-	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd, rep)
+	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd.GetRangeId(), rep)
 
 	// Should be able to get a rangelease.
+	ctx, cancel := context.WithTimeout(bgCtx, 3*time.Second)
+	defer cancel()
 	err := l.Lease(ctx)
 	require.NoError(t, err)
 
@@ -135,7 +135,7 @@ func TestAcquireAndReleaseMetaRange(t *testing.T) {
 	valid := l.Valid(ctx)
 	require.True(t, valid)
 
-	log.Printf("RangeLease: %s", l.Desc(ctx))
+	log.Infof("RangeLease: %s", l.Desc(ctx))
 
 	// Should be able to release a rangelease.
 	err = l.Release(ctx)
@@ -167,7 +167,7 @@ func TestMetaRangeLeaseKeepalive(t *testing.T) {
 	}
 	leaseDuration := 100 * time.Millisecond
 	gracePeriod := 50 * time.Millisecond
-	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd, rep).WithTimeouts(leaseDuration, gracePeriod)
+	l := rangelease.New(proposer, session, log.NamedSubLogger("test"), liveness, rd.GetRangeId(), rep).WithTimeouts(leaseDuration, gracePeriod)
 
 	// Should be able to get a rangelease.
 	err := l.Lease(ctx)
@@ -177,9 +177,9 @@ func TestMetaRangeLeaseKeepalive(t *testing.T) {
 	valid := l.Valid(ctx)
 	require.True(t, valid)
 
-	log.Printf("RangeLease: %s", l.Desc(ctx))
+	log.Infof("RangeLease: %s", l.Desc(ctx))
 	time.Sleep(2 * leaseDuration)
-	log.Printf("RangeLease: %s", l.Desc(ctx))
+	log.Infof("RangeLease: %s", l.Desc(ctx))
 
 	// Rangelease should have auto-renewed itself and should still be valid.
 	valid = l.Valid(ctx)

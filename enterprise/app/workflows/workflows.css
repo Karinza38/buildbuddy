@@ -58,7 +58,7 @@
 .workflows-page .workflow-item {
   padding-top: 16px;
   padding-bottom: 16px;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--color-border-primary);
 }
 
 .workflows-page .workflow-item > :not(:last-child) {
@@ -72,7 +72,7 @@
 
 .workflows-page .workflow-description {
   font-size: 14px;
-  color: #aaa;
+  color: var(--color-text-tertiary);
 }
 
 .workflows-page .workflow-dropdown-menu {
@@ -80,7 +80,7 @@
 }
 
 .workflows-page .repo-url {
-  background: #f8f8f8;
+  background: var(--color-workflows-bg);
   border-radius: 4px;
   padding: 4px 8px;
 }
@@ -139,7 +139,7 @@
 .workflows-page .error-details {
   margin-top: 4px;
   font-size: 14px;
-  color: #d32f2f;
+  color: var(--color-red-700);
 }
 
 .workflows-page .card .detail {
@@ -149,19 +149,17 @@
 .workflows-page .upgrade-notice {
   margin-top: 12px;
   font-size: 12px;
-  color: #757575;
+  color: var(--color-workflows-upgrade-notice);
   display: flex;
   gap: 4px;
 }
 
 .workflows-page .upgrade-notice .icon {
-  width: 16px;
-  height: 16px;
+  --icon-size: 16px;
 }
 
 .workflows-page .workflow-item-row .git-merge-icon {
-  width: 16px;
-  height: 16px;
+  --icon-size: 16px;
   align-self: center;
   margin-right: 8px;
 }
@@ -173,12 +171,131 @@
 .workflows-page .run-workflow-input .title {
   font-weight: 600;
   font-size: 15px;
-  background: white;
+  background: var(--color-bg-primary);
   padding: 4px;
 }
 
 .workflows-page .run-workflow-input button {
   margin-top: 8px;
+}
+
+.workflows-page .checks-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflows-page .checks-button .chevron {
+  width: 16px;
+  height: 16px;
+}
+
+.workflows-page .checks-popup {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+}
+
+.workflows-page .checks-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.workflows-page .check-item {
+  border-top: 1px solid var(--color-border);
+}
+
+.workflows-page .check-item:first-child {
+  border-top: none;
+}
+
+.workflows-page .check-item-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 12px;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.workflows-page .check-item-header:hover {
+  background: var(--color-bg-hover);
+}
+
+.workflows-page .check-item-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workflows-page .check-item-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.workflows-page .check-item-label .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.workflows-page .check-item-description {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.workflows-page .check-item-header .chevron {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.workflows-page .check-item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.workflows-page .check-run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflows-page .check-run-row .text-input {
+  flex: 1;
+}
+
+/* Match the 13-14px scale of the rest of the popup rather than the default 16px. */
+.workflows-page .check-run-row .text-input,
+.workflows-page .check-run-row .base-button {
+  font-size: 14px;
+}
+
+.workflows-page .check-copy-button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  /* base-button centers itself; stretch so copy buttons fill the popup width. */
+  align-self: stretch;
+  gap: 2px;
+  text-align: left;
+  font-size: 14px;
+}
+
+.workflows-page .check-copy-hint {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
 }
 
 .workflows-page .run-clean-container {
@@ -194,10 +311,11 @@
 .action-error-hovercard {
   width: 30%;
   margin: 12px;
-  background: rgba(255, 255, 255, 0.8);
+  background: var(--color-hovercard-bg);
+  color: var(--color-hovercard-text);
   border-radius: 8px;
   padding: 12px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 1px 3px var(--color-shadow-light);
   font-size: 14px;
   backdrop-filter: blur(3px);
 }
@@ -219,12 +337,12 @@
 }
 
 .create-workflow-page .explanation {
-  color: #555;
+  color: var(--color-workflows-explanation);
   font-size: 13px;
 }
 
 .create-workflow-page .error {
-  color: #f44336;
+  color: var(--color-red-500);
 }
 
 .workflow-created-dialog .dialog-body > :not(:last-child) {
@@ -250,11 +368,46 @@
 .workflows-github-import .install-app-banner .banner-content {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 16px;
 }
 
 .workflows-github-import .install-app-banner .base-button {
   align-self: start;
+}
+
+.workflows-github-import .installation-import-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflows-github-import .github-installation-import-list {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.workflows-github-import .github-installation-import-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 40px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.workflows-github-import .github-installation-import-item:first-child {
+  border-top: 1px solid var(--color-border-primary);
+}
+
+.workflows-github-import .github-installation-import-owner {
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .workflows-github-import .repo-search {
@@ -285,7 +438,7 @@
   align-items: center;
   justify-content: space-between;
   padding: 8px 0;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--color-border-primary);
   min-height: 40px;
 }
 
@@ -294,7 +447,7 @@
 }
 
 .workflows-github-import .repo-owner-separator {
-  color: #777;
+  color: var(--color-workflows-separator);
   padding: 0 2px;
 }
 
@@ -505,7 +658,7 @@
 .workflows-page .action-history-explainer-text {
   position: absolute;
   top: -18px;
-  color: #aaa;
+  color: var(--color-text-tertiary);
   font-size: 12px;
   line-height: 18px;
 }
@@ -575,23 +728,24 @@
 }
 
 .workflows-page .action-history-bar.neutral {
-  background-color: #aaa;
+  background-color: var(--color-workflows-neutral-bar);
 }
 
 .workflows-page .action-history-bar.no-data {
   border-width: 0.25px;
-  border-color: #aaa;
+  border-color: var(--color-workflows-neutral-bar);
   border-style: dashed;
   box-sizing: border-box;
 }
 
 .workflows-page-action-history-tooltip {
-  background-color: rgba(255, 255, 255, 0.95);
+  background-color: var(--color-workflows-tooltip-bg);
+  color: var(--color-hovercard-text);
   border-radius: 8px;
   padding: 16px;
   box-shadow:
-    0 3px 6px rgba(0, 0, 0, 0.16),
-    0 3px 6px rgba(0, 0, 0, 0.23);
+    0 3px 6px var(--color-shadow-tooltip),
+    0 3px 6px var(--color-shadow-tooltip-alt);
   pointer-events: none;
   z-index: 1;
 }

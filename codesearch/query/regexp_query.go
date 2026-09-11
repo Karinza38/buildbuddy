@@ -15,6 +15,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/codesearch/token"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/types"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 )
 
 const (
@@ -22,6 +23,12 @@ const (
 	// Find a way to specify them from the indexer / searcher?
 	filenameField = "filename"
 	contentField  = "content"
+
+	// allSQuery is what RegexpQuery compiles a pattern to when it can't
+	// extract any ngrams from it (e.g. the pattern is shorter than the
+	// minimum ngram length, or matches too generally). Such a clause doesn't
+	// filter the candidate set at all.
+	allSQuery = "(:all)"
 )
 
 var (
@@ -29,7 +36,7 @@ var (
 
 	_ types.Query             = (*ReQuery)(nil)
 	_ types.HighlightedRegion = (*regionMatch)(nil)
-	_ types.Scorer            = (*reScorer)(nil)
+	_ types.Scorer            = (*fieldScorer)(nil)
 )
 
 func countNL(b []byte) int {
@@ -52,15 +59,6 @@ type region struct {
 	lineNumber  int
 }
 
-type reScorer struct {
-	fieldMatchers map[string]*dfa.Regexp
-	skip          bool
-}
-
-func (s *reScorer) Skip() bool {
-	return s.skip
-}
-
 func match(re *dfa.Regexp, buf []byte) []region {
 	results := make([]region, 0)
 	var (
@@ -79,10 +77,7 @@ func match(re *dfa.Regexp, buf []byte) []region {
 			break
 		}
 		lineStart := bytes.LastIndex(buf[chunkStart:m1], nl) + 1 + chunkStart
-		lineEnd := m1 + 1
-		if lineEnd > end {
-			lineEnd = end
-		}
+		lineEnd := min(m1+1, end)
 		lineno += countNL(buf[chunkStart:lineStart])
 		results = append(results, region{
 			startOffset: lineStart,
@@ -97,32 +92,279 @@ func match(re *dfa.Regexp, buf []byte) []region {
 	return results
 }
 
-func (s *reScorer) Score(docMatch types.DocumentMatch, doc types.Document) float64 {
-	docScore := 0.0
-	for fieldName := range s.fieldMatchers {
-		re := s.fieldMatchers[fieldName]
-		field := doc.Field(fieldName)
-		if len(field.Contents()) == 0 {
-			continue
-		}
+type scorerOp int
 
-		matchingRegions := match(re.Clone(), field.Contents())
-		f_qi_d := float64(len(matchingRegions))
-		D := float64(len(strings.Fields(string(field.Contents()))))
-		k1, b := bm25Params(field.Name())
-		fieldScore := (f_qi_d * (k1 + 1)) / (f_qi_d + k1*(1-b+b*D))
-		docScore += fieldScore
-	}
-	return docScore
+const (
+	Match scorerOp = iota
+	Or
+	And
+	Noop
+)
+
+// fieldScorer scores documents based on how well they match the given scorers.
+// Scorers can be combined using AND and OR operations, which allows scoring to mirror
+// the structure of queries.
+// TODO(jdelfino): simplify to just be an array of scorers? or leave it generalized?
+type fieldScorer struct {
+	op        scorerOp
+	fieldName string
+	weight    int
+	matcher   *dfa.Regexp
+	children  []*fieldScorer
+
+	// filteredByIndex is true when this matcher contributed real ngrams to
+	// the squery, meaning the index already filtered the candidate set
+	// through it. Only then does a missing posting prove a doc doesn't
+	// match; for unindexable patterns (too short/general to produce ngrams)
+	// a missing posting just means "unverified".
+	filteredByIndex bool
+
+	// avgFieldLen maps each scored field to its mean length over the
+	// candidate set, computed by Prepare on the root scorer. It supplies
+	// the avgdl in BM25's per-field length normalization.
+	avgFieldLen map[string]float64
 }
 
-func bm25Params(fieldName string) (k1 float64, b float64) {
-	switch fieldName {
-	case filenameField:
-		return 1.2, 0.8
-	default:
-		return 1.4, 0.9
+func (fs *fieldScorer) collectFieldNames(out map[string]bool) {
+	if fs.op == Match {
+		out[fs.fieldName] = true
 	}
+	for _, child := range fs.children {
+		child.collectFieldNames(out)
+	}
+}
+
+// Prepare computes per-field average lengths across the candidate set so
+// Score can normalize each field's term frequency against that field's own
+// typical length.
+func (fs *fieldScorer) Prepare(matches []types.DocumentMatch) {
+	names := make(map[string]bool)
+	fs.collectFieldNames(names)
+	sums := make(map[string]float64, len(names))
+	counts := make(map[string]int, len(names))
+	for _, m := range matches {
+		for name := range names {
+			if l := m.FieldLength(name); l > 0 {
+				sums[name] += float64(l)
+				counts[name]++
+			}
+		}
+	}
+	fs.avgFieldLen = make(map[string]float64, len(names))
+	for name, n := range counts {
+		fs.avgFieldLen[name] = sums[name] / float64(n)
+	}
+}
+
+func (fs *fieldScorer) Skip() bool {
+	return fs.op == Noop
+}
+
+// fieldScore returns the subtree's score: each matched field contributes
+// weight_f * sat(tf_f / B_f), where B_f = 1 - b + b*(len_f/avglen_f)
+// normalizes the field's length against that field's candidate-set average
+// and sat is BM25's saturating transform. Saturation is applied PER FIELD,
+// before weighting and summation, because fields have very different
+// term-frequency scales (content ngram frequencies run 10-100x symbol or
+// filename frequencies); pooling raw frequencies across fields would leave a
+// short field's evidence invisible inside an already-saturated pool. Fields
+// are weighted to mirror the method described here:
+// https://www.researchgate.net/publication/221613382_Simple_BM25_extension_to_multiple_weighted_fields
+func (fs *fieldScorer) fieldScore(docMatch types.DocumentMatch, avgLens map[string]float64) float64 {
+	switch fs.op {
+	case Match:
+		if docMatch == nil {
+			return 0
+		}
+		posting := docMatch.Posting(fs.fieldName)
+		if posting == nil {
+			if !fs.filteredByIndex {
+				// Candidates were never filtered through this matcher's
+				// ngrams, so a missing posting means "unverified", not "no
+				// match". Contribute neutral evidence so an And doesn't
+				// veto the doc, and let Rescore make the exact call.
+				return float64(fs.weight) * bm25Sat(1)
+			}
+			// The index filtered candidates through this matcher's ngrams,
+			// so a missing posting means the doc truly doesn't match.
+			return 0
+		}
+		tf := float64(posting.Frequency())
+		if tf == 0 {
+			return 0
+		}
+		fieldLen := float64(docMatch.FieldLength(fs.fieldName))
+		// A field always holds at least as many tokens as any one term's
+		// occurrences, so tf is a lower bound on the true field length.
+		// Docs indexed before field lengths were stored report 0; without
+		// this floor they'd skip length normalization entirely and
+		// outscore reindexed docs.
+		if fieldLen < tf {
+			fieldLen = tf
+		}
+		// The symbols field is exempt from length normalization: declaring a
+		// name makes a file the definition regardless of how many other
+		// symbols it declares, so a large definition file (e.g. a 2000-line
+		// class) shouldn't have its declaration score divided down the way
+		// content matches are.
+		norm := 1.0
+		if fs.fieldName != types.SymbolsField {
+			if avg := avgLens[fs.fieldName]; avg > 0 {
+				norm = 1 - bm25B + bm25B*(fieldLen/avg)
+			}
+		}
+		return float64(fs.weight) * bm25Sat(tf/norm)
+	case Or:
+		// Pool the children: a doc matching the term in several fields
+		// accumulates evidence from each.
+		total := 0.0
+		for _, child := range fs.children {
+			total += child.fieldScore(docMatch, avgLens)
+		}
+		return total
+	case And:
+		// Gate on any clause contributing nothing (AND semantics), summing
+		// the rest. Gating lives here, not in Score, so it holds at any
+		// nesting depth (e.g. an And nested under an Or).
+		total := 0.0
+		for _, child := range fs.children {
+			s := child.fieldScore(docMatch, avgLens)
+			if s == 0 {
+				return 0
+			}
+			total += s
+		}
+		return total
+	case Noop:
+		return 1
+	default:
+		log.Warningf("Unknown scorer operation %d", fs.op)
+		return 0 // Should never happen
+	}
+}
+
+const (
+	// Standard BM25 constants, untuned. See
+	// https://en.wikipedia.org/wiki/Okapi_BM25#The_ranking_function.
+	bm25K1 = 1.2
+	bm25B  = 0.75
+)
+
+// bm25Sat applies BM25's saturating transform to a length-normalized term
+// frequency. Per-field length normalization happens in fieldScore, so no
+// document-length term appears here.
+func bm25Sat(tf float64) float64 {
+	if tf <= 0 {
+		return 0
+	}
+	return (tf * (bm25K1 + 1)) / (tf + bm25K1)
+}
+
+func newNoopScorer() *fieldScorer {
+	return &fieldScorer{
+		op: Noop,
+	}
+}
+
+func newFieldScorer(fieldName string, weight int, matcher *dfa.Regexp, filteredByIndex bool) *fieldScorer {
+	return &fieldScorer{
+		op:              Match,
+		fieldName:       fieldName,
+		weight:          weight,
+		matcher:         matcher,
+		filteredByIndex: filteredByIndex,
+	}
+}
+
+func andScorers(a *fieldScorer, b *fieldScorer) *fieldScorer {
+	if a.op == Noop {
+		return b
+	}
+	if b.op == Noop {
+		return a
+	}
+	return &fieldScorer{
+		op:       And,
+		children: []*fieldScorer{a, b},
+	}
+}
+
+func orScorers(a *fieldScorer, b *fieldScorer) *fieldScorer {
+	if a.op == Noop {
+		return b
+	}
+	if b.op == Noop {
+		return a
+	}
+	return &fieldScorer{
+		op:       Or,
+		children: []*fieldScorer{a, b},
+	}
+}
+
+func (fs *fieldScorer) Score(docMatch types.DocumentMatch) float64 {
+	return fs.fieldScore(docMatch, fs.avgFieldLen)
+}
+
+// rescoreFieldScore mirrors fieldScore, but computes exact match counts by
+// running the field matchers against the stored document contents instead of
+// approximating with index-side term frequencies.
+func (fs *fieldScorer) rescoreFieldScore(docMatch types.DocumentMatch, doc types.Document, avgLens map[string]float64) float64 {
+	switch fs.op {
+	case Match:
+		if fs.matcher == nil {
+			// A matcher-less scorer has nothing to verify against the stored
+			// document (e.g. exact keyword-field lookups, which produce no
+			// trigram false positives, and whose fields aren't stored), so
+			// the index-side score is already the exact score.
+			return fs.fieldScore(docMatch, avgLens)
+		}
+		contents := doc.Field(fs.fieldName).Contents()
+		tf := float64(len(match(fs.matcher.Clone(), contents)))
+		if tf == 0 {
+			return 0
+		}
+		fieldLen := 0.0
+		if docMatch != nil {
+			fieldLen = float64(docMatch.FieldLength(fs.fieldName))
+		}
+		// Same floor as fieldScore: docs indexed before field lengths were
+		// stored report FieldLength 0.
+		if fieldLen < tf {
+			fieldLen = tf
+		}
+		norm := 1.0
+		if avg := avgLens[fs.fieldName]; avg > 0 {
+			norm = 1 - bm25B + bm25B*(fieldLen/avg)
+		}
+		return float64(fs.weight) * bm25Sat(tf/norm)
+	case Or:
+		total := 0.0
+		for _, child := range fs.children {
+			total += child.rescoreFieldScore(docMatch, doc, avgLens)
+		}
+		return total
+	case And:
+		// Gate at any depth, mirroring fieldScore.
+		total := 0.0
+		for _, child := range fs.children {
+			s := child.rescoreFieldScore(docMatch, doc, avgLens)
+			if s == 0 {
+				return 0
+			}
+			total += s
+		}
+		return total
+	case Noop:
+		return 1
+	default:
+		log.Warningf("Unknown scorer operation %d", fs.op)
+		return 0 // Should never happen
+	}
+}
+
+func (fs *fieldScorer) Rescore(docMatch types.DocumentMatch, doc types.Document) float64 {
+	return fs.rescoreFieldScore(docMatch, doc, fs.avgFieldLen)
 }
 
 func extractLine(buf []byte, lineNumber int) []byte {
@@ -138,7 +380,7 @@ func extractLine(buf []byte, lineNumber int) []byte {
 }
 
 type reHighlighter struct {
-	fieldMatchers map[string]*dfa.Regexp
+	contentMatcher *dfa.Regexp
 }
 
 type regionMatch struct {
@@ -160,7 +402,7 @@ func (rm regionMatch) Line() int {
 
 func (rm regionMatch) CustomSnippet(linesBefore, linesAfter int) string {
 	lineNumber := rm.region.lineNumber
-	snippetText := ""
+	var snippetText strings.Builder
 
 	firstLine := max(lineNumber-linesBefore, 1)
 	lastLine := lineNumber + linesAfter
@@ -171,9 +413,9 @@ func (rm regionMatch) CustomSnippet(linesBefore, linesAfter int) string {
 			// Skip blank lines before the matched line.
 			continue
 		}
-		snippetText += makeLine(buf, n)
+		snippetText.WriteString(makeLine(buf, n))
 	}
-	return snippetText
+	return snippetText.String()
 }
 
 func (rm regionMatch) String() string {
@@ -184,10 +426,8 @@ func (h *reHighlighter) Highlight(doc types.Document) []types.HighlightedRegion 
 	results := make([]types.HighlightedRegion, 0)
 
 	field := doc.Field(contentField)
-	matcher, ok := h.fieldMatchers[contentField]
-	if ok {
-		for _, region := range match(matcher.Clone(), field.Contents()) {
-			region := region
+	if h.contentMatcher != nil {
+		for _, region := range match(h.contentMatcher.Clone(), field.Contents()) {
 			results = append(results, types.HighlightedRegion(regionMatch{
 				field:  field,
 				region: region,
@@ -195,11 +435,11 @@ func (h *reHighlighter) Highlight(doc types.Document) []types.HighlightedRegion 
 		}
 	}
 
-	// HACK: if there are no matching regions, add a fake one that matches
-	// the first line of the file. This way filter-only queries will be able
-	// to display a highlighted region.
-	if len(results) == 0 && h.fieldMatchers[contentField] == nil {
-		field := doc.Field(contentField)
+	// Minor hack: If there are no matching content regions, add a fake region that matches the first
+	// line of the file. This way filter-only queries will be able to display a highlighted region.
+	// Note that we can rely on scoring to have filtered out non-matches, so it's safe to
+	// assume this doc is a match.
+	if len(results) == 0 {
 		results = append(results, types.HighlightedRegion(regionMatch{
 			field: field,
 			region: region{
@@ -218,7 +458,8 @@ type ReQuery struct {
 	parsed string
 	squery string
 
-	fieldMatchers map[string]*dfa.Regexp
+	scorer         *fieldScorer
+	contentMatcher *dfa.Regexp
 }
 
 func expressionToSquery(expr string, fieldName string) (string, error) {
@@ -229,19 +470,45 @@ func expressionToSquery(expr string, fieldName string) (string, error) {
 	return RegexpQuery(syn).SQuery(fieldName), nil
 }
 
+// symbolsWeight is the BM25 field weight for symbol-definition matches: an
+// identifier-shaped query term additionally matches the symbols field (the
+// tree-sitter extracted declaration names) at this weight, so a file that
+// declares the queried name scores above files that merely use it. Documents
+// indexed without the field contribute no symbols postings, so this is safe
+// against older indexes.
+const symbolsWeight = 2
+
+// identifierTerm reports whether the query term is a bare identifier (word
+// characters only, no regex metacharacters), returning it lowercased to match
+// the keyword tokenizer's normalization.
+func identifierTerm(qTerm string) (string, bool) {
+	term := strings.TrimSuffix(strings.TrimPrefix(qTerm, `"`), `"`)
+	if term == "" {
+		return "", false
+	}
+	// Identifiers can't start with a digit, so an all-numeric term (e.g.
+	// "12345") isn't a symbol name; reject it rather than emit a dead clause.
+	if c := term[0]; c >= '0' && c <= '9' {
+		return "", false
+	}
+	for _, r := range term {
+		if r != '_' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return "", false
+		}
+	}
+	return strings.ToLower(term), true
+}
+
 func NewReQuery(ctx context.Context, q string) (*ReQuery, error) {
 	subLog := log.NamedSubLogger("regexp-query")
 	subLog.Infof("raw query: [%s]", q)
 
 	// A list of s-expression strings that must be satisfied by the query.
 	// (added to the query with AND)
-	requiredSClauses := make([]string, 0)
+	sClauses := make([]string, 0)
 
 	// Regex options that will be applied to the main query only.
 	regexFlags := "m" // always use multiline mode.
-
-	// Regexp matches (for highlighting) by fieldname.
-	fieldMatchers := make(map[string]*dfa.Regexp)
 
 	q, caseSensitive := filters.ExtractCaseSensitivity(q)
 	if !caseSensitive {
@@ -249,33 +516,37 @@ func NewReQuery(ctx context.Context, q string) (*ReQuery, error) {
 	}
 
 	q, filename := filters.ExtractFilenameFilter(q)
+	scorer := newNoopScorer()
+	var contentMatcher *dfa.Regexp
+
 	if len(filename) > 0 {
 		subQ, err := expressionToSquery(filename, filenameField)
 		if err != nil {
-			return nil, err
+			return nil, status.InvalidArgumentError(err.Error())
 		}
-		requiredSClauses = append(requiredSClauses, subQ)
+		sClauses = append(sClauses, subQ)
 		fileMatchRe, err := dfa.Compile(filename)
 		if err != nil {
-			return nil, err
+			return nil, status.InvalidArgumentError(err.Error())
 		}
-		fieldMatchers[filenameField] = fileMatchRe
+		// Weight 2 because explicit filename matches should be more impactful to ranking than
+		// non-explicit filename matches.
+		scorer = andScorers(scorer, newFieldScorer(filenameField, 2, fileMatchRe, subQ != allSQuery))
 	}
 
 	q, lang := filters.ExtractLanguageFilter(q)
 	if len(lang) > 0 {
 		subQ := fmt.Sprintf("(:eq language %s)", strconv.Quote(strings.ToLower(lang)))
-		requiredSClauses = append(requiredSClauses, subQ)
+		sClauses = append(sClauses, subQ)
 	}
 
 	q, repo := filters.ExtractRepoFilter(q)
 	if len(repo) > 0 {
 		subQ := fmt.Sprintf("(:eq repo %s)", strconv.Quote(repo))
-		requiredSClauses = append(requiredSClauses, subQ)
+		sClauses = append(sClauses, subQ)
 	}
 
 	q = strings.TrimSpace(q)
-	sQueries := make([]string, 0)
 	if len(q) > 0 {
 		flagString := "(?" + regexFlags + ")"
 
@@ -285,60 +556,95 @@ func NewReQuery(ctx context.Context, q string) (*ReQuery, error) {
 		if err != nil {
 			return nil, err
 		}
+		hasIdentifierTerm := false
+		// The term scorers below cover all terms at once (via an OR'd
+		// matcher), so a field counts as index-filtered if any term
+		// contributed real ngrams for it.
+		contentFiltered := false
+		filenameFiltered := false
 		for _, qTerm := range queryTerms {
 			expr := flagString + strings.TrimSuffix(strings.TrimPrefix(qTerm, `"`), `"`)
 			syn, err := syntax.Parse(expr, syntax.Perl)
 			if err != nil {
-				return nil, err
+				return nil, status.InvalidArgumentError(err.Error())
 			}
-			subQ := RegexpQuery(syn, token.WithMaxNgramLength(6), token.WithLowerCase(true)).SQuery(contentField)
-			sQueries = append(sQueries, subQ)
+			// TODO(jdelfino): This should really be derived from the tokenizer specified on the
+			// field in the schema.
+			subQContent := RegexpQuery(syn, token.WithMaxNgramLength(6), token.WithLowerCase(true)).SQuery(contentField)
+			subQFilename := RegexpQuery(syn).SQuery(filenameField)
+			contentFiltered = contentFiltered || subQContent != allSQuery
+			filenameFiltered = filenameFiltered || subQFilename != allSQuery
+			clause := subQContent + " " + subQFilename
+			// The symbols field is lowercased at index time and the symbols
+			// scorer has no matcher to re-verify during rescore, so it can't
+			// honor case. Skip it for case-sensitive queries rather than award
+			// a case-blind boost to a mismatched declaration.
+			if id, ok := identifierTerm(qTerm); ok && !caseSensitive {
+				// Scoring evidence only: any doc whose symbols contain the
+				// term also matches the content ngram clause, so the candidate
+				// set is unchanged.
+				clause += fmt.Sprintf(" (:eq %s %s)", types.SymbolsField, strconv.Quote(id))
+				hasIdentifierTerm = true
+			}
+			sClauses = append(sClauses, "(:or "+clause+")")
 		}
 
 		// Build a content matcher that will match any of the query terms.
-		for i, qTerm := range queryTerms {
-			queryTerms[i] = "(" + qTerm + ")"
-		}
-		q = flagString + strings.Join(queryTerms, "|")
-		re, err := dfa.Compile(q)
+		re, err := reForQueryTerms(queryTerms, flagString)
 		if err != nil {
 			return nil, err
 		}
-		fieldMatchers[contentField] = re
 
-		// If there is a content matcher, and there is not already a
-		// filename matcher, allow filenames that match the query too.
-		if _, ok := fieldMatchers[filenameField]; !ok {
-			fieldMatchers[filenameField] = re
+		contentScorer := orScorers(
+			// Weight 2 because content matches should be more important than non-explicit
+			// filename matches.
+			newFieldScorer(contentField, 2, re, contentFiltered),
+			newFieldScorer(filenameField, 1, re, filenameFiltered),
+		)
+		if hasIdentifierTerm {
+			// Declaring the queried name is the strongest content evidence.
+			// No matcher: keyword-field postings are exact, and the field is
+			// not stored, so Rescore reuses the index-side score.
+			contentScorer = orScorers(
+				newFieldScorer(types.SymbolsField, symbolsWeight, nil, true),
+				contentScorer,
+			)
 		}
+		scorer = andScorers(scorer, contentScorer)
+		contentMatcher = re
+
 	}
 	subLog.Infof("parsed query: [%s]", q)
 
 	squery := ""
-	if len(sQueries) == 1 {
-		squery = sQueries[0]
-	} else if len(sQueries) > 1 {
-		squery = "(:and " + strings.Join(sQueries, " ") + ")"
-	}
-
-	if len(requiredSClauses) > 0 {
-		var clauses string
-		if len(requiredSClauses) == 1 {
-			clauses = requiredSClauses[0]
-		} else {
-			clauses = strings.Join(requiredSClauses, " ")
-		}
-		squery = "(:and " + squery + " " + clauses + ")"
+	if len(sClauses) == 1 {
+		squery = sClauses[0]
+	} else if len(sClauses) > 1 {
+		squery = "(:and " + strings.Join(sClauses, " ") + ")"
 	}
 
 	req := &ReQuery{
-		ctx:           ctx,
-		log:           subLog,
-		squery:        squery,
-		parsed:        q,
-		fieldMatchers: fieldMatchers,
+		ctx:            ctx,
+		log:            subLog,
+		squery:         squery,
+		parsed:         q,
+		scorer:         scorer,
+		contentMatcher: contentMatcher,
 	}
 	return req, nil
+}
+
+func reForQueryTerms(queryTerms []string, flags string) (*dfa.Regexp, error) {
+	// Build a regexp that matches any of the query terms.
+	for i, qTerm := range queryTerms {
+		queryTerms[i] = "(" + qTerm + ")"
+	}
+	q := flags + strings.Join(queryTerms, "|")
+	re, err := dfa.Compile(q)
+	if err != nil {
+		return nil, status.InvalidArgumentError(err.Error())
+	}
+	return re, nil
 }
 
 func (req *ReQuery) SQuery() string {
@@ -350,17 +656,14 @@ func (req *ReQuery) ParsedQuery() string {
 }
 
 func (req *ReQuery) Scorer() types.Scorer {
-	return &reScorer{
-		fieldMatchers: req.fieldMatchers,
-		skip:          len(req.fieldMatchers) == 0,
-	}
+	return req.scorer
 }
 
 func (req *ReQuery) Highlighter() types.Highlighter {
-	return &reHighlighter{req.fieldMatchers}
+	return &reHighlighter{req.contentMatcher}
 }
 
-// TESTONLY: return field matchers to verify regexp params.
-func (req *ReQuery) TestOnlyFieldMatchers() map[string]*dfa.Regexp {
-	return req.fieldMatchers
+// TESTONLY: return content matcher to verify regexp params.
+func (req *ReQuery) TestOnlyContentMatcher() *dfa.Regexp {
+	return req.contentMatcher
 }

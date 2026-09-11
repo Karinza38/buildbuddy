@@ -1,21 +1,21 @@
 import React from "react";
 
-import { invocation } from "../../../proto/invocation_ts_proto";
-import router from "../../../app/router/router";
-import format from "../../../app/format/format";
 import {
-  Clock,
-  Hash,
-  XCircle,
-  PlayCircle,
-  CheckCircle,
   Activity,
+  CheckCircle,
+  Clock,
   CodeIcon,
-  Pencil,
-  Settings,
+  Hash,
   Network,
+  Pencil,
+  PlayCircle,
+  Settings,
+  XCircle,
 } from "lucide-react";
 import capabilities from "../../../app/capabilities/capabilities";
+import format from "../../../app/format/format";
+import router from "../../../app/router/router";
+import { invocation } from "../../../proto/invocation_ts_proto";
 
 interface Props {
   invocationStat: invocation.InvocationStat;
@@ -66,12 +66,12 @@ export default class HistoryInvocationStatCardComponent extends React.Component<
 
   renderStatusIcon() {
     if (this.props.invocationStat.lastGreenBuildUsec == this.props.invocationStat.latestBuildTimeUsec) {
-      return <CheckCircle className="icon green" />;
+      return <CheckCircle className="green" />;
     }
     if (this.props.invocationStat.lastRedBuildUsec == this.props.invocationStat.latestBuildTimeUsec) {
-      return <XCircle className="icon red" />;
+      return <XCircle className="red" />;
     }
-    return <PlayCircle className="icon blue" />;
+    return <PlayCircle className="blue" />;
   }
 
   getStatus() {
@@ -106,15 +106,15 @@ export default class HistoryInvocationStatCardComponent extends React.Component<
               {this.getStatus()}
             </div>
             <div className="detail">
-              <Hash className="icon" />
+              <Hash />
               {format.formatWithCommas(this.props.invocationStat.totalNumBuilds)} total builds
             </div>
             <div className="detail">
-              <Clock className="icon" />
+              <Clock />
               {format.durationUsec(this.props.invocationStat?.totalBuildTimeUsec)} total
             </div>
             <div className="detail">
-              <Activity className="icon" />
+              <Activity />
               {format.formatWithCommas(this.props.invocationStat.totalActions)} total actions
             </div>
           </div>

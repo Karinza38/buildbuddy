@@ -6,7 +6,11 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/codesearch/cmd/cli",
     visibility = ["//visibility:private"],
     deps = [
+        "//codesearch/annotations",
+        "//codesearch/github",
         "//codesearch/index",
+        "//codesearch/indexprofile",
+        "//codesearch/nav",
         "//codesearch/performance",
         "//codesearch/query",
         "//codesearch/schema",
@@ -14,7 +18,6 @@ go_library(
         "//codesearch/types",
         "//server/util/git",
         "//server/util/log",
-        "@com_github_cockroachdb_pebble//:pebble",
     ],
 )
 

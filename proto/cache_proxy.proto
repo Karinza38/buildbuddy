@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "proto/acl.proto";
+import "proto/context.proto";
+import "proto/upgrade.proto";
+
+package cache_proxy;
+
+// CacheProxyNode is the registration info that a cache proxy sends to the
+// main BuildBuddy server.
+message CacheProxyNode {
+  // Cache proxy host (typically the proxy's hostname or pod name).
+  // Ex. "10.52.6.5" or "cache-proxy-abc123"
+  string host = 1;
+
+  // Unique ID that identifies this cache proxy instance. Set once when the
+  // proxy starts and preserved for the lifetime of the process. Each proxy
+  // generates its own ID on startup.
+  //
+  // Ex. "34c5cf7e-b3b1-4e20-b43c-3e196b30d983"
+  string proxy_id = 2;
+
+  // Unique ID that identifies the host the cache proxy is running on.
+  //
+  // Ex. "23894af6-a540-430a-962e-a14b1f398472"
+  string proxy_host_id = 3;
+
+  // Proxy's operating system family. One of: "darwin", "linux", or "windows".
+  string os_family = 4;
+
+  // Architecture of the cache proxy node.
+  // Ex. "amd64"
+  string arch = 5;
+
+  // Version of the cache proxy binary.
+  string version = 6;
+
+  // Time when this cache proxy process started.
+  google.protobuf.Timestamp start_time = 7;
+
+  // Optional set of key-value labels identifying this cache proxy. Set
+  // operationally (e.g. region, canary, environment) and surfaced on the
+  // deployment view.
+  map<string, string> labels = 8;
+
+  // CPU allocated to this cache proxy node, in milliCPU (1000 == 1 core).
+  int64 allocated_cpu_millis = 9;
+
+  // Memory allocated to this cache proxy node, in bytes.
+  int64 allocated_memory_bytes = 10;
+
+  // The flags this cache proxy was configured with (via the command line or
+  // config file), in "--name=value" form. Only flags set to non-default
+  // values are included, and the values of secret flags are redacted.
+  repeated string configured_flags = 11;
+}
+
+// Statistics about this cache proxy's performance. Cumulative over the
+// lifetime of this cache proxy.
+message Statistics {
+  // Read statistics — broken out by hit/miss.
+  int64 ac_read_hits = 1;
+  int64 ac_read_misses = 2;
+  int64 ac_read_uncacheable = 13;
+  int64 ac_read_hit_bytes = 3;
+  int64 ac_read_miss_bytes = 4;
+  int64 ac_read_uncacheable_bytes = 14;
+  int64 cas_read_hits = 5;
+  int64 cas_read_misses = 6;
+  int64 cas_read_uncacheable = 15;
+  int64 cas_read_hit_bytes = 7;
+  int64 cas_read_miss_bytes = 8;
+  int64 cas_read_uncacheable_bytes = 16;
+
+  // Write statistics.
+  int64 ac_writes = 9;
+  int64 ac_write_bytes = 10;
+  int64 cas_writes = 11;
+  int64 cas_write_bytes = 12;
+}
+
+// RegisterCacheProxyRequest is sent on the client-side stream from the proxy
+// to the server, both initially and as a periodic heartbeat.
+message RegisterCacheProxyRequest {
+  CacheProxyNode node = 1;
+  Statistics statistics = 2;
+
+  // When true, the proxy is shutting down cleanly and the server should
+  // remove this proxy from its registry immediately rather than waiting
+  // for the heartbeat staleness TTL.
+  bool shutting_down = 3;
+}
+
+// RegisterCacheProxyResponse is returned by the server once the proxy closes
+// the stream (or the stream is broken). Empty for now but kept as a message
+// so we can add fields later without changing the RPC signature.
+message RegisterCacheProxyResponse {}
+
+message GetCacheProxiesRequest {
+  context.RequestContext request_context = 1;
+}
+
+message GetCacheProxiesResponse {
+  context.ResponseContext response_context = 1;
+
+  repeated CacheProxy cache_proxy = 2;
+
+  message CacheProxy {
+    CacheProxyNode node = 1;
+
+    // Last time this cache proxy checked in with the server.
+    google.protobuf.Timestamp last_check_in_time = 2;
+
+    // Statistics about this cache proxy's performance.
+    Statistics statistics = 3;
+  }
+
+  upgrade.Prompt upgrade_prompt = 3;
+}
+
+// Persisted information about a connected cache proxy.
+message RegisteredCacheProxy {
+  CacheProxyNode registration = 1;
+  string group_id = 2;
+  acl.ACL acl = 3;
+  google.protobuf.Timestamp last_ping_time = 4;
+  Statistics statistics = 5;
+}
+
+// CacheProxyRegistry runs on the main BuildBuddy app and tracks the set of
+// live cache proxies for each group, so the deployment view can list them.
+service CacheProxyRegistry {
+  // RegisterAndStreamHeartbeat is opened by the cache proxy on startup. The
+  // proxy sends an initial RegisterCacheProxyRequest with its identifying
+  // info, then re-sends the same message periodically as a heartbeat. The
+  // server uses these heartbeats to maintain a TTL-backed registry of live
+  // proxies, scoped to the group identified by the proxy's API key. The
+  // server returns a single RegisterCacheProxyResponse once the proxy
+  // closes the stream (or the connection drops).
+  rpc RegisterAndStreamHeartbeat(stream RegisterCacheProxyRequest)
+      returns (RegisterCacheProxyResponse) {}
+}

@@ -2,6 +2,7 @@ package container_test
 
 import (
 	"context"
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -21,12 +23,14 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
 type FakeContainer struct {
 	RequiredPullCredentials oci.Credentials
 	PullCount               int
+	PullErr                 error
 	pullDelay               time.Duration
 }
 
@@ -42,6 +46,9 @@ func (c *FakeContainer) IsImageCached(context.Context) (bool, error) {
 func (c *FakeContainer) PullImage(ctx context.Context, creds oci.Credentials) error {
 	if c.pullDelay > 0*time.Second {
 		time.Sleep(c.pullDelay)
+	}
+	if c.PullErr != nil {
+		return c.PullErr
 	}
 	if creds != c.RequiredPullCredentials {
 		return status.PermissionDeniedError("Permission denied: wrong pull credentials")
@@ -71,7 +78,7 @@ func userCtx(t *testing.T, ta *testauth.TestAuthenticator, userID string) contex
 
 func TestPullImageIfNecessary_ValidCredentials(t *testing.T) {
 	env := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 	env.SetImageCacheAuthenticator(container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{}))
 	imageRef := "docker.io/some-org/some-image:v1.0.0"
@@ -88,17 +95,17 @@ func TestPullImageIfNecessary_ValidCredentials(t *testing.T) {
 
 	assert.Equal(t, 0, c.PullCount, "sanity check: pull count should be 0 initially")
 
-	err := container.PullImageIfNecessary(ctx, env, c, goodCreds1, imageRef)
+	err := container.PullImageIfNecessary(ctx, env, c, goodCreds1, imageRef, false)
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, c.PullCount, "should pull the image if credentials are valid")
 
-	err = container.PullImageIfNecessary(ctx, env, c, goodCreds1, imageRef)
+	err = container.PullImageIfNecessary(ctx, env, c, goodCreds1, imageRef, false)
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, c.PullCount, "should not need to immediately re-authenticate with the remote registry")
 
-	err = container.PullImageIfNecessary(ctx, env, c, goodCreds2, imageRef)
+	err = container.PullImageIfNecessary(ctx, env, c, goodCreds2, imageRef, false)
 
 	require.NoError(t, err)
 	assert.Equal(
@@ -108,7 +115,7 @@ func TestPullImageIfNecessary_ValidCredentials(t *testing.T) {
 
 func TestPullImageIfNecessary_InvalidCredentials_PermissionDenied(t *testing.T) {
 	env := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 	env.SetImageCacheAuthenticator(container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{}))
 	imageRef := "docker.io/some-org/some-image:v1.0.0"
@@ -123,22 +130,122 @@ func TestPullImageIfNecessary_InvalidCredentials_PermissionDenied(t *testing.T) 
 		Password: "trying-to-guess-the-real-secret",
 	}
 
-	err := container.PullImageIfNecessary(ctx, env, c, badCreds, imageRef)
+	err := container.PullImageIfNecessary(ctx, env, c, badCreds, imageRef, false)
 
 	require.True(t, status.IsPermissionDeniedError(err), "should return PermissionDenied if credentials are valid")
 
-	err = container.PullImageIfNecessary(ctx, env, c, badCreds, imageRef)
+	err = container.PullImageIfNecessary(ctx, env, c, badCreds, imageRef, false)
 
 	require.True(t, status.IsPermissionDeniedError(err), "should return PermissionDenied on subsequent attempts as well")
 
-	err = container.PullImageIfNecessary(ctx, env, c, goodCreds, imageRef)
+	err = container.PullImageIfNecessary(ctx, env, c, goodCreds, imageRef, false)
 
 	require.NoError(t, err, "good creds should still work after previous incorrect attempts")
 }
 
+func TestPullImageIfNecessary_NonOCIFetcherPullErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		pullErr     error
+		wantStatus  string
+		wantCounted bool
+	}{
+		{
+			name:        "resource exhausted",
+			pullErr:     status.ResourceExhaustedError("remote registry rate limited"),
+			wantStatus:  metrics.OCIFetcherStatusError,
+			wantCounted: true,
+		},
+		{
+			name:        "permission denied",
+			pullErr:     status.PermissionDeniedError("wrong pull credentials"),
+			wantStatus:  metrics.OCIFetcherStatusUserError,
+			wantCounted: false,
+		},
+		{
+			name:        "not found",
+			pullErr:     status.NotFoundError("image not found"),
+			wantStatus:  metrics.OCIFetcherStatusUserError,
+			wantCounted: false,
+		},
+		{
+			name:        "unavailable",
+			pullErr:     status.UnavailableError("remote registry unavailable"),
+			wantStatus:  metrics.OCIFetcherStatusError,
+			wantCounted: true,
+		},
+	} {
+		for _, useOCIFetcher := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/use_oci_fetcher_%t", tc.name, useOCIFetcher), func(t *testing.T) {
+				env := testenv.GetTestEnv(t)
+				imageRef := "docker.io/some-org/some-image:v1.0.0"
+				ctx := context.Background()
+				c := &FakeContainer{PullErr: tc.pullErr}
+
+				err := container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, imageRef, useOCIFetcher)
+
+				require.Error(t, err)
+				require.Equal(t, tc.wantStatus, container.ImagePullMetricStatus(err))
+				require.Equal(t, tc.wantCounted, container.ShouldCountImagePullError(err))
+			})
+		}
+	}
+}
+
+func TestImagePullMetricStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		err         error
+		wantStatus  string
+		wantCounted bool
+	}{
+		{
+			name:        "nil",
+			err:         nil,
+			wantStatus:  metrics.OCIFetcherStatusOK,
+			wantCounted: false,
+		},
+		{
+			name:        "unknown error",
+			err:         status.UnknownError("network unavailable"),
+			wantStatus:  metrics.OCIFetcherStatusError,
+			wantCounted: true,
+		},
+		{
+			name:        "resource exhausted",
+			err:         status.ResourceExhaustedError("remote registry rate limited"),
+			wantStatus:  metrics.OCIFetcherStatusError,
+			wantCounted: true,
+		},
+		{
+			name:        "permission denied",
+			err:         status.PermissionDeniedError("wrong pull credentials"),
+			wantStatus:  metrics.OCIFetcherStatusUserError,
+			wantCounted: false,
+		},
+		{
+			name:        "not found",
+			err:         status.NotFoundError("image not found"),
+			wantStatus:  metrics.OCIFetcherStatusUserError,
+			wantCounted: false,
+		},
+		{
+			name:        "unavailable",
+			err:         status.UnavailableError("remote registry unavailable"),
+			wantStatus:  metrics.OCIFetcherStatusError,
+			wantCounted: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.wantStatus, container.ImagePullMetricStatus(tc.err))
+			require.Equal(t, tc.wantCounted, container.ShouldCountImagePullError(tc.err))
+		})
+	}
+}
+
 func TestPullImageIfNecessary_ParallelCallsSerialized(t *testing.T) {
 	env := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 	env.SetImageCacheAuthenticator(container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{}))
 	imageRef := "docker.io/some-org/some-image:v1.0.0"
@@ -147,8 +254,8 @@ func TestPullImageIfNecessary_ParallelCallsSerialized(t *testing.T) {
 
 	assert.Equal(t, 0, c.PullCount, "sanity check: pull count should be 0 initially")
 	eg := errgroup.Group{}
-	for i := 0; i < 20; i++ {
-		eg.Go(func() error { return container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, imageRef) })
+	for range 20 {
+		eg.Go(func() error { return container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, imageRef, false) })
 	}
 	require.NoError(t, eg.Wait())
 	assert.Equal(t, 1, c.PullCount, "image should only be pulled once")
@@ -156,7 +263,7 @@ func TestPullImageIfNecessary_ParallelCallsSerialized(t *testing.T) {
 
 func TestImageCacheAuthenticator(t *testing.T) {
 	env := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1", "US2", "GR2"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1", "US2", "GR2"))
 	env.SetAuthenticator(ta)
 
 	auth := container.NewImageCacheAuthenticator(container.ImageCacheAuthenticatorOpts{})
@@ -369,6 +476,97 @@ func TestUsageStats(t *testing.T) {
 	}, s.TaskStats(), protocmp.Transform()))
 }
 
+func TestUsageStats_GPUUsageReportsPeaks(t *testing.T) {
+	stats := &container.UsageStats{}
+	stats.Reset()
+
+	// Observe two GPUs whose per-device peaks occur during different samples.
+	// The peak total should be the largest simultaneous sum, not the sum of the
+	// independent per-device peaks.
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		TotalMemoryBytes: 300,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", MemoryBytes: 100, Vendor: repb.GPUDeviceUsage_NVIDIA},
+			{Id: "GPU-b", MemoryBytes: 200, Vendor: repb.GPUDeviceUsage_NVIDIA},
+		},
+	}})
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		TotalMemoryBytes: 300,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", MemoryBytes: 250},
+			{Id: "GPU-b", MemoryBytes: 50},
+		},
+	}})
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		TotalMemoryBytes: 400,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", MemoryBytes: 200},
+			{Id: "GPU-b", MemoryBytes: 200},
+		},
+	}})
+
+	// A final empty sample after the processes exit should not discard the GPU
+	// peaks observed while the task was running.
+	stats.Update(&repb.UsageStats{})
+	require.Empty(t, cmp.Diff(&repb.GPUUsage{
+		PeakTotalMemoryBytes: 400,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", PeakMemoryBytes: 250, Vendor: repb.GPUDeviceUsage_NVIDIA},
+			{Id: "GPU-b", PeakMemoryBytes: 200, Vendor: repb.GPUDeviceUsage_NVIDIA},
+		},
+	}, stats.TaskStats().GetGpuUsage(), protocmp.Transform()))
+
+	// A recycled runner should not carry GPU peaks into the next task.
+	stats.Reset()
+	require.Nil(t, stats.TaskStats().GetGpuUsage())
+}
+
+func TestUsageStats_ConcurrentUpdateAndBasicTaskStats(t *testing.T) {
+	flags.Set(t, "executor.record_usage_timelines", true)
+
+	stats := &container.UsageStats{}
+	stats.Reset()
+
+	var eg errgroup.Group
+	eg.Go(func() error {
+		for i := range 1000 {
+			stats.Update(&repb.UsageStats{
+				CpuNanos:      int64(i) * 1e6,
+				MemoryBytes:   int64(i) * 1024,
+				CgroupIoStats: &repb.CgroupIOStats{Rbytes: int64(i), Wbytes: int64(i)},
+			})
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		for range 1000 {
+			taskStats := stats.BasicTaskStats()
+			_ = taskStats.GetMemoryBytes()
+			_ = taskStats.GetCpuNanos()
+		}
+		return nil
+	})
+
+	require.NoError(t, eg.Wait())
+}
+
+func TestUsageStats_BasicTaskStatsOmitsTimeline(t *testing.T) {
+	flags.Set(t, "executor.record_usage_timelines", true)
+
+	stats := &container.UsageStats{}
+	stats.Reset()
+	stats.Update(&repb.UsageStats{
+		CpuNanos:      1e6,
+		MemoryBytes:   1024,
+		CgroupIoStats: &repb.CgroupIOStats{},
+	})
+
+	// Full execution stats should include the timeline, but live stats polling
+	// should skip it to avoid returning a pointer to mutable timeline state.
+	require.NotNil(t, stats.TaskStats().GetTimeline())
+	require.Nil(t, stats.BasicTaskStats().GetTimeline())
+}
+
 func TestUsageStats_Timeseries(t *testing.T) {
 	flags.Set(t, "executor.record_usage_timelines", true)
 
@@ -418,6 +616,162 @@ func TestUsageStats_Timeseries(t *testing.T) {
 	}, timestamps, "timestamps")
 	assert.Equal(t, []int64{0, 7000, 9500}, cpuSamples, "cpu samples")
 	assert.Equal(t, []int64{0, 500, 400}, memKBSamples, "memory kb samples")
+}
+
+func TestUsageStats_ZeroGPUUsageOmitted(t *testing.T) {
+	flags.Set(t, "executor.record_usage_timelines", true)
+
+	stats := &container.UsageStats{}
+	stats.Reset()
+
+	// Successful GPU readings that never observe any memory should not add an
+	// empty summary or an all-zero timeline to the task stats.
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a"},
+		},
+	}})
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{}})
+
+	taskStats := stats.TaskStats()
+	require.Nil(t, taskStats.GetGpuUsage())
+	require.Nil(t, taskStats.GetTimeline().GetGpuUsage())
+}
+
+func TestUsageStats_GPUTimeseries(t *testing.T) {
+	flags.Set(t, "executor.record_usage_timelines", true)
+
+	start := time.Unix(100, 0)
+	clock := clockwork.NewFakeClockAt(start)
+	stats := &container.UsageStats{Clock: clock}
+	stats.Reset()
+
+	// GPU tracking starts after the initial timeline sample. The total GPU
+	// series should be backfilled with zero for that initial sample.
+	clock.Advance(100 * time.Millisecond)
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		TotalMemoryBytes: 100_000,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", MemoryBytes: 100_000},
+		},
+	}})
+
+	// An unavailable reading should preserve the last observation instead of
+	// reporting a false zero.
+	clock.Advance(100 * time.Millisecond)
+	stats.Update(&repb.UsageStats{})
+
+	// A larger reading spread across two devices should be recorded as the
+	// new total.
+	clock.Advance(100 * time.Millisecond)
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{
+		TotalMemoryBytes: 400_000,
+		DeviceUsage: []*repb.GPUDeviceUsage{
+			{Id: "GPU-a", MemoryBytes: 150_000},
+			{Id: "GPU-b", MemoryBytes: 250_000},
+		},
+	}})
+
+	// A successful empty reading should bring total GPU usage back to zero.
+	clock.Advance(100 * time.Millisecond)
+	stats.Update(&repb.UsageStats{GpuUsage: &repb.GPUUsage{}})
+
+	timeline := stats.TaskStats().GetTimeline()
+	assert.Equal(t, []int64{0, 100, 100, 400, 0}, timeseries.DeltaDecode(timeline.GetGpuUsage().GetTotalMemoryKbSamples()))
+
+	// Recycled runners should begin the next task without the previous task's
+	// final GPU reading or timeline.
+	stats.Reset()
+	require.Nil(t, stats.TaskStats().GetTimeline().GetGpuUsage())
+}
+
+// fakePausableContainer is a FakeContainer whose Pause sleeps for a
+// configurable duration so tests can assert on TracedCommandContainer's
+// pause timing.
+type fakePausableContainer struct {
+	FakeContainer
+	pauseDelay time.Duration
+}
+
+func (c *fakePausableContainer) Pause(ctx context.Context) error {
+	if c.pauseDelay > 0 {
+		time.Sleep(c.pauseDelay)
+	}
+	return nil
+}
+
+// fakeFirecrackerLikeContainer is a FakeContainer that exposes
+// PostCompletionStats with non-pause-duration fields, simulating what
+// firecracker reports. TracedCommandContainer should preserve those
+// fields and overwrite only PauseDurationUsec.
+type fakeFirecrackerLikeContainer struct {
+	fakePausableContainer
+	stats *espb.PostCompletionStats
+}
+
+func (c *fakeFirecrackerLikeContainer) PostCompletionStats() *espb.PostCompletionStats {
+	return c.stats
+}
+
+func TestTracedCommandContainer_PostCompletionStats_TimesPause(t *testing.T) {
+	delegate := &fakePausableContainer{pauseDelay: 10 * time.Millisecond}
+	tc := container.NewTracedCommandContainer(delegate)
+
+	require.NoError(t, tc.Pause(context.Background()))
+
+	stats := tc.PostCompletionStats()
+	require.NotNil(t, stats)
+	assert.GreaterOrEqual(t, stats.GetPauseDurationUsec(), (10 * time.Millisecond).Microseconds(),
+		"pause duration should reflect time spent in Pause")
+	assert.Nil(t, stats.GetFirecrackerPostExecStats(),
+		"delegate without PostCompletionStats should yield no firecracker stats")
+}
+
+func TestTracedCommandContainer_PostCompletionStats_PreservesDelegateStats(t *testing.T) {
+	delegateStats := &espb.PostCompletionStats{
+		// A stale duration on the delegate's stats; TracedCommandContainer
+		// should overwrite it with the measured value.
+		PauseDurationUsec: 999999,
+		FirecrackerPostExecStats: &espb.FirecrackerPostExecStats{
+			SnapshotSavedLocally: true,
+			SnapshotSavedBytes:   4242,
+		},
+	}
+	delegate := &fakeFirecrackerLikeContainer{
+		pauseDelay: 10 * time.Millisecond,
+		stats:      delegateStats,
+	}
+	tc := container.NewTracedCommandContainer(delegate)
+
+	require.NoError(t, tc.Pause(context.Background()))
+
+	stats := tc.PostCompletionStats()
+	require.NotNil(t, stats)
+	assert.GreaterOrEqual(t, stats.GetPauseDurationUsec(), (10 * time.Millisecond).Microseconds(),
+		"pause duration should reflect measured time, not the delegate's stale value")
+	require.NotNil(t, stats.GetFirecrackerPostExecStats(), "delegate's firecracker stats should be preserved")
+	assert.True(t, stats.GetFirecrackerPostExecStats().GetSnapshotSavedLocally())
+	assert.Equal(t, int64(4242), stats.GetFirecrackerPostExecStats().GetSnapshotSavedBytes())
+}
+
+func TestTracedCommandContainer_PostCompletionStats_ResetOnRunAndExec(t *testing.T) {
+	delegate := &fakePausableContainer{pauseDelay: 10 * time.Millisecond}
+	tc := container.NewTracedCommandContainer(delegate)
+
+	require.NoError(t, tc.Pause(context.Background()))
+	require.GreaterOrEqual(t, tc.PostCompletionStats().GetPauseDurationUsec(), (10 * time.Millisecond).Microseconds())
+
+	// Run resets the pause duration so the next pause doesn't inherit the
+	// previous value.
+	tc.Run(context.Background(), &repb.Command{}, "", oci.Credentials{})
+	assert.Zero(t, tc.PostCompletionStats().GetPauseDurationUsec(), "Run should reset pause duration")
+
+	require.NoError(t, tc.Pause(context.Background()))
+	require.GreaterOrEqual(t, tc.PostCompletionStats().GetPauseDurationUsec(), (10 * time.Millisecond).Microseconds())
+
+	// Exec also resets.
+	tc.Exec(context.Background(), &repb.Command{}, &interfaces.Stdio{})
+	assert.Zero(t, tc.PostCompletionStats().GetPauseDurationUsec(), "Exec should reset pause duration")
 }
 
 func makePSI(someTotal, fullTotal int64) *repb.PSI {

@@ -3,6 +3,7 @@ package subdomain
 import (
 	"context"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/endpoint_urls/build_buddy_url"
@@ -13,7 +14,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/urlutil"
 )
 
-const subdomainKey = "subdomain"
+const (
+	key = "subdomain"
+
+	// HeaderName is the gRPC metadata key a trusted forwarding proxy uses to
+	// assert the subdomain the original request was addressed to. It is an
+	// internal header, so it is stripped when sent by an untrusted caller.
+	HeaderName = "x-buildbuddy-internal-subdomain"
+)
 
 var (
 	enableSubdomainMatching = flag.Bool("app.enable_subdomain_matching", false, "If true, request subdomain will be taken into account when determining what request restrictions should be applied.")
@@ -37,18 +45,27 @@ func SetHost(ctx context.Context, host string) context.Context {
 	}
 
 	subdomain := parts[0]
-	for _, ds := range *defaultSubdomains {
-		if ds == subdomain {
-			return ctx
-		}
+	if slices.Contains(*defaultSubdomains, subdomain) {
+		return ctx
 	}
-	return context.WithValue(ctx, subdomainKey, subdomain)
+	return Context(ctx, subdomain)
+}
+
+func Context(ctx context.Context, subdomain string) context.Context {
+	return context.WithValue(ctx, key, subdomain)
+}
+
+func SetResolved(ctx context.Context, subdomain string) context.Context {
+	if !*enableSubdomainMatching || subdomain == "" {
+		return ctx
+	}
+	return Context(ctx, subdomain)
 }
 
 // Get returns the subdomain restriction that should be applied or an empty
 // string if no subdomain restrictions should be applied.
 func Get(ctx context.Context) string {
-	v, _ := ctx.Value(subdomainKey).(string)
+	v, _ := ctx.Value(key).(string)
 	return v
 }
 

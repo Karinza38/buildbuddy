@@ -91,17 +91,15 @@ func (f *FS) Mount(ctx context.Context, path string) error {
 	opts := &fusefs.Options{
 		EntryTimeout: &nodeAttrTimeout,
 		AttrTimeout:  &nodeAttrTimeout,
-		MountOptions: fuse.MountOptions{
-			AllowOther: true,
-			// Debug:         true,
-			DisableXAttrs: true,
-			// Don't depend on `fusermount`.
-			// Disable fallback to fusermount as well, since it can cause
-			// deadlocks. See https://github.com/hanwen/go-fuse/issues/506
-			DirectMountStrict: true,
-			FsName:            "vbd",
-			MaxWrite:          fuse.MAX_KERNEL_WRITE,
-		},
+		AllowOther:   true,
+		// Debug:         true,
+		DisableXAttrs: true,
+		// Don't depend on `fusermount`.
+		// Disable fallback to fusermount as well, since it can cause
+		// deadlocks. See https://github.com/hanwen/go-fuse/issues/506
+		DirectMountStrict: true,
+		FsName:            "vbd",
+		MaxWrite:          fuse.MAX_KERNEL_WRITE,
 	}
 	nodeFS := fusefs.NewNodeFS(f.root, opts)
 	server, err := fuse.NewServer(nodeFS, path, &opts.MountOptions)
@@ -128,16 +126,27 @@ func (f *FS) Unmount(ctx context.Context) error {
 	// Unmount in the background to prevent tasks from being blocked if it
 	// hangs forever.
 	// Log an error if this happens, since this is a goroutine leak.
-	resultCh := make(chan error, 1)
+	resultCh := make(chan error)
 	go func() {
-		resultCh <- f.unmount(ctx)
+		defer close(resultCh)
+		err := f.unmount(ctx)
+		select {
+		case resultCh <- err:
+			// Since resultCh is unbuffered, this only happens when the outer
+			// function received from the channel and will return this err.
+		case <-ctx.Done():
+			// Nothing is waiting for this result, so log it here.
+			if err != nil {
+				log.CtxErrorf(ctx, "Failed to unmount %s in the background after context was cancelled: %s", f.mountPath, err)
+			} else {
+				log.CtxInfof(ctx, "Unmounted %s in the background, even after the context was canceled", f.mountPath)
+			}
+		}
 	}()
 	select {
 	case err := <-resultCh:
 		return err
 	case <-ctx.Done():
-		log.CtxErrorf(ctx, "Failed to unmount vbd at %s before the context was canceled - "+
-			"it may still be unmounted in the background, or there may be a goroutine leak: %s", f.mountPath, ctx.Err())
 		return ctx.Err()
 	}
 }
@@ -159,7 +168,7 @@ func (f *FS) unmount(ctx context.Context) error {
 		// If we successfully unmounted, then the mount path should point to
 		// an empty dir. Remove it.
 		if err := os.Remove(f.mountPath); err != nil {
-			log.CtxErrorf(ctx, "Failed to unmount vbd: %s", err)
+			log.CtxErrorf(ctx, "Failed to remove vbd mount path %s: %s", f.mountPath, err)
 		}
 	}
 	if err := os.Remove(f.lockFile.Name()); err != nil {
@@ -167,11 +176,6 @@ func (f *FS) unmount(ctx context.Context) error {
 	}
 	if err := f.lockFile.Close(); err != nil {
 		log.CtxErrorf(ctx, "Failed to unlock vbd lock file: %s", err)
-	}
-	if ctx.Err() != nil {
-		log.CtxInfof(ctx, "Unmounted %s in the background, even after the context was canceled", f.mountPath)
-	} else {
-		log.CtxDebugf(ctx, "Unmounted %s", f.mountPath)
 	}
 	return err
 }
@@ -184,6 +188,7 @@ type Node struct {
 
 var _ fusefs.NodeOpener = (*Node)(nil)
 var _ fusefs.NodeGetattrer = (*Node)(nil)
+var _ fusefs.NodeSetattrer = (*Node)(nil)
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fusefs.FileHandle, uint32, syscall.Errno) {
 	if n.file == nil {
@@ -203,6 +208,27 @@ func (n *Node) Getattr(ctx context.Context, _ fusefs.FileHandle, out *fuse.AttrO
 		out.Size = uint64(size)
 	}
 	return fusefs.OK
+}
+
+func (n *Node) Setattr(ctx context.Context, fh fusefs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if n.file == nil {
+		return syscall.ENODEV
+	}
+
+	if requestedSize, ok := in.GetSize(); ok {
+		currentSize, err := n.file.SizeBytes()
+		if err != nil {
+			log.CtxErrorf(ctx, "VBD size failed: %s", err)
+			return syscall.EIO
+		}
+
+		if requestedSize != uint64(currentSize) {
+			log.CtxErrorf(ctx, "VBD does not support resizing: current size %d, requested size %d", currentSize, requestedSize)
+			return syscall.EOPNOTSUPP
+		}
+	}
+
+	return n.Getattr(ctx, fh, out)
 }
 
 type fileHandle struct {
@@ -241,10 +267,7 @@ type reader struct {
 var _ fuse.ReadResult = (*reader)(nil)
 
 func (r *reader) Bytes(p []byte) ([]byte, fuse.Status) {
-	length := r.size
-	if len(p) < length {
-		length = len(p)
-	}
+	length := min(len(p), r.size)
 	_, err := r.file.ReadAt(p[:length], r.off)
 	if err != nil {
 		log.CtxErrorf(r.ctx, "VBD read failed: %s", err)

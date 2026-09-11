@@ -1,27 +1,29 @@
 import React from "react";
-import InvocationModel from "./invocation_model";
-import InvocationExecutionTable from "./invocation_execution_table";
 import { execution_stats } from "../../proto/execution_stats_ts_proto";
-import Select, { Option } from "../components/select/select";
 import { build } from "../../proto/remote_execution_ts_proto";
-import rpcService from "../service/rpc_service";
 import { OutlinedButton } from "../components/button/button";
+import Select, { Option } from "../components/select/select";
+import errorService from "../errors/error_service";
+import format from "../format/format";
+import rpcService from "../service/rpc_service";
+import InvocationExecutionTable from "./invocation_execution_table";
 import {
   downloadDuration,
   executionDuration,
-  getActionPageLink,
   getExecutionStatus,
   queuedDuration,
   subtractTimestamp,
   totalDuration,
   uploadDuration,
 } from "./invocation_execution_util";
-import format from "../format/format";
+import InvocationModel from "./invocation_model";
 
 interface Props {
   model: InvocationModel;
   search: URLSearchParams;
   filter: string;
+  /** Optional target label to filter executions by (exact match). */
+  targetLabel?: string;
 }
 
 interface State {
@@ -30,6 +32,7 @@ interface State {
   sort: string;
   direction: "asc" | "desc";
   statusFilter: string;
+  mnemonicFilter: string;
   limit: number;
 }
 
@@ -42,6 +45,7 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
     sort: "status",
     direction: "desc",
     statusFilter: "all",
+    mnemonicFilter: "all",
     limit: 100,
   };
 
@@ -52,7 +56,14 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
   }
 
   componentDidUpdate(prevProps: Props) {
-    if (this.props.model !== prevProps.model) {
+    const invocationIdChanged = this.props.model.getInvocationId() !== prevProps.model.getInvocationId();
+    const invocationStatusChanged =
+      this.props.model.invocation.invocationStatus !== prevProps.model.invocation.invocationStatus;
+    const targetLabelChanged = this.props.targetLabel !== prevProps.targetLabel;
+
+    if (invocationIdChanged || invocationStatusChanged || targetLabelChanged) {
+      clearTimeout(this.timeoutRef);
+      this.timeoutRef = undefined;
       this.fetchExecution();
     }
   }
@@ -65,16 +76,23 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
     let request = new execution_stats.GetExecutionRequest();
     request.executionLookup = new execution_stats.ExecutionLookup();
     request.executionLookup.invocationId = this.props.model.getInvocationId();
+    if (this.props.targetLabel) {
+      request.executionLookup.targetLabel = this.props.targetLabel;
+    }
     let inProgressBeforeRequestWasMade = this.props.model.isInProgress();
-    rpcService.service.getExecution(request).then((response) => {
-      this.setState({ executions: response.execution, loading: false });
+    rpcService.service
+      .getExecution(request)
+      .then((response) => {
+        this.setState({ executions: response.execution, loading: false });
 
-      if (inProgressBeforeRequestWasMade) {
-        this.fetchUpdatedProgress();
-      }
+        if (inProgressBeforeRequestWasMade) {
+          this.fetchUpdatedProgress();
+        }
 
-      console.log(response);
-    });
+        console.log(response);
+      })
+      .catch((e) => errorService.handleError(e))
+      .finally(() => this.setState({ loading: false }));
   }
 
   fetchUpdatedProgress() {
@@ -175,6 +193,12 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
     });
   }
 
+  handleMnemonicFilterChange(event: React.ChangeEvent<HTMLSelectElement>) {
+    this.setState({
+      mnemonicFilter: event.target.value,
+    });
+  }
+
   handleMoreClicked() {
     this.setState({ limit: this.state.limit + 100 });
   }
@@ -185,32 +209,43 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
 
   render() {
     if (this.state.loading) {
-      return <div className="loading" />;
+      return <div className="loading loading-slim invocation-tab-loading" />;
     }
 
     let completedCount = 0;
     let incompleteCount = 0;
+    const mnemonics = new Set<string>();
     for (let execution of this.state.executions) {
       if (execution.stage === ExecutionStage.Value.COMPLETED) {
         completedCount++;
       } else {
         incompleteCount++;
       }
+      if (execution.actionMnemonic) {
+        mnemonics.add(execution.actionMnemonic);
+      }
     }
 
-    const filteredActions = this.state.executions
+    const filter = this.props.filter?.toLowerCase();
+    const filteredExecutions = this.state.executions
       .filter(
-        (action) =>
-          !this.props.filter ||
-          `${action.actionDigest?.hash ?? ""}/${action.actionDigest?.sizeBytes ?? ""}`
+        (execution) =>
+          !filter ||
+          execution.targetLabel?.toLowerCase()?.includes(filter) ||
+          execution.actionMnemonic?.toLowerCase()?.includes(filter) ||
+          execution.commandSnippet?.toLowerCase()?.includes(filter) ||
+          execution.primaryOutputPath?.toLowerCase()?.includes(filter) ||
+          `${execution.actionDigest?.hash ?? ""}/${execution.actionDigest?.sizeBytes ?? ""}`
             .toLowerCase()
-            .includes(this.props.filter.toLowerCase()) ||
-          action.commandSnippet.toLowerCase().includes(this.props.filter.toLowerCase())
+            .includes(filter)
       )
       .filter(
-        (action) =>
+        (execution) =>
           this.state.statusFilter === "all" ||
-          getExecutionStatus(action).name.toLowerCase().startsWith(this.state.statusFilter)
+          getExecutionStatus(execution).name.toLowerCase().startsWith(this.state.statusFilter)
+      )
+      .filter(
+        (execution) => this.state.mnemonicFilter === "all" || execution.actionMnemonic === this.state.mnemonicFilter
       );
 
     return (
@@ -220,7 +255,7 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
             <div className="invocation-content-header">
               <div className="title">
                 Remotely executed actions (
-                {!!incompleteCount && <span>{format.formatWithCommas(incompleteCount)} in progress, </span>}
+                {!!incompleteCount && `${format.formatWithCommas(incompleteCount)} in progress, `}
                 {format.formatWithCommas(completedCount)} completed)
               </div>
 
@@ -235,6 +270,15 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
                   <Option value="succeeded">Succeeded</Option>
                   <Option value="failed">Failed</Option>
                   <Option value="error">Errored</Option>
+                </Select>
+                <span className="invocation-filter-title">Mnemonic</span>
+                <Select onChange={this.handleMnemonicFilterChange.bind(this)} value={this.state.mnemonicFilter}>
+                  <Option value="all">All</Option>
+                  {[...mnemonics].sort().map((m) => (
+                    <Option key={m} value={m}>
+                      {m}
+                    </Option>
+                  ))}
                 </Select>
                 <span className="invocation-sort-title">Sort by</span>
                 <Select onChange={this.handleSortChange.bind(this)} value={this.state.sort}>
@@ -282,15 +326,15 @@ export default class SpawnCardComponent extends React.Component<Props, State> {
               </div>
             </div>
             <div>
-              {filteredActions.length ? (
+              {filteredExecutions.length ? (
                 <InvocationExecutionTable
-                  executions={filteredActions.sort(this.sort.bind(this)).slice(0, this.state.limit)}
+                  executions={filteredExecutions.sort(this.sort.bind(this)).slice(0, this.state.limit)}
                   invocationIdProvider={() => this.props.model.getInvocationId()}></InvocationExecutionTable>
               ) : (
                 <div className="invocation-execution-empty-actions">No matching actions.</div>
               )}
             </div>
-            {filteredActions.length > this.state.limit && (
+            {filteredExecutions.length > this.state.limit && (
               <div className="more-buttons">
                 <OutlinedButton onClick={this.handleMoreClicked.bind(this)}>See more executions</OutlinedButton>
                 <OutlinedButton onClick={this.handleAllClicked.bind(this)}>See all executions</OutlinedButton>

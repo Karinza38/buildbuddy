@@ -12,37 +12,64 @@ import (
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/resource"
+	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
+	"github.com/buildbuddy-io/buildbuddy/server/cache_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_asset/fetch_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/byte_stream_server"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/content_addressable_storage_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
+	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/scratchspace"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
+	cspb "github.com/buildbuddy-io/buildbuddy/proto/cache_service"
 	rapb "github.com/buildbuddy-io/buildbuddy/proto/remote_asset"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
+	gerrdetails "google.golang.org/genproto/googleapis/rpc/errdetails"
+	gcodes "google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
 )
 
 func runFetchServer(ctx context.Context, t *testing.T, env *testenv.TestEnv) *grpc.ClientConn {
 	byteStreamServer, err := byte_stream_server.NewByteStreamServer(env)
 	require.NoError(t, err)
-	fetchServer, err := fetch_server.NewFetchServer(env)
+	err = buildbuddy_server.Register(env)
+	require.NoError(t, err)
+	err = content_addressable_storage_server.Register(env)
+	require.NoError(t, err)
+	err = cache_server.Register(env)
 	require.NoError(t, err)
 
+	// Allow 127.0.0.1 so we can dial the server in the test.
+	flags.Set(t, "remote_asset.allowed_private_ips", []string{"127.0.0.0/8"})
+
 	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
-	bspb.RegisterByteStreamServer(grpcServer, byteStreamServer)
-	rapb.RegisterFetchServer(grpcServer, fetchServer)
-
-	go runFunc()
-
 	clientConn, err := testenv.LocalGRPCConn(ctx, lis)
 	require.NoError(t, err)
 
 	env.SetByteStreamClient(bspb.NewByteStreamClient(clientConn))
+	env.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(clientConn))
+	env.SetBuildBuddyServiceClient(bbspb.NewBuildBuddyServiceClient(clientConn))
+	env.SetCacheClient(cspb.NewCacheClient(clientConn))
+
+	fetchServer, err := fetch_server.NewFetchServer(env)
+	require.NoError(t, err)
+
+	rapb.RegisterFetchServer(grpcServer, fetchServer)
+	bspb.RegisterByteStreamServer(grpcServer, byteStreamServer)
+	bbspb.RegisterBuildBuddyServiceServer(grpcServer, env.GetBuildBuddyServer())
+	repb.RegisterContentAddressableStorageServer(grpcServer, env.GetCASServer())
+	cspb.RegisterCacheServer(grpcServer, env.GetCacheServer())
+	go runFunc()
+
 	return clientConn
 }
 
@@ -188,7 +215,7 @@ func TestFetchBlobWithCache(t *testing.T) {
 			clientConn := runFetchServer(ctx, t, te)
 			fetchClient := rapb.NewFetchClient(clientConn)
 
-			ctx, err := prefix.AttachUserPrefixToContext(ctx, te)
+			ctx, err := prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 			require.NoError(t, err)
 
 			checksumDigest, err := digest.Compute(bytes.NewReader([]byte(content)), tc.checksumFunc)
@@ -214,6 +241,7 @@ func TestFetchBlobWithCache(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, resp)
 			assert.Equal(t, int32(0), resp.GetStatus().Code)
+			assert.Equal(t, tc.storageFunc, resp.GetDigestFunction())
 
 			exist, err := te.GetCache().Contains(ctx, digest.NewResourceName(&repb.Digest{
 				Hash:      resp.GetBlobDigest().GetHash(),
@@ -317,6 +345,7 @@ func TestFetchBlobMismatch(t *testing.T) {
 			require.NotNil(t, resp)
 			assert.Equal(t, int32(0), resp.GetStatus().Code)
 			assert.Equal(t, "", resp.GetStatus().Message)
+			assert.Equal(t, tc.expectedDigestFunc, resp.GetDigestFunction())
 			assert.Contains(t, resp.GetUri(), ts.URL)
 			expectedDigest, err := digest.Compute(bytes.NewReader([]byte(content)), tc.expectedDigestFunc)
 			require.NoError(t, err)
@@ -541,15 +570,152 @@ func TestFetchBlobWithUnknownQualifiers(t *testing.T) {
 		Uris: []string{ts.URL},
 		Qualifiers: []*rapb.Qualifier{
 			{
+				Name:  fetch_server.BazelCanonicalIDQualifier,
+				Value: "known-qualifier",
+			},
+			{
 				Name:  "unknown-qualifier",
 				Value: "some-value",
 			},
 		},
 	}
 	resp, err := fetchClient.FetchBlob(ctx, request)
-	// TODO: Return an error when an unknown qualifier is used
-	assert.NoError(t, err)
-	assert.NotNil(t, resp)
+	require.Error(t, err)
+	status, ok := gstatus.FromError(err)
+	assert.Nil(t, resp)
+	assert.True(t, ok)
+	require.NotNil(t, status)
+	assert.Equal(t, gcodes.InvalidArgument, status.Code())
+	assert.Equal(t, "Unsupported qualifiers: unknown-qualifier", status.Message())
+	require.Len(t, status.Details(), 1)
+	expectedDetail := &gerrdetails.BadRequest{
+		FieldViolations: []*gerrdetails.BadRequest_FieldViolation{
+			{
+				Field:       "qualifiers.name",
+				Description: `"unknown-qualifier" not supported`,
+			},
+		},
+	}
+	require.IsType(t, expectedDetail, status.Details()[0])
+	actualDetail := status.Details()[0].(*gerrdetails.BadRequest)
+	assert.True(t, proto.Equal(expectedDetail, actualDetail))
+}
+
+func TestFetchBlob_CacheProxy(t *testing.T) {
+	localEnv := testenv.GetTestEnv(t)
+	require.NoError(t, scratchspace.Init())
+
+	runRemoteCacheServers(t, t.Context(), localEnv)
+	clientConn := runFetchServerWithCacheProxy(t.Context(), localEnv, t)
+	fetchClient := rapb.NewFetchClient(clientConn)
+
+	content := "hello world"
+	contentDigest, err := digest.Compute(bytes.NewReader([]byte(content)), repb.DigestFunction_BLAKE3)
+	require.NoError(t, err)
+	remoteFetches := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteFetches++
+		fmt.Fprint(w, content)
+	}))
+	defer ts.Close()
+
+	request := &rapb.FetchBlobRequest{
+		Uris: []string{ts.URL},
+		Qualifiers: []*rapb.Qualifier{
+			{
+				Name:  fetch_server.ChecksumQualifier,
+				Value: checksumQualifierFromContent(t, contentDigest.GetHash(), repb.DigestFunction_BLAKE3),
+			},
+		},
+		DigestFunction: repb.DigestFunction_BLAKE3,
+	}
+	resp, err := fetchClient.FetchBlob(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, contentDigest.GetHash(), resp.GetBlobDigest().GetHash())
+	require.Equal(t, 1, remoteFetches)
+
+	// Verify on the second read, you can read the blob from local BSS server without another fetch from the HTTP server.
+	resp, err = fetchClient.FetchBlob(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, contentDigest.GetHash(), resp.GetBlobDigest().GetHash())
+	require.Equal(t, 1, remoteFetches)
+
+	// Verify you can not read the blob from the remote cache.
+	// To reduce egress across zones, we don't want artifacts propagated to the remote cache.
+	// This is okay because remote assets can be refetched if necessary, so the build won't fail
+	// if the proxy data is lost.
+	rn := digest.NewCASResourceName(contentDigest, "", repb.DigestFunction_BLAKE3)
+	buf := bytes.NewBuffer(make([]byte, 0, contentDigest.GetSizeBytes()))
+	remoteBSS := localEnv.GetByteStreamClient()
+	err = cachetools.GetBlob(t.Context(), remoteBSS, rn, buf)
+	require.Error(t, err)
+}
+
+// Run remote cache servers with a separate backing cache.
+func runRemoteCacheServers(t testing.TB, ctx context.Context, localEnv *testenv.TestEnv) {
+	remoteEnv := testenv.GetTestEnv(t)
+
+	if err := byte_stream_server.Register(remoteEnv); err != nil {
+		t.Fatal(err)
+	}
+	if err := buildbuddy_server.Register(remoteEnv); err != nil {
+		t.Fatal(err)
+	}
+	if err := content_addressable_storage_server.Register(remoteEnv); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteGRPCServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, remoteEnv)
+	bspb.RegisterByteStreamServer(remoteGRPCServer, remoteEnv.GetByteStreamServer())
+	repb.RegisterContentAddressableStorageServer(remoteGRPCServer, remoteEnv.GetCASServer())
+	bbspb.RegisterBuildBuddyServiceServer(remoteGRPCServer, remoteEnv.GetBuildBuddyServer())
+	go runFunc()
+
+	conn, err := testenv.LocalGRPCConn(ctx, lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	// Point clients in the proxy to the remote cache.
+	localEnv.SetByteStreamClient(bspb.NewByteStreamClient(conn))
+	localEnv.SetContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	localEnv.SetBuildBuddyServiceClient(bbspb.NewBuildBuddyServiceClient(conn))
+}
+
+func runFetchServerWithCacheProxy(ctx context.Context, env *testenv.TestEnv, t testing.TB) *grpc.ClientConn {
+	// Allow 127.0.0.1 so we can dial the server in the test.
+	flags.Set(t, "remote_asset.allowed_private_ips", []string{"127.0.0.0/8"})
+
+	// Run the local GRPC servers. They handle local-only reads and writes to the proxy and are not exposed
+	// to external GRPC traffic.
+	// The fetch server should use these local servers, which do NOT write through to the remote cache.
+	localBSS, err := byte_stream_server.NewByteStreamServer(env)
+	require.NoError(t, err)
+	env.SetLocalByteStreamServer(localBSS)
+
+	localCAS, err := content_addressable_storage_server.NewContentAddressableStorageServer(env)
+	require.NoError(t, err)
+	env.SetLocalCASServer(localCAS)
+
+	localCacheServer := cache_server.New(env)
+
+	fetchServer, err := fetch_server.NewFetchServer(env)
+	require.NoError(t, err)
+
+	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, env)
+	bspb.RegisterByteStreamServer(grpcServer, localBSS)
+	repb.RegisterContentAddressableStorageServer(grpcServer, localCAS)
+	rapb.RegisterFetchServer(grpcServer, fetchServer)
+	cspb.RegisterCacheServer(grpcServer, localCacheServer)
+	go runFunc()
+
+	conn, err := testenv.LocalGRPCConn(ctx, lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	env.SetLocalByteStreamClient(bspb.NewByteStreamClient(conn))
+	env.SetLocalContentAddressableStorageClient(repb.NewContentAddressableStorageClient(conn))
+	env.SetLocalCacheClient(cspb.NewCacheClient(conn))
+	return conn
 }
 
 func TestFetchDirectory(t *testing.T) {

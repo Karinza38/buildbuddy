@@ -1,13 +1,13 @@
-import { Subject } from "rxjs";
-import { buildbuddy, $stream } from "../../proto/buildbuddy_service_ts_proto";
-import { context } from "../../proto/context_ts_proto";
-import { CancelablePromise } from "../util/async";
-import * as protobufjs from "protobufjs";
-import capabilities from "../capabilities/capabilities";
-import { FetchError, GRPCStatusError, HTTPStatusError, parseGRPCStatus } from "../util/errors";
-import { google as google_status } from "../../proto/grpc_status_ts_proto";
-import { google as google_code } from "../../proto/grpc_code_ts_proto";
 import { BrowserHeaders } from "browser-headers";
+import * as protobufjs from "protobufjs";
+import { Subject } from "rxjs";
+import { $stream, buildbuddy } from "../../proto/buildbuddy_service_ts_proto";
+import { context } from "../../proto/context_ts_proto";
+import { google as google_code } from "../../proto/grpc_code_ts_proto";
+import { google as google_status } from "../../proto/grpc_status_ts_proto";
+import capabilities from "../capabilities/capabilities";
+import { CancelablePromise } from "../util/async";
+import { FetchError, GRPCStatusError, HTTPStatusError, parseGRPCStatus } from "../util/errors";
 
 /** Return type for unary RPCs. */
 export { CancelablePromise } from "../util/async";
@@ -92,7 +92,7 @@ class RpcService {
       }
     }
 
-    (window as any)._rpcService = this;
+    (globalThis as any)._rpcService = this;
   }
 
   debuggingEnabled(): boolean {
@@ -142,29 +142,55 @@ class RpcService {
     return bestMatch;
   }
 
-  getDownloadUrl(params: Record<string, string>): string {
+  /**
+   * Temporarily re-scopes the requestContext to use the given group ID as the
+   * selected group ID.
+   *
+   * The returned function must be called to restore the original group ID.
+   */
+  overrideGroupId(groupId: string): () => void {
+    const originalGroupId = this.requestContext.groupId;
+    this.requestContext.groupId = groupId;
+    return () => {
+      this.requestContext.groupId = originalGroupId;
+    };
+  }
+
+  getDownloadUrl(params: Record<string, string>, view = false): string {
     const encodedRequestContext = uint8ArrayToBase64(context.RequestContext.encode(this.requestContext).finish());
-    return `/file/download?${new URLSearchParams({
+    return `/file/${view ? "view" : "download"}?${new URLSearchParams({
       ...params,
       request_context: encodedRequestContext,
     })}`;
   }
 
-  getBytestreamUrl(bytestreamURL: string, invocationId: string, { filename = "", zip = "" } = {}): string {
+  getBytestreamUrl(
+    bytestreamURL: string,
+    invocationId: string,
+    { filename = "", zip = "", view = false } = {}
+  ): string {
     const params: Record<string, string> = {
       bytestream_url: bytestreamURL,
       invocation_id: invocationId,
     };
     if (filename) params.filename = filename;
     if (zip) params.z = zip;
-    return this.getDownloadUrl(params);
+    return this.getDownloadUrl(params, view);
   }
 
-  downloadLog(invocationId: string, attempt: number) {
+  downloadBuildLog(invocationId: string, attempt: number) {
     const params: Record<string, string> = {
       invocation_id: invocationId,
       attempt: attempt.toString(),
       artifact: "buildlog",
+    };
+    window.open(this.getDownloadUrl(params));
+  }
+
+  downloadRunLog(invocationId: string) {
+    const params: Record<string, string> = {
+      invocation_id: invocationId,
+      artifact: "runlog",
     };
     window.open(this.getDownloadUrl(params));
   }
@@ -287,7 +313,9 @@ class RpcService {
     streamParams?: $stream.StreamingRPCParams
   ): Promise<void> {
     const url = `${server || ""}/rpc/BuildBuddyService/${method.name}`;
-    const init: RequestInit = { method: "POST", body: requestData };
+    // Protobufjs returns ArrayBuffer-backed Uint8Arrays, which are valid fetch request bodies.
+    // TODO: Update protobufjs to return Uint8Array<ArrayBuffer> so this assertion is unnecessary.
+    const init: RequestInit = { method: "POST", body: requestData as Uint8Array<ArrayBuffer> };
     if (capabilities.config.regions?.map((r) => r.server).includes(server)) {
       init.credentials = "include";
     }

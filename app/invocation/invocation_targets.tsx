@@ -1,18 +1,27 @@
 import React from "react";
 
-import InvocationModel from "./invocation_model";
-import TargetsCardComponent from "./invocation_targets_card";
-import { XCircle, CheckCircle, HelpCircle, Clock, SkipForward } from "lucide-react";
+import { CheckCircle, Clock, HelpCircle, SkipForward, XCircle } from "lucide-react";
 import { api as api_common } from "../../proto/api/v1/common_ts_proto";
 import { target } from "../../proto/target_ts_proto";
+import rpcService, { CancelablePromise } from "../service/rpc_service";
+import InvocationModel from "./invocation_model";
 import TargetGroupCard from "./invocation_target_group_card";
-import rpc_service, { CancelablePromise } from "../service/rpc_service";
+import TargetsCardComponent from "./invocation_targets_card";
 
 interface Props {
   model: InvocationModel;
   pageSize: number;
   filter: string;
   mode: "passing" | "failing";
+
+  /**
+   * Whether to show a loading indicator when the targets are loading. Should
+   * only be set for the first card.
+   *
+   * TODO: Restructure these components to avoid this - maybe show the loader in
+   * the filter component instead.
+   */
+  showLoader?: boolean;
 }
 
 interface State {
@@ -62,7 +71,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
       this.setState({ searchLoading: false, searchResponse: undefined });
       return;
     }
-    this.searchRPC = rpc_service.service
+    this.searchRPC = rpcService.service
       .getTarget({
         invocationId: this.props.model.getInvocationId(),
         filter: this.props.filter,
@@ -93,7 +102,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
 
   render() {
     if (this.state.searchLoading) {
-      return <div className="loading" />;
+      return this.props.showLoader ? <div className="loading loading-slim invocation-tab-loading" /> : null;
     }
 
     if (this.props.model.invocation.targetGroups.length) {
@@ -111,7 +120,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.failedTest}
             className="card-failure"
-            icon={<XCircle className="icon red" />}
+            icon={<XCircle className="red" />}
             presentVerb={`failing ${this.props.model.failedTest.length == 1 ? "test" : "tests"}`}
             pastVerb={`${this.props.model.failedTest.length == 1 ? "test" : "tests"} failed`}
             model={this.props.model}
@@ -124,7 +133,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.failed}
             className="card-failure"
-            icon={<XCircle className="icon red" />}
+            icon={<XCircle className="red" />}
             presentVerb={`failing ${this.props.model.failed.length == 1 ? "target" : "targets"}`}
             pastVerb={`${this.props.model.failed.length == 1 ? "target" : "targets"} failed to build`}
             model={this.props.model}
@@ -137,7 +146,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.brokenTest}
             className="card-failure"
-            icon={<XCircle className="icon red" />}
+            icon={<XCircle className="red" />}
             presentVerb={`broken ${this.props.model.brokenTest.length == 1 ? "test" : "tests"}`}
             pastVerb={`${this.props.model.brokenTest.length == 1 ? "test" : "tests"} broken`}
             model={this.props.model}
@@ -150,7 +159,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.timeoutTest}
             className="card-timeout"
-            icon={<Clock className="icon" />}
+            icon={<Clock />}
             presentVerb={`timed out ${this.props.model.timeoutTest.length == 1 ? "test" : "tests"}`}
             pastVerb={`${this.props.model.timeoutTest.length == 1 ? "test" : "tests"} timed out`}
             model={this.props.model}
@@ -163,7 +172,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.flakyTest}
             className="card-flaky"
-            icon={<HelpCircle className="icon orange" />}
+            icon={<HelpCircle className="orange" />}
             presentVerb={`flaky ${this.props.model.flakyTest.length == 1 ? "test" : "tests"}`}
             pastVerb={`flaky ${this.props.model.flakyTest.length == 1 ? "test" : "tests"}`}
             model={this.props.model}
@@ -176,7 +185,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.succeededTest}
             className="card-success"
-            icon={<CheckCircle className="icon green" />}
+            icon={<CheckCircle className="green" />}
             presentVerb={`passing ${this.props.model.succeededTest.length == 1 ? "test" : "tests"}`}
             pastVerb={`${this.props.model.succeededTest.length == 1 ? "test" : "tests"} passed`}
             model={this.props.model}
@@ -189,7 +198,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.succeeded}
             className="card-success"
-            icon={<CheckCircle className="icon green" />}
+            icon={<CheckCircle className="green" />}
             presentVerb={`${this.props.model.succeeded.length == 1 ? "target" : "targets"}`}
             pastVerb={`${this.props.model.succeeded.length == 1 ? "target" : "targets"} built successfully`}
             model={this.props.model}
@@ -202,7 +211,7 @@ export default class TargetsComponent extends React.Component<Props, State> {
           <TargetsCardComponent
             buildEvents={this.props.model.skipped}
             className="card-skipped"
-            icon={<SkipForward className="icon purple" />}
+            icon={<SkipForward className="purple" />}
             presentVerb={`${this.props.model.skipped.length == 1 ? "target" : "targets"}`}
             pastVerb={`${this.props.model.skipped.length == 1 ? "target" : "targets"} skipped`}
             model={this.props.model}

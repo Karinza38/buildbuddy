@@ -1,11 +1,12 @@
-import React from "react";
-import InvocationModel from "./invocation_model";
 import { Copy, Info } from "lucide-react";
-import { copyToClipboard } from "../util/clipboard";
-import alert_service from "../alert/alert_service";
+import React from "react";
 import { command_line } from "../../proto/command_line_ts_proto";
+import alert_service from "../alert/alert_service";
 import Banner from "../components/banner/banner";
+import { Link } from "../components/link/link";
 import format from "../format/format";
+import { copyToClipboard } from "../util/clipboard";
+import InvocationModel from "./invocation_model";
 
 interface Props {
   model: InvocationModel;
@@ -37,9 +38,13 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
   render() {
     const isBazelInvocation = this.props.model.isBazelInvocation();
 
+    const cumulativeMetrics = this.props.model.buildMetrics?.cumulativeMetrics;
+    const numAnalyses = cumulativeMetrics?.numAnalyses ?? 0;
+    const numBuilds = cumulativeMetrics?.numBuilds ?? 0;
+
     return (
       <div className="card">
-        <Info className="icon purple" />
+        <Info className="purple" />
         <div className="content">
           <div className="title">Invocation details</div>
           <div className="details">
@@ -79,13 +84,25 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div>{this.props.model.getTiming()}</div>
             </div>
             <div className="invocation-section">
-              <div className="invocation-section-title">User</div>
-              <div>{this.props.model.getUser(false)}</div>
+              <div className="invocation-section-title">CPU time</div>
+              <div>
+                {format.formatWithCommas(+(this.props.model.buildMetrics?.timingMetrics?.cpuTimeInMs || 0) / 1000)}{" "}
+                cpu-seconds
+              </div>
             </div>
-            <div className="invocation-section">
-              <div className="invocation-section-title">Host name</div>
-              <div>{this.props.model.getHost()}</div>
-            </div>
+
+            {this.props.model.getUser() ? (
+              <div className="invocation-section">
+                <div className="invocation-section-title">User</div>
+                <div>{this.props.model.getUser()}</div>
+              </div>
+            ) : null}
+            {this.props.model.getHost() ? (
+              <div className="invocation-section">
+                <div className="invocation-section-title">Host name</div>
+                <div>{this.props.model.getHost()}</div>
+              </div>
+            ) : null}
             <div className="invocation-section">
               <div className="invocation-section-title">Tool</div>
               <div>{this.props.model.getTool()}</div>
@@ -126,24 +143,37 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
                     )}
                   </div>
                 </div>
-                <div className="invocation-section">
-                  <div className="invocation-section-title">Actions</div>
-                  <div>
-                    {format.formatWithCommas(this.props.model.buildMetrics?.actionSummary?.actionsExecuted)} actions
-                    {!!this.props.model.buildMetrics?.actionSummary?.actionsCreated && (
-                      <span>
-                        {" "}
-                        ({format.formatWithCommas(this.props.model.buildMetrics?.actionSummary.actionsCreated)} created)
-                      </span>
-                    )}
+                {Boolean(this.props.model.buildMetrics?.actionSummary) && (
+                  <div className="invocation-section">
+                    <div className="invocation-section-title">Actions</div>
+                    <div>
+                      {format.formatWithCommas(this.props.model.buildMetrics?.actionSummary?.actionsExecuted)} actions
+                      {!!this.props.model.buildMetrics?.actionSummary?.actionsCreated && (
+                        <span>
+                          {" "}
+                          ({format.formatWithCommas(this.props.model.buildMetrics?.actionSummary?.actionsCreated)}{" "}
+                          created)
+                        </span>
+                      )}
+                    </div>
                   </div>
-                </div>
-                <div className="invocation-section">
-                  <div className="invocation-section-title">Packages</div>
-                  <div>
-                    {format.formatWithCommas(this.props.model.buildMetrics?.packageMetrics?.packagesLoaded)} packages
+                )}
+                {Boolean(this.props.model.buildMetrics?.packageMetrics) && (
+                  <div className="invocation-section">
+                    <div className="invocation-section-title">Packages</div>
+                    <div>
+                      {format.formatWithCommas(this.props.model.buildMetrics?.packageMetrics?.packagesLoaded)} packages
+                    </div>
                   </div>
-                </div>
+                )}
+                {cumulativeMetrics && (
+                  <div className="invocation-section">
+                    <div className="invocation-section-title">Analysis Cache Age</div>
+                    <div>
+                      {`${numAnalyses} ${numAnalyses === 1 ? "analysis" : "analyses"}, ${numBuilds} ${numBuilds === 1 ? "build" : "builds"}`}
+                    </div>
+                  </div>
+                )}
               </>
             )}
 
@@ -151,7 +181,7 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GitHub user</div>
                 <div>
-                  <a href={`${this.props.model.getGithubUser()}`}>{this.props.model.getGithubUser()}</a>
+                  <Link href={`${this.props.model.getGithubUser()}`}>{this.props.model.getGithubUser()}</Link>
                 </div>
               </div>
             )}
@@ -160,7 +190,7 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GitHub repo</div>
                 <div>
-                  <a href={`${this.props.model.getGithubRepo()}`}>{this.props.model.getGithubRepo()}</a>
+                  <Link href={`${this.props.model.getGithubRepo()}`}>{this.props.model.getGithubRepo()}</Link>
                 </div>
               </div>
             )}
@@ -169,9 +199,9 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GitHub branch</div>
                 <div>
-                  <a href={`${this.props.model.getGithubRepo()}/tree/${this.props.model.getGithubBranch()}`}>
+                  <Link href={`${this.props.model.getGithubRepo()}/tree/${this.props.model.getGithubBranch()}`}>
                     {this.props.model.getGithubBranch()}
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -180,12 +210,12 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GitHub commit</div>
                 <div>
-                  <a
+                  <Link
                     href={`${this.props.model
                       .getGithubRepo()
                       .replace(/\.git$/, "")}/commit/${this.props.model.getGithubSHA()}`}>
                     {this.props.model.getGithubSHA()}
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -194,9 +224,9 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GitHub run</div>
                 <div>
-                  <a href={`${this.props.model.getGithubRepo()}/actions/runs/${this.props.model.getGithubRun()}`}>
+                  <Link href={`${this.props.model.getGithubRepo()}/actions/runs/${this.props.model.getGithubRun()}`}>
                     {this.props.model.getGithubRun()}
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -205,10 +235,10 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GKE project</div>
                 <div>
-                  <a
+                  <Link
                     href={`http://console.cloud.google.com/home/dashboard?project=${this.props.model.getGKEProject()}`}>
                     {this.props.model.getGKEProject()}
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -217,10 +247,10 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
               <div className="invocation-section">
                 <div className="invocation-section-title">GKE cluster</div>
                 <div>
-                  <a
+                  <Link
                     href={`https://console.cloud.google.com/kubernetes/list?project=${this.props.model.getGKEProject()}&filter=name:${this.props.model.getGKECluster()}`}>
                     {this.props.model.getGKECluster()}
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -248,23 +278,14 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
                     effective command line{" "}
                     <Copy
                       className="copy-icon"
-                      onClick={this.handleCopyClicked.bind(
-                        this,
-                        `${this.props.model.bazelCommandAndPatternWithOptions(
-                          this.props.model.optionsParsed?.cmdLine ?? []
-                        )}`
-                      )}
+                      onClick={this.handleCopyClicked.bind(this, this.props.model.effectiveCommandLine())}
                     />
                   </div>
                   {this.props.model.invocation.patternsTruncated && !this.props.model.hasPatternFile() && (
                     <Banner type="warning">Patterns have been truncated due to size limitations.</Banner>
                   )}
                   <div className="invocation-section">
-                    <code className="wrap">
-                      {this.props.model.bazelCommandAndPatternWithOptions(
-                        this.props.model.optionsParsed?.cmdLine ?? []
-                      )}
-                    </code>
+                    <code className="wrap">{this.props.model.effectiveCommandLine()}</code>
                   </div>
                 </div>
               </>
@@ -299,12 +320,12 @@ export default class ArtifactsCardComponent extends React.Component<Props, State
                               {option.optionName?.startsWith("//") || option.optionName?.startsWith("@") ? (
                                 <span className="invocation-option-name">{option.optionName}</span>
                               ) : (
-                                <a
+                                <Link
                                   className="invocation-option-name"
                                   href={`https://bazel.build/reference/command-line-reference#flag--${option.optionName}`}
                                   target="_blank">
                                   {option.optionName}
-                                </a>
+                                </Link>
                               )}
 
                               {option.optionValue !== undefined && (

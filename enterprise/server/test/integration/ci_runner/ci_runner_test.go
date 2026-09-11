@@ -57,7 +57,6 @@ var (
 	ciRunnerRunfilePath string
 
 	workspaceContentsWithBazelVersionAction = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"buildbuddy.yaml": `
 actions:
   - name: "Show bazel version"
@@ -69,8 +68,8 @@ actions:
 	}
 
 	workspaceContentsWithTestsAndNoBuildBuddyYAML = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"BUILD": `
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 sh_test(name = "pass", srcs = ["pass.sh"])
 sh_test(name = "fail", srcs = ["fail.sh"])
 `,
@@ -79,8 +78,8 @@ sh_test(name = "fail", srcs = ["fail.sh"])
 	}
 
 	workspaceContentsWithTestsAndBuildBuddyYAML = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"BUILD": `
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 sh_test(name = "pass", srcs = ["pass.sh"])
 sh_test(name = "fail", srcs = ["fail.sh"])
 `,
@@ -98,8 +97,8 @@ actions:
 	}
 
 	workspaceContentsWithRunScript = map[string]string{
-		"WORKSPACE":     `workspace(name = "test")`,
-		"BUILD":         `sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
 		"print_args.sh": "echo 'args: {{' $@ '}}'",
 		"buildbuddy.yaml": `
 actions:
@@ -113,10 +112,10 @@ actions:
 	}
 
 	workspaceContentsWithEnvVars = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
-		"BUILD":     `sh_test(name = "check_env", srcs = ["check_env.sh"])`,
+		"BUILD": `load("@rules_shell//shell:sh_test.bzl", "sh_test")
+sh_test(name = "check_env", srcs = ["check_env.sh"])`,
 		"check_env.sh": `
-		
+
 		if [[ "$TEST_SECRET_1" != "test_secret_1_value" ]]; then
 				echo "TEST_SECRET_1 env var: expected 'test_secret_1_value', got $TEST_SECRET_1"
 				exit 1
@@ -140,9 +139,9 @@ actions:
 	}
 
 	workspaceContentsWithLocalEnvironmentalErrorAction = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
-		"BUILD":     `sh_binary(name = "exit", srcs = ["exit.sh"])`,
-		"exit.sh":   `exit "$1"`,
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "exit", srcs = ["exit.sh"])`,
+		"exit.sh": `exit "$1"`,
 		"buildbuddy.yaml": `
 actions:
   - name: "Exit 36"
@@ -155,9 +154,9 @@ actions:
 	}
 
 	workspaceContentsWithExitScriptAndMergeDisabled = map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `sh_binary(name = "exit", srcs = ["exit.sh"])`,
-		"exit.sh":   `exit "$1"`,
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "exit", srcs = ["exit.sh"])`,
+		"exit.sh": `exit "$1"`,
 		"buildbuddy.yaml": `
 actions:
   - name: "Test"
@@ -170,9 +169,26 @@ actions:
 `,
 	}
 
+	workspaceContentsWithMergeBaseInterval = map[string]string{
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "exit", srcs = ["exit.sh"])`,
+		"exit.sh": `exit "$1"`,
+		"buildbuddy.yaml": `
+actions:
+  - name: "Test"
+    triggers:
+      pull_request:
+        branches: [ "*" ]
+        merge_with_base_interval: "3h"
+    bazel_commands:
+      - run :exit -- 0
+`,
+	}
+
 	workspaceContentsWithArtifactUploads = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"BUILD": `
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 sh_test(name = "pass", srcs = ["pass.sh"])
 sh_binary(name = "check_artifacts_dir", srcs = ["check_artifacts_dir.sh"])
 `,
@@ -199,8 +215,8 @@ actions:
 	}
 
 	workspaceContentsWithGitLog = map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
-		"BUILD":     `sh_binary(name = "log", srcs = ["log.sh"])`,
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "log", srcs = ["log.sh"])`,
 		"log.sh": `
 			cd "$BUILD_WORKSPACE_DIRECTORY"
 			git log
@@ -236,23 +252,36 @@ type result struct {
 	DoNotRecycle bool
 }
 
+type invokeRunnerOpts struct {
+	Env               []string
+	WorkDir           string
+	BazelStartupFlags string
+}
+
 func invokeRunner(t *testing.T, args []string, env []string, workDir string) *result {
+	return invokeRunnerWithOpts(t, args, invokeRunnerOpts{
+		Env:     env,
+		WorkDir: workDir,
+	})
+}
+
+func invokeRunnerWithOpts(t *testing.T, args []string, opts invokeRunnerOpts) *result {
 	binPath, err := runfiles.Rlocation(ciRunnerRunfilePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bazelPath, err := runfiles.Rlocation(testbazel.BazelBinaryPath)
-	if err != nil {
-		t.Fatal(err)
+	startupFlags := bazelStartupFlags
+	if opts.BazelStartupFlags != "" {
+		startupFlags = opts.BazelStartupFlags
 	}
 	args = append([]string{
-		"--bazel_command=" + bazelPath,
-		"--bazel_startup_flags=" + bazelStartupFlags,
+		"--bazel_command=" + testbazel.BinaryPath(t),
+		"--bazel_startup_flags=" + startupFlags,
 	}, args...)
 
 	cmd := exec.Command(binPath, args...)
-	cmd.Dir = workDir
-	cmd.Env = env
+	cmd.Dir = opts.WorkDir
+	cmd.Env = opts.Env
 	outputBytes, err := cmd.CombinedOutput()
 	exitCode := -1
 	signal := syscall.Signal(-1)
@@ -283,7 +312,7 @@ func invokeRunner(t *testing.T, args []string, env []string, workDir string) *re
 		ExitCode:      exitCode,
 		Signal:        signal,
 		InvocationIDs: invocationIDs,
-		DoNotRecycle:  testfs.Exists(t, workDir, ".BUILDBUDDY_DO_NOT_RECYCLE"),
+		DoNotRecycle:  testfs.Exists(t, opts.WorkDir, ".BUILDBUDDY_DO_NOT_RECYCLE"),
 	}
 }
 
@@ -310,7 +339,9 @@ func makeGitRepo(t *testing.T, contents map[string]string) (path, commitSHA stri
 	// called more than once to create unique repos with incompatible commit
 	// history.
 	contents[".repo_id"] = newUUID(t)
-	return testgit.MakeTempRepo(t, contents)
+	path = testbazel.MakeTempModule(t, contents)
+	commitSHA = testgit.Init(t, path)
+	return path, commitSHA
 }
 
 func getRunnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocation {
@@ -320,8 +351,7 @@ func getRunnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocati
 	}
 	invResp, err := bbService.GetInvocation(context.Background(), &inpb.GetInvocationRequest{
 		Lookup: &inpb.InvocationLookup{
-			InvocationId:          res.InvocationIDs[0],
-			FetchChildInvocations: true,
+			InvocationId: res.InvocationIDs[0],
 		},
 	})
 	require.NoError(t, err)
@@ -338,7 +368,8 @@ func getRunnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocati
 func getInnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocation {
 	bbService := app.BuildBuddyServiceClient(t)
 
-	pattern := `Streaming build results to: ` + app.HTTPURL() + `/invocation/([a-f0-9-]+)`
+	// Note: The `.*?` part of the pattern is used to skip ANSI color codes.
+	pattern := `Streaming build results to: .*?` + app.HTTPURL() + `/invocation/([a-f0-9-]+)`
 	innerIIDPattern := regexp.MustCompile(pattern)
 	iidMatches := innerIIDPattern.FindAllStringSubmatch(res.Output, -1)
 	invocationIDs := make([]string, 0)
@@ -346,9 +377,7 @@ func getInnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocatio
 		invocationIDs = append(invocationIDs, m[1])
 	}
 
-	if !assert.GreaterOrEqual(t, len(invocationIDs), 1) {
-		require.FailNowf(t, "Runner did not output invocation IDs", "output: %s", res.Output)
-	}
+	require.NotEmpty(t, invocationIDs, "runner did not output any invocation IDs: %s", res.Output)
 
 	invResp, err := bbService.GetInvocation(context.Background(), &inpb.GetInvocationRequest{
 		Lookup: &inpb.InvocationLookup{
@@ -366,14 +395,13 @@ func getInnerInvocation(t *testing.T, app *app.App, res *result) *inpb.Invocatio
 	return invResp.Invocation[0]
 }
 
-func TestCIRunner_RunsBashCommands(t *testing.T) {
+func TestCIRunner_RunsBashCommands_NoBazelWorkspace(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
 	workspaceContentsWithBashCommands := map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"buildbuddy.yaml": `
 actions:
-  - name: "Show bazel version"
+  - name: "Test"
     triggers:
       push: { branches: [ master ] }
       pull_request: { branches: [ master ] }
@@ -381,14 +409,15 @@ actions:
       - run: |
           for i in {1..2}; do
             echo "Loop $i: ";
-            bazel version;
           done
 `,
 	}
-	repoPath, headCommitSHA := makeGitRepo(t, workspaceContentsWithBashCommands)
+
+	// Initialize a non-bazel repo
+	repoPath, headCommitSHA := testgit.MakeTempRepo(t, workspaceContentsWithBashCommands)
 	runnerFlags := []string{
 		"--workflow_id=test-workflow",
-		"--action_name=Show bazel version",
+		"--action_name=Test",
 		"--trigger_event=push",
 		"--pushed_repo_url=file://" + repoPath,
 		"--pushed_branch=master",
@@ -405,9 +434,9 @@ actions:
 	checkRunnerResult(t, result)
 
 	runnerInvocation := getRunnerInvocation(t, app, result)
-	assert.Contains(t, runnerInvocation.ConsoleBuffer, "Build label: ")
 	assert.Contains(t, runnerInvocation.ConsoleBuffer, "Loop 1:")
 	assert.Contains(t, runnerInvocation.ConsoleBuffer, "Loop 2:")
+	assert.False(t, result.DoNotRecycle)
 }
 
 func TestCIRunner_RunsBashCommands_BazelWithOptions(t *testing.T) {
@@ -434,32 +463,34 @@ func TestCIRunner_RunsBashCommands_BazelWithOptions(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		workspaceContents := map[string]string{
-			"WORKSPACE":     `workspace(name = "test")`,
-			"BUILD":         `sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
-			"print_args.sh": "echo 'args: {{' $@ '}}'",
-			"buildbuddy.yaml": `
+		t.Run(tc.name, func(t *testing.T) {
+			workspaceContents := map[string]string{
+				"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+				"print_args.sh": "echo 'args: {{' $@ '}}'",
+				"buildbuddy.yaml": `
 actions:
   - name: "Test action"
     steps:
       - run: ` + tc.command,
-		}
+			}
 
-		repoPath, _ := makeGitRepo(t, workspaceContents)
-		runnerFlags := []string{
-			"--workflow_id=test-workflow",
-			"--action_name=Test action",
-			"--trigger_event=push",
-			"--pushed_repo_url=file://" + repoPath,
-			"--pushed_branch=master",
-		}
-		// Start the app so the runner can use it as the BES backend.
-		app := buildbuddy.Run(t)
-		runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+			repoPath, _ := makeGitRepo(t, workspaceContents)
+			runnerFlags := []string{
+				"--workflow_id=test-workflow",
+				"--action_name=Test action",
+				"--trigger_event=push",
+				"--pushed_repo_url=file://" + repoPath,
+				"--pushed_branch=master",
+			}
+			// Start the app so the runner can use it as the BES backend.
+			app := buildbuddy.Run(t)
+			runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
 
-		result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-		runnerInvocation := getRunnerInvocation(t, app, result)
-		require.Regexp(t, tc.outputMustMatch, runnerInvocation.ConsoleBuffer, tc.name)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			require.Regexp(t, tc.outputMustMatch, runnerInvocation.ConsoleBuffer, tc.name)
+		})
 	}
 }
 
@@ -469,17 +500,18 @@ func TestCIRunner_AppliesCustomBazelrc(t *testing.T) {
 	testCases := []struct {
 		name                   string
 		workspaceContents      map[string]string
+		initSubdir             bool
 		expectedStartupOptions []string
 		expectModifiedIID      bool
 	}{
 		{
 			name: "Has a workspace .bazelrc",
 			workspaceContents: map[string]string{
-				"WORKSPACE": `workspace(name = "test")`,
 				".bazelrc": `
 common --invocation_id=00000000-0000-0000-0000-000000000000
 `,
-				"BUILD":         `sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+				"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
 				"print_args.sh": "echo 'args: {{' $@ '}}'",
 				"buildbuddy.yaml": `
 actions:
@@ -498,8 +530,8 @@ actions:
 		{
 			name: "Does not have a workspace .bazelrc",
 			workspaceContents: map[string]string{
-				"WORKSPACE":     `workspace(name = "test")`,
-				"BUILD":         `sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+				"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
 				"print_args.sh": "echo 'args: {{' $@ '}}'",
 				"buildbuddy.yaml": `
 actions:
@@ -519,11 +551,11 @@ actions:
 			// recycling to work properly.
 			name: "Workspace is in a subdir",
 			workspaceContents: map[string]string{
-				"subdir/WORKSPACE": `workspace(name = "test")`,
 				"subdir/.bazelrc": `
 common --invocation_id=00000000-0000-0000-0000-000000000000
 `,
-				"subdir/BUILD":         `sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+				"subdir/BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
 				"subdir/print_args.sh": "echo 'args: {{' $@ '}}'",
 				"buildbuddy.yaml": `
 actions:
@@ -533,6 +565,7 @@ actions:
       - run: bazel build //:print_args
 `,
 			},
+			initSubdir: true,
 			expectedStartupOptions: []string{
 				"buildbuddy.bazelrc",
 				"repo-root/subdir/.bazelrc",
@@ -543,56 +576,170 @@ actions:
 	}
 
 	for _, tc := range testCases {
-		repoPath, _ := makeGitRepo(t, tc.workspaceContents)
-		runnerFlags := []string{
-			"--workflow_id=test-workflow",
-			"--action_name=Test action",
-			"--pushed_repo_url=file://" + repoPath,
-			"--pushed_branch=master",
-		}
-		// Start the app so the runner can use it as the BES backend.
-		app := buildbuddy.Run(t)
-		runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+		t.Run(tc.name, func(t *testing.T) {
+			repoPath, _ := makeGitRepo(t, tc.workspaceContents)
+			if tc.initSubdir {
+				testbazel.InitModule(t, filepath.Join(repoPath, "subdir"))
+				testgit.CommitAll(t, repoPath, "Init subdir bazel module")
+			}
+			runnerFlags := []string{
+				"--workflow_id=test-workflow",
+				"--action_name=Test action",
+				"--pushed_repo_url=file://" + repoPath,
+				"--pushed_branch=master",
+			}
+			// Start the app so the runner can use it as the BES backend.
+			app := buildbuddy.Run(t)
+			runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
 
-		result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-		checkRunnerResult(t, result)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			checkRunnerResult(t, result)
 
-		runnerInvocation := getRunnerInvocation(t, app, result)
-		innerInvocation := getInnerInvocation(t, app, result)
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			innerInvocation := getInnerInvocation(t, app, result)
 
-		missingStartupFlags := make(map[string]struct{}, 0)
-		for _, sf := range tc.expectedStartupOptions {
-			missingStartupFlags[sf] = struct{}{}
-		}
-
-		for _, cl := range innerInvocation.StructuredCommandLine {
-			for _, s := range cl.Sections {
-				if s.SectionLabel == "startup options" {
-					optionList, ok := s.SectionType.(*clpb.CommandLineSection_OptionList)
-					if !ok {
-						continue
-					}
-					for _, o := range optionList.OptionList.Option {
-						for _, so := range tc.expectedStartupOptions {
-							if strings.Contains(o.CombinedForm, so) {
-								delete(missingStartupFlags, so)
-							}
-						}
+			missingStartupFlags := make(map[string]struct{}, 0)
+			for _, sf := range tc.expectedStartupOptions {
+				missingStartupFlags[sf] = struct{}{}
+			}
+			for _, o := range findStructuredCommandLineOptions(t, innerInvocation, "original", "startup options") {
+				for so := range missingStartupFlags {
+					if strings.Contains(o.CombinedForm, so) {
+						delete(missingStartupFlags, so)
 					}
 				}
 			}
+			require.Empty(t, missingStartupFlags)
+
+			// Check logs that BES url from buildbuddy.bazelrc was applied
+			require.Contains(t, runnerInvocation.ConsoleBuffer, app.HTTPURL(), tc.name)
+
+			if tc.expectModifiedIID {
+				require.Contains(t, runnerInvocation.ConsoleBuffer, "00000000-0000-0000-0000-000000000000")
+			} else {
+				require.NotContains(t, runnerInvocation.ConsoleBuffer, "00000000-0000-0000-0000-000000000000")
+			}
+		})
+	}
+}
+
+func findStructuredCommandLineOptions(t *testing.T, inv *inpb.Invocation, label, section string) []*clpb.Option {
+	t.Helper()
+	for _, cl := range inv.StructuredCommandLine {
+		if cl.GetCommandLineLabel() != label {
+			continue
 		}
-		require.Empty(t, missingStartupFlags)
-
-		// Check logs that BES url from buildbuddy.bazelrc was applied
-		require.Contains(t, runnerInvocation.ConsoleBuffer, app.HTTPURL(), tc.name)
-
-		if tc.expectModifiedIID {
-			require.Contains(t, runnerInvocation.ConsoleBuffer, "00000000-0000-0000-0000-000000000000")
-		} else {
-			require.NotContains(t, runnerInvocation.ConsoleBuffer, "00000000-0000-0000-0000-000000000000")
+		for _, s := range cl.GetSections() {
+			if s.GetSectionLabel() != section {
+				continue
+			}
+			optionList, ok := s.SectionType.(*clpb.CommandLineSection_OptionList)
+			require.Truef(t, ok, "structured command line %q section %q was not an option list", label, section)
+			return optionList.OptionList.GetOption()
 		}
 	}
+	require.FailNowf(t, "structured command line section not found", "label=%q section=%q command_lines=%v", label, section, inv.StructuredCommandLine)
+	return nil
+}
+
+func TestCIRunner_StartupOptionsDontRestartBazelServer(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+
+	// Run a bazel command with a startup option
+	workspaceContents := map[string]string{
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+		"print_args.sh": "echo 'args: {{' $@ '}}'",
+		"buildbuddy.yaml": `
+actions:
+  - name: "Test action"
+    steps:
+      - run: bazel --host_jvm_args=-DBAZEL_TRACK_SOURCE_DIRECTORIES=1 help
+`,
+	}
+
+	repoPath, _ := makeGitRepo(t, workspaceContents)
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test action",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=master",
+	}
+	// Start the app so the runner can use it as the BES backend.
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	// Invoke one run.
+	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+	checkRunnerResult(t, result)
+
+	// Invoke a second run - should use a recycled runner.
+	result = invokeRunner(t, runnerFlags, []string{}, wsPath)
+	checkRunnerResult(t, result)
+
+	// Check that the bazel server wasn't restarted.
+	runnerInvocation := getRunnerInvocation(t, app, result)
+	require.NotContains(t, runnerInvocation.ConsoleBuffer, "Running Bazel server needs to be killed, because the startup options are different.")
+}
+
+func TestCIRunner_SetsMaxIdleSecsToZero(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	workspaceContents := map[string]string{
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "print_args", srcs = ["print_args.sh"])`,
+		"print_args.sh": "echo 'args: {{' $@ '}}'",
+		"buildbuddy.yaml": `
+actions:
+  - name: "Test action"
+    steps:
+      - run: bazel build //:print_args
+`,
+	}
+
+	repoPath, _ := makeGitRepo(t, workspaceContents)
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test action",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=master",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	// This needs a dedicated test because the shared ci_runner harness injects
+	// --max_idle_secs=5, which would override the generated rc's
+	// startup --max_idle_secs=0 and mask the canonical startup option we want
+	// to assert here. Keep workflow_id so the action_name path still publishes
+	// a runner invocation to BES. Since ci_runner now disables idle shutdown for
+	// all Bazel runs, clean it up explicitly so the local Bazel server does not
+	// stay alive after the test.
+	startupFlags := "--noblock_for_lock"
+	t.Cleanup(func() {
+		shutdownFlags := append(append([]string{}, runnerFlags...), "--shutdown_and_exit")
+		result := invokeRunnerWithOpts(t, shutdownFlags, invokeRunnerOpts{
+			Env:               []string{},
+			WorkDir:           wsPath,
+			BazelStartupFlags: startupFlags,
+		})
+		require.Equalf(t, 0, result.ExitCode, "shutdown runner returned exit code %d\noutput:\n%s", result.ExitCode, result.Output)
+	})
+
+	result := invokeRunnerWithOpts(t, runnerFlags, invokeRunnerOpts{
+		Env:               []string{},
+		WorkDir:           wsPath,
+		BazelStartupFlags: startupFlags,
+	})
+	checkRunnerResult(t, result)
+
+	canonicalStartupOptions := findStructuredCommandLineOptions(t, getInnerInvocation(t, app, result), "canonical", "startup options")
+	foundMaxIdleSecs := false
+	for _, option := range canonicalStartupOptions {
+		if option.GetOptionName() == "max_idle_secs" && option.GetOptionValue() == "0" {
+			foundMaxIdleSecs = true
+			break
+		}
+	}
+	require.Truef(t, foundMaxIdleSecs, "canonical startup options did not include --max_idle_secs=0: %v", canonicalStartupOptions)
 }
 
 func TestCIRunner_Push_WorkspaceWithCustomConfig_RunsAndUploadsResultsToBES(t *testing.T) {
@@ -841,13 +988,15 @@ func TestCIRunner_Fork_MergesTargetBranchBeforeRunning(t *testing.T) {
 	baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
 
 	for _, tc := range testCases {
-		runnerFlags := append(baselineRunnerFlags, tc.repoFlags...)
-		result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-		runnerInvocation := getRunnerInvocation(t, app, result)
-		// We should be able to see both of the changes we made, since they should
-		// be merged together.
-		assert.Contains(t, runnerInvocation.ConsoleBuffer, "NONCONFLICTING_EDIT_1", tc.name)
-		assert.Contains(t, runnerInvocation.ConsoleBuffer, "NONCONFLICTING_EDIT_2", tc.name)
+		t.Run(tc.name, func(t *testing.T) {
+			runnerFlags := append(baselineRunnerFlags, tc.repoFlags...)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			// We should be able to see both of the changes we made, since they should
+			// be merged together.
+			assert.Contains(t, runnerInvocation.ConsoleBuffer, "NONCONFLICTING_EDIT_1", tc.name)
+			assert.Contains(t, runnerInvocation.ConsoleBuffer, "NONCONFLICTING_EDIT_2", tc.name)
+		})
 	}
 }
 
@@ -951,6 +1100,75 @@ func TestCIRunner_Merge_FetchesCompleteGitHistory(t *testing.T) {
 	checkRunnerResult(t, result)
 }
 
+func TestCIRunner_MergeDisabled_SkipsFetchingCompleteGitHistory(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, _ := makeGitRepo(t, workspaceContentsWithRunScript)
+
+	testshell.Run(t, repoPath, `
+		# Create a base branch
+		git checkout -B base
+		printf 'echo "Base Commit" && exit 0\n' > base1.sh
+		git add base1.sh
+		git commit -m "Original commit on base"
+
+		# Create a feature branch off the first commit of the base branch
+		git checkout -B feature
+		printf 'echo NONCONFLICTING_EDIT && exit 0\n' > feature.sh
+		git add feature.sh
+		git commit -m "Commit from feature branch"
+
+		# Add another commit to the base branch, so the merge base is no longer
+		# reachable from a shallow fetch of the feature branch.
+		printf 'echo "Second commit on base" && exit 0\n' > base2.sh
+		git add base2.sh
+		git commit -m "Second commit on base"
+	`)
+
+	// Disable merge_with_base.
+	mergeWithBase := false
+	action := &config.Action{
+		Name: "Print args",
+		Triggers: &config.Triggers{
+			PullRequest: &config.PullRequestTrigger{
+				MergeWithBase: &mergeWithBase,
+			},
+		},
+		Steps: []*rnpb.Step{
+			{Run: "echo merge-with-base-disabled"},
+		},
+	}
+	actionBytes, err := yaml.Marshal(action)
+	require.NoError(t, err)
+	serializedAction := base64.StdEncoding.EncodeToString(actionBytes)
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--serialized_action=" + serializedAction,
+		"--trigger_event=pull_request",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=feature",
+		"--target_repo_url=file://" + repoPath,
+		"--target_branch=base",
+		// Request a shallow fetch.
+		"--git_fetch_depth=1",
+		// Disable clean checkout fallback for this test since we expect to sync
+		// without errors.
+		"--fallback_to_clean_checkout=false",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+	checkRunnerResult(t, result)
+
+	runnerInvocation := getRunnerInvocation(t, app, result)
+	// With merge_with_base disabled, we shouldn't fetch full git history.
+	assert.NotContains(t, runnerInvocation.ConsoleBuffer, "Fetching full history")
+	if t.Failed() {
+		t.Log(runnerInvocation.ConsoleBuffer)
+	}
+}
+
 func TestCIRunner_PullRequest_FailedSync_CanRecoverAndRunCommand(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
@@ -1048,30 +1266,31 @@ func TestRunAction_RespectsCommitSha(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		wsPath := testfs.MakeTempDir(t)
-		repoPath, initialCommitSHA := makeGitRepo(t, workspaceContentsWithRunScript)
+		t.Run(fmt.Sprintf("setBranchName_%t", tc.setBranchName), func(t *testing.T) {
+			wsPath := testfs.MakeTempDir(t)
+			repoPath, initialCommitSHA := makeGitRepo(t, workspaceContentsWithRunScript)
 
-		baselineRunnerFlags := []string{
-			"--workflow_id=test-workflow",
-			"--action_name=Print args",
-			"--trigger_event=push",
-			"--pushed_repo_url=file://" + repoPath,
-			"--target_repo_url=file://" + repoPath,
-		}
-		// Start the app so the runner can use it as the BES backend.
-		app := buildbuddy.Run(t)
-		baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
-		if tc.setBranchName {
-			baselineRunnerFlags = append(baselineRunnerFlags, "--pushed_branch=master", "--target_branch=master")
-		}
+			baselineRunnerFlags := []string{
+				"--workflow_id=test-workflow",
+				"--action_name=Print args",
+				"--trigger_event=push",
+				"--pushed_repo_url=file://" + repoPath,
+				"--target_repo_url=file://" + repoPath,
+			}
+			// Start the app so the runner can use it as the BES backend.
+			app := buildbuddy.Run(t)
+			baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
+			if tc.setBranchName {
+				baselineRunnerFlags = append(baselineRunnerFlags, "--pushed_branch=master", "--target_branch=master")
+			}
 
-		runnerFlagsCommit1 := append(baselineRunnerFlags, "--commit_sha="+initialCommitSHA)
-		result := invokeRunner(t, runnerFlagsCommit1, []string{}, wsPath)
-		checkRunnerResult(t, result)
-		assert.Contains(t, result.Output, "args: {{ Hello world }}")
+			runnerFlagsCommit1 := append(baselineRunnerFlags, "--commit_sha="+initialCommitSHA)
+			result := invokeRunner(t, runnerFlagsCommit1, []string{}, wsPath)
+			checkRunnerResult(t, result)
+			assert.Contains(t, result.Output, "args: {{ Hello world }}")
 
-		// Commit changes to the print statement in the workflow config
-		modifiedWorkflowConfig := `
+			// Commit changes to the print statement in the workflow config
+			modifiedWorkflowConfig := `
 actions:
   - name: "Print args"
     triggers:
@@ -1080,37 +1299,38 @@ actions:
     bazel_commands:
       - run //:print_args -- "Switcheroo!"
 `
-		newCommitSha := testgit.CommitFiles(t, repoPath, map[string]string{"buildbuddy.yaml": modifiedWorkflowConfig})
+			newCommitSha := testgit.CommitFiles(t, repoPath, map[string]string{"buildbuddy.yaml": modifiedWorkflowConfig})
 
-		// When invoked with the initial commit sha, should not contain the modified print statement
-		result = invokeRunner(t, runnerFlagsCommit1, []string{}, wsPath)
-		if !tc.setBranchName {
-			// Older versions of Git do not support fetching non-HEAD commits by
-			// default. In this case, if pushed_branch is not set as a fallback, the
-			// fetch will fail. However, the default behavior for this has since
-			// changed and the old behavior been entirely removed as an option in
-			// https://patchwork.kernel.org/project/git/patch/20181217221625.1523-1-avarab@gmail.com/#22387021
-			if result.ExitCode != 0 {
-				require.NotEqual(t, 0, result.ExitCode)
-				// The DO_NOT_RECYCLE file should get created here since we failed
-				// to set up the workspace - recreate the workspace here to match
-				// what the executor would do.
-				require.True(t, testfs.Exists(t, wsPath, ".BUILDBUDDY_DO_NOT_RECYCLE"))
-				wsPath = testfs.MakeTempDir(t)
+			// When invoked with the initial commit sha, should not contain the modified print statement
+			result = invokeRunner(t, runnerFlagsCommit1, []string{}, wsPath)
+			if !tc.setBranchName {
+				// Older versions of Git do not support fetching non-HEAD commits by
+				// default. In this case, if pushed_branch is not set as a fallback, the
+				// fetch will fail. However, the default behavior for this has since
+				// changed and the old behavior been entirely removed as an option in
+				// https://patchwork.kernel.org/project/git/patch/20181217221625.1523-1-avarab@gmail.com/#22387021
+				if result.ExitCode != 0 {
+					require.NotEqual(t, 0, result.ExitCode)
+					// The DO_NOT_RECYCLE file should get created here since we failed
+					// to set up the workspace - recreate the workspace here to match
+					// what the executor would do.
+					require.True(t, testfs.Exists(t, wsPath, ".BUILDBUDDY_DO_NOT_RECYCLE"))
+					wsPath = testfs.MakeTempDir(t)
+				} else {
+					checkRunnerResult(t, result)
+					assert.Contains(t, result.Output, "args: {{ Hello world }}")
+				}
 			} else {
 				checkRunnerResult(t, result)
 				assert.Contains(t, result.Output, "args: {{ Hello world }}")
 			}
-		} else {
-			checkRunnerResult(t, result)
-			assert.Contains(t, result.Output, "args: {{ Hello world }}")
-		}
 
-		// When invoked with the new commit sha, should contain the modified print statement
-		runnerFlagsCommit2 := append(baselineRunnerFlags, "--commit_sha="+newCommitSha)
-		result = invokeRunner(t, runnerFlagsCommit2, []string{}, wsPath)
-		checkRunnerResult(t, result)
-		assert.Contains(t, result.Output, "args: {{ Switcheroo! }}")
+			// When invoked with the new commit sha, should contain the modified print statement
+			runnerFlagsCommit2 := append(baselineRunnerFlags, "--commit_sha="+newCommitSha)
+			result = invokeRunner(t, runnerFlagsCommit2, []string{}, wsPath)
+			checkRunnerResult(t, result)
+			assert.Contains(t, result.Output, "args: {{ Switcheroo! }}")
+		})
 	}
 }
 
@@ -1166,30 +1386,151 @@ func TestRunAction_PushedRepoOnly(t *testing.T) {
 	baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
 
 	for _, tc := range testCases {
-		runnerFlags := append(baselineRunnerFlags, tc.repoFlags...)
-		result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-		checkRunnerResult(t, result)
-		assert.Contains(t, result.Output, "args: {{ Hello world }}", tc.name)
+		t.Run(tc.name, func(t *testing.T) {
+			runnerFlags := append(baselineRunnerFlags, tc.repoFlags...)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			checkRunnerResult(t, result)
+			assert.Contains(t, result.Output, "args: {{ Hello world }}", tc.name)
 
-		// Check that metadata was reported correctly
-		runnerInvocation := getRunnerInvocation(t, app, result)
-		var workspaceStatusEvent *bespb.WorkspaceStatus
-		for _, e := range runnerInvocation.Event {
-			if e.BuildEvent.GetWorkspaceStatus() != nil {
-				workspaceStatusEvent = e.BuildEvent.GetWorkspaceStatus()
-				break
+			// Check that metadata was reported correctly
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			var workspaceStatusEvent *bespb.WorkspaceStatus
+			for _, e := range runnerInvocation.Event {
+				if e.BuildEvent.GetWorkspaceStatus() != nil {
+					workspaceStatusEvent = e.BuildEvent.GetWorkspaceStatus()
+					break
+				}
 			}
-		}
-		require.NotNil(t, workspaceStatusEvent, tc.name)
+			require.NotNil(t, workspaceStatusEvent, tc.name)
 
-		workspaceStatusMap := make(map[string]string, len(workspaceStatusEvent.Item))
-		for _, i := range workspaceStatusEvent.Item {
-			workspaceStatusMap[i.GetKey()] = i.GetValue()
-		}
+			workspaceStatusMap := make(map[string]string, len(workspaceStatusEvent.Item))
+			for _, i := range workspaceStatusEvent.Item {
+				workspaceStatusMap[i.GetKey()] = i.GetValue()
+			}
 
-		require.Equal(t, tc.expectedReportingValues["branch"], workspaceStatusMap["GIT_BRANCH"], tc.name)
-		require.Equal(t, tc.expectedReportingValues["commit"], workspaceStatusMap["COMMIT_SHA"], tc.name)
+			require.Equal(t, tc.expectedReportingValues["branch"], workspaceStatusMap["GIT_BRANCH"], tc.name)
+			require.Equal(t, tc.expectedReportingValues["commit"], workspaceStatusMap["COMMIT_SHA"], tc.name)
+		})
 	}
+}
+
+func TestRunAction_PushedTag(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, initialCommitSHA := makeGitRepo(t, workspaceContentsWithRunScript)
+
+	// Create a tag pointing at the initial commit
+	testshell.Run(t, repoPath, `git tag v1.0.0`)
+
+	testCases := []struct {
+		name                    string
+		repoFlags               []string
+		expectedReportingValues map[string]string
+	}{
+		{
+			name: "Pushed tag and commit sha",
+			repoFlags: []string{
+				"--pushed_tag=v1.0.0",
+				"--commit_sha=" + initialCommitSHA,
+			},
+			expectedReportingValues: map[string]string{
+				"branch": "",
+				"tag":    "v1.0.0",
+				"commit": initialCommitSHA,
+			},
+		},
+		{
+			name: "Just pushed tag",
+			repoFlags: []string{
+				"--pushed_tag=v1.0.0",
+			},
+			expectedReportingValues: map[string]string{
+				"branch": "",
+				"tag":    "v1.0.0",
+				"commit": initialCommitSHA,
+			},
+		},
+	}
+	baselineRunnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Print args",
+		"--trigger_event=push",
+		"--pushed_repo_url=file://" + repoPath,
+	}
+	// Start the app so the runner can use it as the BES backend.
+	app := buildbuddy.Run(t)
+	baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			runnerFlags := append(baselineRunnerFlags, tc.repoFlags...)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			checkRunnerResult(t, result)
+			assert.Contains(t, result.Output, "args: {{ Hello world }}", tc.name)
+
+			// Check that metadata was reported correctly
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			var workspaceStatusEvent *bespb.WorkspaceStatus
+			for _, e := range runnerInvocation.Event {
+				if e.BuildEvent.GetWorkspaceStatus() != nil {
+					workspaceStatusEvent = e.BuildEvent.GetWorkspaceStatus()
+					break
+				}
+			}
+			require.NotNil(t, workspaceStatusEvent, tc.name)
+
+			workspaceStatusMap := make(map[string]string, len(workspaceStatusEvent.Item))
+			for _, i := range workspaceStatusEvent.Item {
+				workspaceStatusMap[i.GetKey()] = i.GetValue()
+			}
+
+			require.Equal(t, tc.expectedReportingValues["branch"], workspaceStatusMap["GIT_BRANCH"], tc.name)
+			require.Equal(t, tc.expectedReportingValues["tag"], workspaceStatusMap["GIT_TAG"], tc.name)
+			require.Equal(t, tc.expectedReportingValues["commit"], workspaceStatusMap["COMMIT_SHA"], tc.name)
+		})
+	}
+}
+
+func TestRunAction_PushedTagWithoutCommitSHA(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, initialCommitSHA := makeGitRepo(t, workspaceContentsWithRunScript)
+
+	// Create a tag pointing at the initial commit
+	testshell.Run(t, repoPath, `git tag v1.0.0`)
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Print args",
+		"--trigger_event=push",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_tag=v1.0.0",
+	}
+	// Start the app so the runner can use it as the BES backend.
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+	checkRunnerResult(t, result)
+	assert.Contains(t, result.Output, "args: {{ Hello world }}")
+
+	// Check that metadata was reported correctly
+	runnerInvocation := getRunnerInvocation(t, app, result)
+	var workspaceStatusEvent *bespb.WorkspaceStatus
+	for _, e := range runnerInvocation.Event {
+		if e.BuildEvent.GetWorkspaceStatus() != nil {
+			workspaceStatusEvent = e.BuildEvent.GetWorkspaceStatus()
+			break
+		}
+	}
+	require.NotNil(t, workspaceStatusEvent)
+
+	workspaceStatusMap := make(map[string]string, len(workspaceStatusEvent.Item))
+	for _, i := range workspaceStatusEvent.Item {
+		workspaceStatusMap[i.GetKey()] = i.GetValue()
+	}
+
+	require.Equal(t, "", workspaceStatusMap["GIT_BRANCH"])
+	require.Equal(t, "v1.0.0", workspaceStatusMap["GIT_TAG"])
+	require.Equal(t, initialCommitSHA, workspaceStatusMap["COMMIT_SHA"])
 }
 
 func TestRunAction_PushedAndTargetBranchAreEqual(t *testing.T) {
@@ -1224,15 +1565,17 @@ func TestRunAction_PushedAndTargetBranchAreEqual(t *testing.T) {
 	baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
 
 	for _, tc := range testCases {
-		runnerFlags := baselineRunnerFlags
-		if tc.useSha {
-			runnerFlags = append(runnerFlags, "--commit_sha="+initialCommitSHA)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			runnerFlags := baselineRunnerFlags
+			if tc.useSha {
+				runnerFlags = append(runnerFlags, "--commit_sha="+initialCommitSHA)
+			}
 
-		result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-		checkRunnerResult(t, result)
-		assert.Contains(t, result.Output, "args: {{ Hello world }}", tc.name)
-		assert.NotContains(t, result.Output, "git merge", tc.name)
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			checkRunnerResult(t, result)
+			assert.Contains(t, result.Output, "args: {{ Hello world }}", tc.name)
+			assert.NotContains(t, result.Output, "git merge", tc.name)
+		})
 	}
 }
 
@@ -1269,8 +1612,8 @@ func TestGitCleanExclude(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
 	targetRepoPath, commitSHA := makeGitRepo(t, map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `sh_binary(name = "check_repo", srcs = ["check_repo.sh"])`,
+		"BUILD": `load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "check_repo", srcs = ["check_repo.sh"])`,
 		"check_repo.sh": `
 			cd "$BUILD_WORKSPACE_DIRECTORY"
 			echo "not_excluded.txt exists:" $([[ -e not_excluded.txt ]] && echo yes || echo no)
@@ -1319,10 +1662,10 @@ actions:
 func TestBazelWorkspaceDir(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
-	repoPath, commitSHA := makeGitRepo(t, map[string]string{
-		"subdir/WORKSPACE": "",
-		"subdir/BUILD":     `sh_test(name = "pass", srcs = ["pass.sh"])`,
-		"subdir/pass.sh":   "",
+	repoPath, _ := makeGitRepo(t, map[string]string{
+		"subdir/BUILD": `load("@rules_shell//shell:sh_test.bzl", "sh_test")
+sh_test(name = "pass", srcs = ["pass.sh"])`,
+		"subdir/pass.sh": "",
 		"subdir/.bazelrc": `
 # This role should take priority over the CI role.
 build --build_metadata=ROLE=TEST
@@ -1334,6 +1677,9 @@ actions:
   bazel_commands: [ 'bazel test :pass' ]
 `,
 	})
+	// Set up MODULE.bazel and MODULE.bazel.lock in the subdir.
+	testbazel.InitModule(t, filepath.Join(repoPath, "subdir"))
+	commitSHA := testgit.CommitAll(t, repoPath, "Init subdir bazel module")
 
 	runnerFlags := []string{
 		"--workflow_id=test-workflow",
@@ -1356,19 +1702,17 @@ actions:
 
 	checkRunnerResult(t, result)
 
-	in := getRunnerInvocation(t, app, result)
-	children := in.GetChildInvocations()
-	require.Equal(t, 1, len(children))
-	require.Equal(t, "TEST", children[0].GetRole())
+	childInv := getInnerInvocation(t, app, result)
+	require.Equal(t, "TEST", childInv.GetRole())
 }
 
 func TestHostedBazel_ApplyingAndDiscardingPatches(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
 	targetRepoPath, _ := makeGitRepo(t, map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `sh_test(name = "pass", srcs = ["pass.sh"])`,
-		"pass.sh":   "exit 0",
+		"BUILD": `load("@rules_shell//shell:sh_test.bzl", "sh_test")
+sh_test(name = "pass", srcs = ["pass.sh"])`,
+		"pass.sh": "exit 0",
 	})
 
 	// Start the app so the runner can use it as the BES backend.
@@ -1571,6 +1915,203 @@ func TestDisableBaseBranchMerging(t *testing.T) {
 	checkRunnerResult(t, result)
 }
 
+func TestMergeWithBase_FetchDepth1(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	// workspaceContentsWithRunScript enables merge_with_base (the default) with no
+	// merge_with_base_interval, so the runner should always merge with the base branch tip.
+	targetRepoPath, _ := makeGitRepo(t, workspaceContentsWithRunScript)
+	pushedRepoPath := testgit.MakeTempRepoClone(t, targetRepoPath)
+	// Create a PR branch with 2 commits.
+	testshell.Run(t, pushedRepoPath, `
+		git checkout -b pr-branch
+		touch feature1.sh
+		git add .
+		git commit -m "Add feature1.sh"
+		touch feature2.sh
+		git add .
+		git commit -m "Add feature2.sh"
+	`)
+	prCommitSHA := strings.TrimSpace(testshell.Run(t, pushedRepoPath, `git rev-parse HEAD`))
+	// Add a non-conflicting commit to master that the runner must merge in.
+	testshell.Run(t, targetRepoPath, `
+		touch base_change.sh
+		git add .
+		git commit -m "Add base_change.sh"
+	`)
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Print args",
+		"--trigger_event=pull_request",
+		"--pushed_repo_url=file://" + pushedRepoPath,
+		"--pushed_branch=pr-branch",
+		"--commit_sha=" + prCommitSHA,
+		"--target_repo_url=file://" + targetRepoPath,
+		"--target_branch=master",
+		// Set fetch depth=1. The runner should still fetch enough history to reach
+		// the merge base so that it can merge with the base branch.
+		"--git_fetch_depth=1",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	// The runner should not fail to find the merge base.
+	result := invokeRunner(t, runnerFlags, nil, wsPath)
+	checkRunnerResult(t, result)
+}
+
+func TestMergeWithBase_Skip_MergeBaseAlreadyInHistory(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, _ := makeGitRepo(t, workspaceContentsWithMergeBaseInterval)
+	boundary := time.Now().UTC().Truncate(3 * time.Hour)
+	baseCommitDate := boundary.Add(-time.Hour).Format(time.RFC3339)
+	firstCommitAfterBoundaryDate := boundary.Add(time.Minute).Format(time.RFC3339)
+	laterCommitAfterBoundaryDate := boundary.Add(2 * time.Minute).Format(time.RFC3339)
+	testshell.Run(t, repoPath, fmt.Sprintf(`
+		GIT_AUTHOR_DATE=%[1]q GIT_COMMITTER_DATE=%[1]q git commit --amend --no-edit --date=%[1]q
+
+		# Add the base commit in the interval, then create the PR from
+		# that commit.
+		touch base_change.sh
+		git add .
+		GIT_AUTHOR_DATE=%[2]q GIT_COMMITTER_DATE=%[2]q git commit -m "Base change"
+		git checkout -b pr-branch
+
+		# Add a later bad commit on the base branch in the same interval. The runner should not pull
+		# this in because it has already merged with a base commit in the current interval.
+		git checkout master
+		echo 'exit 1' > exit.sh
+		git add .
+		GIT_AUTHOR_DATE=%[3]q GIT_COMMITTER_DATE=%[3]q git commit -m "Fail"
+	`, baseCommitDate, firstCommitAfterBoundaryDate, laterCommitAfterBoundaryDate))
+	prCommitSHA := strings.TrimSpace(testshell.Run(t, repoPath, `git rev-parse pr-branch`))
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test",
+		"--trigger_event=pull_request",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=pr-branch",
+		"--commit_sha=" + prCommitSHA,
+		"--target_repo_url=file://" + repoPath,
+		"--target_branch=master",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	// The runner should skip merging with base because the PR already contains
+	// a base commit in the current interval.
+	result := invokeRunner(t, runnerFlags, nil, wsPath)
+	checkRunnerResult(t, result)
+}
+
+func TestMergeWithBase_Skip_BaseChangeWithinInterval_FetchDepth1(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	targetRepoPath, _ := makeGitRepo(t, workspaceContentsWithMergeBaseInterval)
+	boundary := time.Now().UTC().Truncate(3 * time.Hour)
+	baseCommitDate := boundary.Add(-time.Hour).Format(time.RFC3339)
+	firstCommitAfterBoundaryDate := boundary.Add(time.Minute).Format(time.RFC3339)
+	laterCommitAfterBoundaryDate := boundary.Add(2 * time.Minute).Format(time.RFC3339)
+	testshell.Run(t, targetRepoPath, fmt.Sprintf(`
+		GIT_AUTHOR_DATE=%[1]q GIT_COMMITTER_DATE=%[1]q git commit --amend --no-edit --date=%[1]q
+		touch base_change.sh
+		git add .
+		GIT_AUTHOR_DATE=%[2]q GIT_COMMITTER_DATE=%[2]q git commit -m "Base change"
+	`, baseCommitDate, firstCommitAfterBoundaryDate))
+	pushedRepoPath := testgit.MakeTempRepoClone(t, targetRepoPath)
+	// Create a PR branch with 2 commits on top of the oldest post-boundary base
+	// commit.
+	testshell.Run(t, pushedRepoPath, `
+		git checkout -b pr-branch
+		touch feature1.sh
+		git add .
+		git commit -m "Add feature1.sh"
+		touch feature2.sh
+		git add .
+		git commit -m "Add feature2.sh"
+	`)
+	prCommitSHA := strings.TrimSpace(testshell.Run(t, pushedRepoPath, `git rev-parse HEAD`))
+	testshell.Run(t, targetRepoPath, fmt.Sprintf(`
+		# Add a later bad commit in the same interval. Since the PR's merge base is
+		# already at the oldest post-boundary commit, the merge with base should be
+		# skipped and this commit ignored.
+		echo 'exit 1' > exit.sh
+		git add .
+		GIT_AUTHOR_DATE=%[1]q GIT_COMMITTER_DATE=%[1]q git commit -m "Fail"
+	`, laterCommitAfterBoundaryDate))
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test",
+		"--trigger_event=pull_request",
+		"--pushed_repo_url=file://" + pushedRepoPath,
+		"--pushed_branch=pr-branch",
+		"--commit_sha=" + prCommitSHA,
+		"--target_repo_url=file://" + targetRepoPath,
+		"--target_branch=master",
+		// Set fetch depth=1.
+		// The runner should still fetch the merge commit to determine whether to merge with base.
+		"--git_fetch_depth=1",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	// The runner should skip merging with base because the PR already contains
+	// a base commit in the current interval.
+	result := invokeRunner(t, runnerFlags, nil, wsPath)
+	checkRunnerResult(t, result)
+}
+
+func TestMergeWithBase_StaleBase(t *testing.T) {
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, _ := makeGitRepo(t, workspaceContentsWithMergeBaseInterval)
+	boundary := time.Now().UTC().Truncate(3 * time.Hour)
+	// Backdate the base commit far into the past, and create the PR branch from
+	// it so the PR's merge base is stale.
+	oldBaseDate := boundary.Add(-48 * time.Hour).Format(time.RFC3339)
+	// Date the bad commit just after the current interval boundary so it becomes
+	// the base commit that the PR is merged with. Add a later passing commit to
+	// verify the runner picks the oldest post-boundary commit rather than the tip.
+	badCommitDate := boundary.Add(time.Minute).Format(time.RFC3339)
+	laterPassingCommitDate := boundary.Add(2 * time.Minute).Format(time.RFC3339)
+	testshell.Run(t, repoPath, fmt.Sprintf(`
+		GIT_AUTHOR_DATE=%[1]q GIT_COMMITTER_DATE=%[1]q git commit --amend --no-edit --date=%[1]q
+		git checkout -b pr-branch
+
+		# Add a bad commit to master, dated just after the interval boundary. Since
+		# the PR's merge base is older than it, the merge with base should proceed
+		# and pull in the failing change.
+		git checkout master
+		echo 'exit 1' > exit.sh
+		git add .
+		GIT_AUTHOR_DATE=%[2]q GIT_COMMITTER_DATE=%[2]q git commit -m "Fail"
+
+		# Restore the script in a later commit in the same interval. If the runner
+		# merged the base branch tip instead of the oldest post-boundary commit,
+		# this test would pass.
+		echo 'exit "$1"' > exit.sh
+		git add .
+		GIT_AUTHOR_DATE=%[3]q GIT_COMMITTER_DATE=%[3]q git commit -m "Restore"
+	`, oldBaseDate, badCommitDate, laterPassingCommitDate))
+	prCommitSHA := strings.TrimSpace(testshell.Run(t, repoPath, `git rev-parse pr-branch`))
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test",
+		"--trigger_event=pull_request",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=pr-branch",
+		"--commit_sha=" + prCommitSHA,
+		"--target_repo_url=file://" + repoPath,
+		"--target_branch=master",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	result := invokeRunner(t, runnerFlags, nil, wsPath)
+	require.NotEqual(t, 0, result.ExitCode)
+}
+
 func TestFetchDepth1(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 	repoPath, initialCommitSHA := makeGitRepo(t, workspaceContentsWithGitLog)
@@ -1684,8 +2225,8 @@ func TestArtifactUploads_GRPCLog(t *testing.T) {
 
 func TestArtifactUploads_JVMLog(t *testing.T) {
 	workspaceSimulateOOM := map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"BUILD": `
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 sh_test(name = "simulate_oom", srcs = ["simulate_oom.sh"])
 `,
 		"simulate_oom.sh": `
@@ -1701,8 +2242,7 @@ actions:
       push: { branches: [ master ] }
     steps:
       - run: |
-          output_base=$(bazel info output_base)
-          bazel run :simulate_oom "$output_base"
+          bazel run :simulate_oom "$PWD/../output-base"
 `,
 	}
 
@@ -1762,8 +2302,83 @@ actions:
 	require.Contains(t, string(b), "java.lang.OutOfMemoryError")
 }
 
-func TestTimeout(t *testing.T) {
+func TestArtifactUploads_JavaLogOnBESUploadError(t *testing.T) {
+	workspaceSimulateBESUploadError := map[string]string{
+		"BUILD": `
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+sh_binary(name = "write_java_log", srcs = ["write_java_log.sh"])
+`,
+		"write_java_log.sh": `
+output_base="$1"
+echo "BES upload timed out" >> "$output_base/java.log"
+exit 38
+`,
+		"buildbuddy.yaml": `
+actions:
+  - name: "Test"
+    triggers:
+      pull_request: { branches: [ master ] }
+      push: { branches: [ master ] }
+    steps:
+      - run: |
+          bazel run :write_java_log "$PWD/../output-base"
+`,
+	}
+
 	wsPath := testfs.MakeTempDir(t)
+	repoPath, headCommitSHA := makeGitRepo(t, workspaceSimulateBESUploadError)
+
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test",
+		"--trigger_event=push",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=master",
+		"--commit_sha=" + headCommitSHA,
+		"--target_repo_url=file://" + repoPath,
+		"--target_branch=master",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+	runnerFlags = append(runnerFlags, "--cache_backend="+app.GRPCAddress())
+
+	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+	require.Equal(t, 38, result.ExitCode, "bazel should have exited with code 38 due to a BES upload failure")
+
+	runnerInvocation := getRunnerInvocation(t, app, result)
+	var javaLog *bespb.File
+	for _, tg := range runnerInvocation.GetTargetGroups() {
+		for _, target := range tg.GetTargets() {
+			for _, file := range target.GetFiles() {
+				if file.GetName() == "java.log" {
+					javaLog = file
+				}
+			}
+		}
+	}
+	require.NotNil(t, javaLog)
+	require.NotEmpty(t, javaLog.GetUri())
+
+	downloadURL := fmt.Sprintf(
+		"%s/file/download?invocation_id=%s&bytestream_url=%s",
+		app.HTTPURL(),
+		url.QueryEscape(runnerInvocation.GetInvocationId()),
+		url.QueryEscape(javaLog.GetUri()))
+	res, err := http.Get(downloadURL)
+	require.NoError(t, err)
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		b, _ := io.ReadAll(res.Body)
+		require.FailNowf(t, res.Status, "response body: %s", string(b))
+	}
+
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(b), "BES upload timed out")
+}
+
+func TestTimeout(t *testing.T) {
 	repoPath, _ := makeGitRepo(t, workspaceContentsWithRunScript)
 
 	baselineRunnerFlags := []string{
@@ -1780,21 +2395,43 @@ func TestTimeout(t *testing.T) {
 	app := buildbuddy.Run(t)
 	baselineRunnerFlags = append(baselineRunnerFlags, app.BESBazelFlags()...)
 
-	runnerFlags := baselineRunnerFlags
+	tests := []struct {
+		name           string
+		extraFlags     []string
+		expectedOutput string
+	}{
+		{
+			name:           "default timeout",
+			expectedOutput: "Aborting...",
+		},
+		{
+			name:           "free tier timeout",
+			extraFlags:     []string{"--timeout_reason=free_tier_limit"},
+			expectedOutput: "due to free tier limitations",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wsPath := testfs.MakeTempDir(t)
+			runnerFlags := append([]string{}, baselineRunnerFlags...)
+			runnerFlags = append(runnerFlags, tc.extraFlags...)
 
-	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
-	// Expect runner to timeout and exit early
-	require.NotEqual(t, 0, result.ExitCode)
-	runnerInvocation := getRunnerInvocation(t, app, result)
-	require.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, runnerInvocation.InvocationStatus)
-	require.Contains(t, runnerInvocation.ConsoleBuffer, "Remote run exceeded timeout")
+			result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+			// Expect runner to timeout and exit early
+			require.NotEqual(t, 0, result.ExitCode)
+			runnerInvocation := getRunnerInvocation(t, app, result)
+			require.Equal(t, inspb.InvocationStatus_COMPLETE_INVOCATION_STATUS, runnerInvocation.InvocationStatus)
+			require.Contains(t, runnerInvocation.ConsoleBuffer, "Remote run exceeded timeout")
+			require.Contains(t, runnerInvocation.ConsoleBuffer, tc.expectedOutput)
+		})
+	}
 }
 
 func TestBazelLock(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 	repoPath, _ := makeGitRepo(t, map[string]string{
-		"WORKSPACE":     "",
-		"BUILD":         `sh_test(name = "sleep_test", srcs = ["sleep_test.sh"], tags = ["no-sandbox"])`,
+		"BUILD": `load("@rules_shell//shell:sh_test.bzl", "sh_test")
+sh_test(name = "sleep_test", srcs = ["sleep_test.sh"], tags = ["no-sandbox"])`,
 		"sleep_test.sh": `touch "$TEST_STARTED" && sleep 99999999`,
 		"buildbuddy.yaml": `
 actions:
@@ -1828,13 +2465,12 @@ func TestRedactsLogs(t *testing.T) {
 	wsPath := testfs.MakeTempDir(t)
 
 	workspaceContentsWithBashCommands := map[string]string{
-		"WORKSPACE": `workspace(name = "test")`,
 		"buildbuddy.yaml": `
 actions:
   - name: "Echo secrets"
     steps:
       - run: |
-          echo '--remote_header=x-buildbuddy-api-key=secret hello okay password@uri fine'
+          echo '--remote_header=x-buildbuddy-api-key=secret hello okay uri://username:password@uri fine'
 `,
 	}
 	repoPath, headCommitSHA := makeGitRepo(t, workspaceContentsWithBashCommands)
@@ -1857,6 +2493,60 @@ actions:
 	checkRunnerResult(t, result)
 
 	runnerInvocation := getRunnerInvocation(t, app, result)
-	expectedStr := "--remote_header=<REDACTED> hello okay <REDACTED>@uri fine"
+	expectedStr := "--remote_header=<REDACTED> hello okay uri://username:<REDACTED>@uri fine"
 	assert.Contains(t, runnerInvocation.ConsoleBuffer, expectedStr)
+}
+
+func TestInvokeCLICommandViaBazelisk(t *testing.T) {
+	tmp := testfs.MakeTempDir(t)
+
+	// Create a fake CLI that supports a single command called
+	// "fake-cli-command" and fails if any other arguments are passed to it.
+	fakeCLI := testfs.WriteFile(t, tmp, "script.sh", `#!/usr/bin/env bash
+
+for arg in "$@"; do
+	if [[ "$arg" == "fake-cli-command" ]]; then
+		# When running the fake-cli-command, no other bazel-specific args
+		# should be passed.
+		if [[ "$*" != "fake-cli-command" ]]; then
+			echo >&2 "Got unexpected arguments: ${@@Q}"
+			exit 1
+		fi
+		echo "fake-cli-command: OK"
+		exit 0
+	fi
+done
+
+# For other bazel commands, do nothing.
+`)
+	testfs.MakeExecutable(t, tmp, "script.sh")
+
+	wsPath := testfs.MakeTempDir(t)
+	repoPath, _ := makeGitRepo(t, map[string]string{
+		".bazelversion": fakeCLI,
+		"buildbuddy.yaml": `
+actions:
+  - name: "Test"
+    steps:
+      - run: "bazelisk fake-cli-command"
+`,
+	})
+	runnerFlags := []string{
+		"--workflow_id=test-workflow",
+		"--action_name=Test",
+		"--trigger_event=push",
+		"--pushed_repo_url=file://" + repoPath,
+		"--pushed_branch=master",
+		"--target_repo_url=file://" + repoPath,
+		"--target_branch=master",
+		// Unset bazel_command so that we use the real bazelisk.
+		"--bazel_command=",
+		"--bazel_startup_flags=",
+	}
+	app := buildbuddy.Run(t)
+	runnerFlags = append(runnerFlags, app.BESBazelFlags()...)
+
+	result := invokeRunner(t, runnerFlags, []string{}, wsPath)
+	checkRunnerResult(t, result)
+	require.Contains(t, result.Output, "fake-cli-command: OK")
 }

@@ -3,13 +3,17 @@ package log
 import (
 	"log"
 	"os"
+
+	"github.com/buildbuddy-io/buildbuddy/cli/terminal"
 )
 
 const (
 	verboseEnvVarName = "BB_VERBOSE"
+)
 
-	debugPrefix   = "\x1b[33m[bb-debug]\x1b[m "
-	WarningPrefix = "\x1b[33mWarning:\x1b[m "
+var (
+	debugPrefix   = terminal.Esc(33) + "[bb-debug]" + terminal.Esc() + " "
+	WarningPrefix = terminal.Esc(33) + "Warning:" + terminal.Esc() + " "
 )
 
 var verbose bool
@@ -35,7 +39,7 @@ func Debug(v ...any) {
 	log.Print(append([]any{debugPrefix}, v...)...)
 }
 
-func Debugf(format string, v ...interface{}) {
+func Debugf(format string, v ...any) {
 	if !verbose {
 		return
 	}
@@ -46,7 +50,7 @@ func Print(v ...any) {
 	log.Print(v...)
 }
 
-func Printf(format string, v ...interface{}) {
+func Printf(format string, v ...any) {
 	log.Printf(format, v...)
 }
 
@@ -54,11 +58,11 @@ func Warn(v ...any) {
 	log.Print(append([]any{WarningPrefix}, v...)...)
 }
 
-func Warnf(format string, v ...interface{}) {
+func Warnf(format string, v ...any) {
 	log.Printf(WarningPrefix+format, v...)
 }
 
-func Fatalf(format string, v ...interface{}) {
+func Fatalf(format string, v ...any) {
 	log.Fatalf(format, v...)
 }
 

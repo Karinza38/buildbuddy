@@ -40,12 +40,12 @@ const (
 
 func getTestEnv(t *testing.T, users map[string]interfaces.UserInfo) *testenv.TestEnv {
 	te := testenv.GetTestEnv(t)
-	te.SetAuthenticator(testauth.NewTestAuthenticator(users))
+	te.SetAuthenticator(testauth.NewTestAuthenticator(t, users))
 	return te
 }
 
 func getAnonContext(t *testing.T, env environment.Env) context.Context {
-	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), env)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), env.GetAuthenticator())
 	if err != nil {
 		t.Errorf("error attaching user prefix: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestFileAtomicity(t *testing.T) {
 	lock := sync.RWMutex{}
 	eg, gctx := errgroup.WithContext(ctx)
 	r, buf := testdigest.RandomCASResourceBuf(t, 100000)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		eg.Go(func() error {
 			lock.Lock()
 			defer lock.Unlock()
@@ -482,7 +482,7 @@ func TestAsyncLoading(t *testing.T) {
 
 	// Write some pre-existing data.
 	resources := make([]*rspb.ResourceName, 0)
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		rn, buf := testdigest.RandomCASResourceBuf(t, 1000)
 		dest := filepath.Join(anonPath, rn.GetDigest().GetHash())
 		err := os.WriteFile(dest, buf, 0644)
@@ -509,7 +509,7 @@ func TestAsyncLoading(t *testing.T) {
 		}
 	}
 	// Write some more files, just to ensure the LRU is appended to.
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		r, buf := testdigest.RandomCASResourceBuf(t, 10000)
 		if err := dc.Set(ctx, r, buf); err != nil {
 			t.Fatal(err)
@@ -555,7 +555,7 @@ func testEviction(t *testing.T, rootDir string) {
 
 	// Fill the cache.
 	resources := make([]*rspb.ResourceName, 0)
-	for i := 0; i < 999; i++ {
+	for range 999 {
 		r, buf := testdigest.RandomCASResourceBuf(t, 10000)
 		err := dc.Set(ctx, r, buf)
 		require.NoError(t, err)
@@ -587,7 +587,7 @@ func testEviction(t *testing.T, rootDir string) {
 
 	// Write more data to push out what's left of the original digests.
 
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		r, buf := testdigest.RandomCASResourceBuf(t, 10000)
 		err := dc.Set(ctx, r, buf)
 		require.NoError(t, err)
@@ -640,7 +640,7 @@ func TestJanitorThread(t *testing.T) {
 	}
 	// Fill the cache.
 	resources := make([]*rspb.ResourceName, 0)
-	for i := 0; i < 999; i++ {
+	for range 999 {
 		r, buf := testdigest.RandomCASResourceBuf(t, 10000)
 		err := dc.Set(ctx, r, buf)
 		if err != nil {
@@ -832,7 +832,7 @@ func TestNonDefaultPartition(t *testing.T) {
 
 	// Anonymous user on default partition.
 	{
-		ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te)
+		ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
 		require.NoError(t, err)
 		r, buf := testdigest.RandomCASResourceBuf(t, 1000)
 
@@ -851,7 +851,7 @@ func TestNonDefaultPartition(t *testing.T) {
 	// Authenticated user on default partition.
 	{
 		ctx := te.GetAuthenticator().AuthContextFromAPIKey(context.Background(), testAPIKey1)
-		ctx, err = prefix.AttachUserPrefixToContext(ctx, te)
+		ctx, err = prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 		require.NoError(t, err)
 		r, buf := testdigest.RandomCASResourceBuf(t, 1000)
 
@@ -871,7 +871,7 @@ func TestNonDefaultPartition(t *testing.T) {
 	// Data should go to the default partition.
 	{
 		ctx := te.GetAuthenticator().AuthContextFromAPIKey(context.Background(), testAPIKey2)
-		ctx, err = prefix.AttachUserPrefixToContext(ctx, te)
+		ctx, err = prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 		require.NoError(t, err)
 		instanceName := "nonmatchingprefix"
 		r, buf := testdigest.NewRandomResourceAndBuf(t, 1000, rspb.CacheType_CAS, instanceName)
@@ -893,7 +893,7 @@ func TestNonDefaultPartition(t *testing.T) {
 	// Data should go to the matching partition.
 	{
 		ctx := te.GetAuthenticator().AuthContextFromAPIKey(context.Background(), testAPIKey2)
-		ctx, err = prefix.AttachUserPrefixToContext(ctx, te)
+		ctx, err = prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 		require.NoError(t, err)
 		instanceName := otherPartitionPrefix + "hello"
 		r, buf := testdigest.NewRandomResourceAndBuf(t, 1000, rspb.CacheType_CAS, instanceName)
@@ -923,7 +923,7 @@ func TestV2Layout(t *testing.T) {
 	dc, err := disk_cache.NewDiskCache(te, diskConfig, maxSizeBytes)
 	require.NoError(t, err)
 
-	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
 	require.NoError(t, err)
 	r, buf := testdigest.RandomCASResourceBuf(t, 1000)
 
@@ -1018,7 +1018,7 @@ func TestV2LayoutMigration(t *testing.T) {
 	require.NoError(t, err)
 	dc.WaitUntilMapped()
 
-	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
 	require.NoError(t, err)
 	testHash := "7e09daa1b85225442942ff853d45618323c56b85a553c5188cec2fd1009cd620"
 	{
@@ -1049,7 +1049,7 @@ func TestV2LayoutMigration(t *testing.T) {
 
 	{
 		ctx := te.GetAuthenticator().AuthContextFromAPIKey(context.Background(), testAPIKey)
-		ctx, err = prefix.AttachUserPrefixToContext(ctx, te)
+		ctx, err = prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 		require.NoError(t, err)
 
 		d := &repb.Digest{Hash: testHash, SizeBytes: 5}
@@ -1068,7 +1068,7 @@ func TestV2LayoutMigration(t *testing.T) {
 
 	{
 		ctx := te.GetAuthenticator().AuthContextFromAPIKey(context.Background(), testAPIKey)
-		ctx, err = prefix.AttachUserPrefixToContext(ctx, te)
+		ctx, err = prefix.AttachUserPrefixToContext(ctx, te.GetAuthenticator())
 		require.NoError(t, err)
 
 		d := &repb.Digest{Hash: testHash, SizeBytes: 5}

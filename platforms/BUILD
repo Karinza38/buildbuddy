@@ -1,83 +1,40 @@
-load("@io_buildbuddy_buildbuddy_toolchain//:rules.bzl", "UBUNTU20_04_IMAGE")
-load("@local_config_platform//:constraints.bzl", "HOST_CONSTRAINTS")
-load(":platforms.bzl", "get_parent_from_constraints")
-
 package(default_visibility = ["//visibility:public"])
 
+# Target this platform with --platforms for a static build linked against musl libc.
+# Only meant to be used as a target platform.
+#
+# The musl platforms also set the "static" Go build tag, so Go sources can opt
+# out of dependencies that cannot be linked statically (e.g. libraries that
+# dlopen shared objects at runtime). Setting the tag on the platform itself
+# rather than in a bazelrc config means it applies however the platform is
+# selected, whether via --config=static, --platforms, or the
+# linux_x86_64_musl_alias transition in //rules:platform_transitions.bzl.
 platform(
-    name = "linux",
-    constraint_values = [
-        "@platforms//os:linux",
-        # This helps us differentiate between the default local platform, which does not have this,
-        # and the remote platform, which does have this.
-        # For more information, see //toolchains:BUILD comments.
-        #
-        # We can remove this constraint value once we migrated to a hermetic toolchain.
-        "@bazel_tools//tools/cpp:gcc",
-    ],
-    exec_properties = {
-        "OSFamily": "Linux",
-        "dockerNetwork": "off",
-    },
+    name = "linux_x86_64_musl",
+    flags = ["--@io_bazel_rules_go//go/config:tags=static"],
+    parents = ["@llvm//platforms:linux_x86_64_musl"],
+)
+
+# Target this platform with --platforms for a static build linked against musl libc.
+# Only meant to be used as a target platform.
+platform(
+    name = "linux_arm64_musl",
+    flags = ["--@io_bazel_rules_go//go/config:tags=static"],
+    parents = ["@llvm//platforms:linux_arm64_musl"],
 )
 
 platform(
     name = "linux_x86_64",
-    constraint_values = ["@platforms//cpu:x86_64"],
-    exec_properties = {"container-image": "docker://" + UBUNTU20_04_IMAGE},
-    parents = [":linux"],
-)
-
-platform(
-    name = "macos",
-    constraint_values = ["@platforms//os:macos"],
-    exec_properties = {
-        "OSFamily": "darwin",
-    },
-)
-
-platform(
-    name = "macos_x86_64",
-    constraint_values = ["@platforms//cpu:x86_64"],
-    exec_properties = {
-        "Arch": "amd64",
-    },
-    parents = [":macos"],
-)
-
-platform(
-    name = "macos_arm64",
-    constraint_values = ["@platforms//cpu:arm64"],
-    exec_properties = {
-        "Arch": "arm64",
-    },
-    parents = [":macos"],
-)
-
-platform(
-    name = "local_config_platform",
-    constraint_values = HOST_CONSTRAINTS,
-    parents = [get_parent_from_constraints(HOST_CONSTRAINTS)],
-)
-
-# Target this platforms with --platforms for a static build linked against musl libc.
-# Only meant to be used as a target platform.
-platform(
-    name = "linux_x86_64_musl",
     constraint_values = [
-        "@platforms//cpu:x86_64",
         "@platforms//os:linux",
-        "//toolchains:musl_on",
+        "@platforms//cpu:x86_64",
     ],
 )
 
-# Target this platforms with --platforms for a static build linked against musl libc.
-# Only meant to be used as a target platform.
 platform(
-    name = "linux_arm64_musl",
+    name = "linux_arm64",
     constraint_values = [
-        "@platforms//cpu:arm64",
         "@platforms//os:linux",
-        "//toolchains:musl_on",
+        "@platforms//cpu:arm64",
     ],
 )

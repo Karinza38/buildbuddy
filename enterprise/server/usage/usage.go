@@ -5,31 +5,36 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/url"
 	"strconv"
 	"time"
 
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column/orderedmap"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
+	"github.com/buildbuddy-io/buildbuddy/server/util/region"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
 	"github.com/go-redis/redis/v8"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 
 	usage_config "github.com/buildbuddy-io/buildbuddy/enterprise/server/usage/config"
+	olaptables "github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
 )
 
 var (
-	region = flag.String("app.region", "", "The region in which the app is running.")
+	writeToOLAP = flag.Bool("app.write_usage_to_olap_db", false, "If true, write usage data to OLAP DB in addition to the primary DB write.")
 )
 
 const (
@@ -53,16 +58,16 @@ const (
 	// to Redis itself.
 	periodSettlingTime = 10 * time.Second
 
-	// redisKeyTTL defines how long usage keys have to live before they are
+	// RedisKeyTTL defines how long usage keys have to live before they are
 	// deleted automatically by Redis.
 	//
 	// Keys should live for at least 2 usage periods since periods
 	// aren't finalized until the period is past, plus some wiggle room for Redis
 	// latency. We add a few more periods on top of that, in case
 	// flushing fails due to transient errors.
-	redisKeyTTL = 5 * periodDuration
+	RedisKeyTTL = 5 * periodDuration
 
-	// Redis storage layout for buffered usage counts (V2):
+	// Redis storage layout for buffered usage counts:
 	//
 	// "usage/collections/{period}" points to a set of "collection" objects
 	// where each is an encoded `Collection` struct. The Collection struct is
@@ -80,6 +85,18 @@ const (
 	redisUsageKeyPrefix       = "usage/"
 	redisCollectionsKeyPrefix = redisUsageKeyPrefix + "collections/"
 	redisCountsKeyPrefix      = redisUsageKeyPrefix + "counts/"
+
+	// Redis storage layout for OLAP-format usage data, which allow arbitrary
+	// SKUs and labels:
+	//
+	// "usage/v2/collections/{period}" points to a set of encoded
+	// `OLAPCollection` structs. Each OLAPCollection contains a group ID
+	// and labels map.
+	//
+	// "usage/v2/counts/{period}/{encode(olapCollection)}" holds a map of
+	// per-SKU usage counts for each `OLAPCollection` within the period.
+	redisOLAPCollectionsKeyPrefix = redisUsageKeyPrefix + "v2/collections/"
+	redisOLAPCountsKeyPrefix      = redisUsageKeyPrefix + "v2/counts/"
 
 	// Time format used to store Redis keys.
 	// Example: 2020-01-01T00:00:00Z
@@ -117,6 +134,8 @@ type tracker struct {
 	rdb    redis.UniversalClient
 	clock  clockwork.Clock
 	region string
+	// See docs for [olaptables.RawUsage.BufferID]
+	bufferID string
 
 	flushLock interfaces.DistributedLock
 	stopFlush chan struct{}
@@ -135,16 +154,17 @@ func RegisterTracker(env *real_environment.RealEnv) error {
 		return err
 	}
 	env.SetUsageTracker(ut)
-	ut.StartDBFlush()
+	ut.startDBFlush()
 	env.GetHealthChecker().RegisterShutdownFunction(func(ctx context.Context) error {
-		ut.StopDBFlush()
+		ut.stopDBFlush()
 		return nil
 	})
 	return nil
 }
 
 func NewTracker(env environment.Env, clock clockwork.Clock, flushLock interfaces.DistributedLock) (*tracker, error) {
-	if *region == "" {
+	appRegion := region.ConfiguredAppRegion()
+	if appRegion == "" {
 		return nil, status.FailedPreconditionError("Usage tracking requires app.region to be configured.")
 	}
 	if env.GetDefaultRedisClient() == nil {
@@ -153,25 +173,32 @@ func NewTracker(env environment.Env, clock clockwork.Clock, flushLock interfaces
 	if env.GetMetricsCollector() == nil {
 		return nil, status.FailedPreconditionError("Metrics Collector must be configured for usage tracker.")
 	}
+	if *writeToOLAP && env.GetOLAPDBHandle() == nil {
+		return nil, status.FailedPreconditionError("OLAP DB handle must be configured for usage tracker when 'app.write_usage_to_olap_db' is true.")
+	}
 	return &tracker{
 		env:       env,
 		rdb:       env.GetDefaultRedisClient(),
-		region:    *region,
+		region:    appRegion,
 		clock:     clock,
 		flushLock: flushLock,
 		stopFlush: make(chan struct{}),
+		bufferID:  fmt.Sprintf("%s:redis", appRegion),
 	}, nil
 }
 
 // emitMetrics emit metrics that are eventually exposed to consumers.
-func (ut *tracker) emitMetrics(groupID string, uc *tables.UsageCounts) {
-	labels := prometheus.Labels{metrics.GroupID: groupID}
+func (ut *tracker) emitMetrics(groupID string, origin string, uc *tables.UsageCounts) {
+	if origin == "" {
+		origin = "external"
+	}
+	exportedLabels := prometheus.Labels{metrics.GroupID: groupID, metrics.CacheRequestOrigin: origin}
 	if uc.TotalDownloadSizeBytes > 0 {
-		metrics.CacheDownloadSizeBytesExported.With(labels).Add(float64(uc.TotalDownloadSizeBytes))
+		metrics.CacheDownloadSizeBytesExported.With(exportedLabels).Add(float64(uc.TotalDownloadSizeBytes))
 	}
 
 	if uc.TotalUploadSizeBytes > 0 {
-		metrics.CacheUploadSizeBytesExported.With(labels).Add(float64(uc.TotalUploadSizeBytes))
+		metrics.CacheUploadSizeBytesExported.With(exportedLabels).Add(float64(uc.TotalUploadSizeBytes))
 	}
 
 	if uc.CASCacheHits > 0 {
@@ -201,6 +228,9 @@ func (ut *tracker) Increment(ctx context.Context, labels *tables.UsageLabels, uc
 		}
 		return err
 	}
+	if u.IsImpersonating() {
+		return nil
+	}
 	groupID := u.GetGroupID()
 
 	counts, err := countsToMap(uc)
@@ -213,28 +243,93 @@ func (ut *tracker) Increment(ctx context.Context, labels *tables.UsageLabels, uc
 
 	t := ut.currentPeriod()
 
-	collection := &Collection{
-		GroupID:     groupID,
-		UsageLabels: *labels,
+	collection := &usageutil.Collection{
+		GroupID: groupID,
+		Origin:  labels.Origin,
+		Client:  labels.Client,
+		Server:  labels.Server,
+		Proxy:   labels.Proxy,
 	}
 	// Increment the hash values
-	encodedCollection := encodeCollection(collection)
+	encodedCollection := usageutil.EncodeCollection(collection)
 	countsKey := countsRedisKey(t, encodedCollection)
-	if err := ut.env.GetMetricsCollector().IncrementCountsWithExpiry(ctx, countsKey, counts, redisKeyTTL); err != nil {
+	if err := ut.env.GetMetricsCollector().IncrementCountsWithExpiry(ctx, countsKey, counts, RedisKeyTTL); err != nil {
 		return status.WrapError(err, "increment counts in redis")
 	}
 	// Add the collection hash to the set of collections with usage
-	if err := ut.env.GetMetricsCollector().SetAddWithExpiry(ctx, collectionsRedisKey(t), redisKeyTTL, encodedCollection); err != nil {
+	if err := ut.env.GetMetricsCollector().SetAddWithExpiry(ctx, collectionsRedisKey(t), RedisKeyTTL, encodedCollection); err != nil {
 		return status.WrapError(err, "add collection hash to set in redis")
 	}
 
-	ut.emitMetrics(groupID, uc)
+	ut.emitMetrics(groupID, labels.Origin, uc)
 	return nil
 }
 
-// StartDBFlush starts a goroutine that periodically flushes usage data from
+func (ut *tracker) IncrementOLAP(ctx context.Context, labels sku.Labels, skuCounts map[sku.SKU]int64) error {
+	if !*writeToOLAP {
+		return nil
+	}
+
+	u, err := ut.env.GetAuthenticator().AuthenticatedUser(ctx)
+	if err != nil {
+		if authutil.IsAnonymousUserError(err) && ut.env.GetAuthenticator().AnonymousUsageEnabled(ctx) {
+			// Don't track anonymous usage for now.
+			return nil
+		}
+		return err
+	}
+	if u.IsImpersonating() {
+		return nil
+	}
+	groupID := u.GetGroupID()
+
+	// Validate counts: 0 is fine (and maybe expected in some cases), but
+	// negative values probably indicate a bug or a bad request that we aren't
+	// guarding against, so trigger an alert and skip the bad SKU.
+	hasPositiveCount := false
+	for usageSKU, count := range skuCounts {
+		if count == 0 {
+			continue
+		}
+		if count < 0 {
+			alert.CtxUnexpectedEvent(ctx, "usage_increment_olap_negative_count", "Tried to increment usage count by negative value: labels=%+#v, sku=%s, count=%d", labels, usageSKU, count)
+			continue
+		}
+		hasPositiveCount = true
+	}
+	if !hasPositiveCount {
+		return nil
+	}
+
+	t := ut.currentPeriod()
+
+	collectionsKey := olapCollectionsRedisKey(t)
+	olapCollection := &usageutil.OLAPCollection{
+		GroupID: groupID,
+		Labels:  labels,
+	}
+	encodedOLAPCollection := usageutil.EncodeOLAPCollection(olapCollection)
+	countsKey := olapCountsRedisKey(t, encodedOLAPCollection)
+
+	// In redis, `countsKey` stores a hash (map) with per-SKU counts.
+	for usageSKU, count := range skuCounts {
+		if count <= 0 {
+			continue
+		}
+		if err := ut.env.GetMetricsCollector().IncrementCountWithExpiry(ctx, countsKey, usageSKU.String(), count, RedisKeyTTL); err != nil {
+			return status.WrapError(err, "increment OLAP count in redis")
+		}
+	}
+	// Add the OLAP collection to the set of collections with usage.
+	if err := ut.env.GetMetricsCollector().SetAddWithExpiry(ctx, collectionsKey, RedisKeyTTL, encodedOLAPCollection); err != nil {
+		return status.WrapError(err, "add OLAP collection to set in redis")
+	}
+	return nil
+}
+
+// startDBFlush starts a goroutine that periodically flushes usage data from
 // Redis to the DB.
-func (ut *tracker) StartDBFlush() {
+func (ut *tracker) startDBFlush() {
 	go func() {
 		ctx := context.Background()
 		ticker := time.NewTicker(flushInterval)
@@ -243,7 +338,7 @@ func (ut *tracker) StartDBFlush() {
 			select {
 			case <-ticker.C:
 				if err := ut.FlushToDB(ctx); err != nil {
-					alert.UnexpectedEvent("usage_data_flush_failed", "Error flushing usage data to DB: %s", err)
+					log.CtxErrorf(ctx, "Error flushing usage data to DB: %s", err)
 				}
 			case <-ut.stopFlush:
 				return
@@ -252,8 +347,8 @@ func (ut *tracker) StartDBFlush() {
 	}()
 }
 
-// StopDBFlush cancels the goroutine started by StartDBFlush.
-func (ut *tracker) StopDBFlush() {
+// stopDBFlush cancels the goroutine started by StartDBFlush.
+func (ut *tracker) stopDBFlush() {
 	ut.stopFlush <- struct{}{}
 }
 
@@ -296,6 +391,33 @@ func (ut *tracker) flushToDB(ctx context.Context) error {
 	ctx, cancel = context.WithDeadline(ctx, deadline.Add(-5*time.Second))
 	defer cancel()
 
+	// Perform MySQL and ClickHouse flushes concurrently, so that if the MySQL
+	// flush takes too long we can still try to flush to ClickHouse.
+	var eg errgroup.Group
+
+	// Flush MySQL buffer (v1 keys)
+	eg.Go(func() error {
+		if err := ut.flushPrimaryDBBuffer(ctx, redisCleanupCtx); err != nil {
+			return fmt.Errorf("flush buffered usage data to primary DB: %w", err)
+		}
+		return nil
+	})
+
+	// Flush ClickHouse buffer (v2 keys) if enabled
+	if *writeToOLAP {
+		eg.Go(func() error {
+			if err := ut.flushOLAPBuffer(ctx, redisCleanupCtx); err != nil {
+				return fmt.Errorf("flush buffered usage data to ClickHouse: %w", err)
+			}
+			return nil
+		})
+	}
+
+	return eg.Wait()
+}
+
+// flushPrimaryDBBuffer reads from the v1 Redis buffer and writes to MySQL.
+func (ut *tracker) flushPrimaryDBBuffer(ctx context.Context, redisCleanupCtx context.Context) error {
 	// Loop through usage periods starting from the oldest period
 	// that may exist in Redis (based on key expiration time) and looping up until
 	// we hit a period which is not yet "settled".
@@ -323,13 +445,13 @@ func (ut *tracker) flushToDB(ctx context.Context) error {
 			if !ok {
 				// Collection contains a new column; let a newer app flush
 				// instead.
-				log.Infof("Usage collection %q for period %s contains column not yet supported by this app; will let a newer app flush this period's data.", encodedCollection, p)
+				log.CtxInfof(ctx, "Usage collection %q for period %s contains column not yet supported by this app; will let a newer app flush this period's data.", encodedCollection, p)
 				return nil
 			}
 		}
 
 		for _, encodedCollection := range encodedCollections {
-			collection, _, err := decodeCollection(encodedCollection)
+			collection, _, err := usageutil.DecodeCollection(encodedCollection)
 			if err != nil {
 				return status.WrapError(err, "decode collection")
 			}
@@ -340,7 +462,15 @@ func (ut *tracker) flushToDB(ctx context.Context) error {
 				return err
 			}
 			if len(h) == 0 {
-				alert.UnexpectedEvent("usage_unexpected_empty_hash_in_redis", "Usage counts in Redis are unexpectedly empty for key %q", countsKey)
+				// Normally every collection key should have a corresponding
+				// counts key containing a non-empty hash, but sometimes we may
+				// be missing counts if there are transient redis issues such as
+				// restarts or resharding events (e.g. when adding redis shards
+				// or temporarily losing connection to a shard). Increment a
+				// metric so we can track how often this happens and alert if it
+				// happens too often.
+				log.CtxInfof(ctx, "Usage counts in Redis are empty for key %q", countsKey)
+				metrics.UsageTrackerMissingCollectionCountsCount.Inc()
 				continue
 			}
 			counts, err := stringMapToCounts(h)
@@ -348,9 +478,12 @@ func (ut *tracker) flushToDB(ctx context.Context) error {
 				return err
 			}
 			// Update counts in the DB
-			if err := ut.flushCounts(ctx, collection.GroupID, p, &collection.UsageLabels, counts); err != nil {
+			groupID := collection.GroupID
+			labels := collection.UsageLabels()
+			if err := ut.flushCountsToPrimaryDB(ctx, groupID, p, labels, counts); err != nil {
 				return err
 			}
+
 			// Remove the collection data from Redis now that it has been
 			// flushed to the DB.
 			pipe := ut.rdb.TxPipeline()
@@ -364,7 +497,86 @@ func (ut *tracker) flushToDB(ctx context.Context) error {
 	return nil
 }
 
-func (ut *tracker) flushCounts(ctx context.Context, groupID string, p period, labels *tables.UsageLabels, counts *tables.UsageCounts) error {
+// flushOLAPBuffer reads from the v2 Redis buffer and writes to ClickHouse.
+// The v2 buffer stores data in OLAP format (SKU + labels map).
+func (ut *tracker) flushOLAPBuffer(ctx context.Context, redisCleanupCtx context.Context) error {
+	var olapRows []*olaptables.RawUsage
+	cleanupPipe := ut.rdb.Pipeline()
+
+	// Loop through usage periods starting from the oldest period
+	// that may exist in Redis (based on key expiration time) and looping up until
+	// we hit a period which is not yet "settled".
+	oldestPeriod := ut.oldestWritablePeriod()
+	for p := oldestPeriod; ut.isSettled(p); p = p.Next() {
+		// Read usage counts from redis
+		collectionsKey := olapCollectionsRedisKey(p)
+		encodedCollections, err := ut.rdb.SMembers(ctx, collectionsKey).Result()
+		if err != nil {
+			return err
+		}
+		if len(encodedCollections) == 0 {
+			continue
+		}
+
+		if p.Equal(oldestPeriod) {
+			alert.UnexpectedEvent("usage_olap_flush_not_keeping_up", "Flushing OLAP usage data that is close to redis TTL - some usage data may be lost")
+		}
+
+		for _, encodedCollection := range encodedCollections {
+			collection, err := usageutil.DecodeOLAPCollection(encodedCollection)
+			if err != nil {
+				return status.WrapError(err, "decode OLAP collection")
+			}
+
+			// Read the counts from Redis (hash of SKU => count)
+			countsKey := olapCountsRedisKey(p, encodedCollection)
+			counts, err := ut.rdb.HGetAll(ctx, countsKey).Result()
+			if err != nil {
+				if err == redis.Nil {
+					alert.UnexpectedEvent("usage_unexpected_empty_olap_count_in_redis", "OLAP usage count in Redis is unexpectedly empty for key %q", countsKey)
+					continue
+				}
+				return err
+			}
+
+			for key, countStr := range counts {
+				count, err := strconv.ParseInt(countStr, 10, 64)
+				if err != nil {
+					return status.WrapError(err, "parse OLAP count in Redis")
+				}
+				olapRows = append(olapRows, &olaptables.RawUsage{
+					GroupID:     collection.GroupID,
+					SKU:         sku.SKU(key),
+					Labels:      orderedmap.FromMap(collection.Labels),
+					PeriodStart: p.Start(),
+					BufferID:    ut.bufferID,
+					Count:       count,
+				})
+			}
+
+			cleanupPipe.SRem(redisCleanupCtx, collectionsKey, encodedCollection)
+			cleanupPipe.Del(redisCleanupCtx, countsKey)
+		}
+	}
+
+	// Flush accumulated OLAP rows.
+	if len(olapRows) > 0 {
+		if err := ut.env.GetOLAPDBHandle().FlushUsages(ctx, olapRows); err != nil {
+			return status.WrapError(err, "flush OLAP usage records")
+		}
+	}
+
+	// Now that we've flushed, clean up the redis buffers. Note that if this
+	// cleanup fails, we may wind up flushing the same data again. The Usage
+	// view is responsible for deduping rows in order to handle this case.
+	if _, err := cleanupPipe.Exec(redisCleanupCtx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (ut *tracker) flushCountsToPrimaryDB(ctx context.Context, groupID string, p period, labels *tables.UsageLabels, counts *tables.UsageCounts) error {
 	dbh := ut.env.GetDBHandle()
 	return dbh.Transaction(ctx, func(tx interfaces.DB) error {
 		tu := &tables.Usage{
@@ -399,12 +611,16 @@ func (ut *tracker) flushCounts(ctx context.Context, groupID string, p period, la
 				AND period_start_usec = ?
 				AND origin = ?
 				AND client = ?
+				AND server = ?
+				AND proxy = ?
 			`+dbh.SelectForUpdateModifier(),
 			tu.Region,
 			tu.GroupID,
 			tu.PeriodStartUsec,
 			tu.Origin,
 			tu.Client,
+			tu.Server,
+			tu.Proxy,
 		).Take(&tables.Usage{})
 		if err != nil && !db.IsRecordNotFound(err) {
 			return err
@@ -427,7 +643,7 @@ func (ut *tracker) currentPeriod() period {
 }
 
 func (ut *tracker) oldestWritablePeriod() period {
-	return periodStartingAt(ut.clock.Now().Add(-redisKeyTTL))
+	return periodStartingAt(ut.clock.Now().Add(-RedisKeyTTL))
 }
 
 func (ut *tracker) lastSettledPeriod() period {
@@ -444,7 +660,7 @@ func (ut *tracker) isSettled(c period) bool {
 // only fields that are supported by this app; i.e. it returns false if the
 // Collection was written by a newer app.
 func (ut *tracker) supportsCollection(ctx context.Context, encodedCollection string) (bool, error) {
-	_, vals, err := decodeCollection(encodedCollection)
+	_, vals, err := usageutil.DecodeCollection(encodedCollection)
 	if err != nil {
 		return false, nil
 	}
@@ -511,51 +727,20 @@ func (c period) String() string {
 	return c.Start().Format(redisTimeKeyFormat)
 }
 
-type Collection struct {
-	// TODO: maybe make GroupID a field of tables.UsageLabels.
-	GroupID string
-	tables.UsageLabels
-}
-
-// encodeCollection encodes the collection to a human readable format.
-func encodeCollection(c *Collection) string {
-	// Using a handwritten encoding scheme for performance reasons (this
-	// runs on every cache request).
-	s := "group_id=" + c.GroupID
-	if c.UsageLabels.Origin != "" {
-		s += "&origin=" + url.QueryEscape(c.UsageLabels.Origin)
-	}
-	if c.UsageLabels.Client != "" {
-		s += "&client=" + url.QueryEscape(c.UsageLabels.Client)
-	}
-	return s
-}
-
-// decodeCollection decodes a string encoded using encodeCollection.
-// It returns the raw url.Values so that apps can detect collections encoded
-// by newer apps.
-func decodeCollection(s string) (*Collection, url.Values, error) {
-	q, err := url.ParseQuery(s)
-	if err != nil {
-		return nil, nil, err
-	}
-	c := &Collection{
-		GroupID: q.Get("group_id"),
-		UsageLabels: tables.UsageLabels{
-			// Note: these need to match the DB field names.
-			Origin: q.Get("origin"),
-			Client: q.Get("client"),
-		},
-	}
-	return c, q, nil
-}
-
 func collectionsRedisKey(c period) string {
 	return fmt.Sprintf("%s%s", redisCollectionsKeyPrefix, c)
 }
 
 func countsRedisKey(c period, encodedCollection string) string {
 	return fmt.Sprintf("%s%s/%s", redisCountsKeyPrefix, c, encodedCollection)
+}
+
+func olapCollectionsRedisKey(c period) string {
+	return fmt.Sprintf("%s%s", redisOLAPCollectionsKeyPrefix, c)
+}
+
+func olapCountsRedisKey(c period, encodedOLAPCollection string) string {
+	return fmt.Sprintf("%s%s/%s", redisOLAPCountsKeyPrefix, c, encodedOLAPCollection)
 }
 
 func countsToMap(tu *tables.UsageCounts) (map[string]int64, error) {
@@ -596,6 +781,36 @@ func countsToMap(tu *tables.UsageCounts) (map[string]int64, error) {
 	if tu.MemoryGBUsec > 0 {
 		counts["memory_gb_usec"] = tu.MemoryGBUsec
 	}
+	if tu.LinuxArm64ExecutionBurstableComputeDurationUsec > 0 {
+		counts["linux_arm64_execution_burstable_compute_duration_usec"] = tu.LinuxArm64ExecutionBurstableComputeDurationUsec
+	}
+	if tu.LinuxArm64ExecutionComputeDurationUsec > 0 {
+		counts["linux_arm64_execution_compute_duration_usec"] = tu.LinuxArm64ExecutionComputeDurationUsec
+	}
+	if tu.LinuxX86_64ExecutionBurstableComputeDurationUsec > 0 {
+		counts["linux_x86_64_execution_burstable_compute_duration_usec"] = tu.LinuxX86_64ExecutionBurstableComputeDurationUsec
+	}
+	if tu.LinuxX86_64ExecutionComputeDurationUsec > 0 {
+		counts["linux_x86_64_execution_compute_duration_usec"] = tu.LinuxX86_64ExecutionComputeDurationUsec
+	}
+	if tu.DarwinArm64ExecutionBurstableComputeDurationUsec > 0 {
+		counts["darwin_arm64_execution_burstable_compute_duration_usec"] = tu.DarwinArm64ExecutionBurstableComputeDurationUsec
+	}
+	if tu.DarwinArm64ExecutionComputeDurationUsec > 0 {
+		counts["darwin_arm64_execution_compute_duration_usec"] = tu.DarwinArm64ExecutionComputeDurationUsec
+	}
+	if tu.DarwinX86_64ExecutionBurstableComputeDurationUsec > 0 {
+		counts["darwin_x86_64_execution_burstable_compute_duration_usec"] = tu.DarwinX86_64ExecutionBurstableComputeDurationUsec
+	}
+	if tu.DarwinX86_64ExecutionComputeDurationUsec > 0 {
+		counts["darwin_x86_64_execution_compute_duration_usec"] = tu.DarwinX86_64ExecutionComputeDurationUsec
+	}
+	if tu.LocalSnapshotSavedBytes > 0 {
+		counts["local_snapshot_saved_bytes"] = tu.LocalSnapshotSavedBytes
+	}
+	if tu.RemoteSnapshotSavedBytes > 0 {
+		counts["remote_snapshot_saved_bytes"] = tu.RemoteSnapshotSavedBytes
+	}
 	return counts, nil
 }
 
@@ -623,5 +838,15 @@ func stringMapToCounts(h map[string]string) (*tables.UsageCounts, error) {
 		TotalCachedActionExecUsec:            hInt64["total_cached_action_exec_usec"],
 		CPUNanos:                             hInt64["cpu_nanos"],
 		MemoryGBUsec:                         hInt64["memory_gb_usec"],
+		LinuxArm64ExecutionBurstableComputeDurationUsec:   hInt64["linux_arm64_execution_burstable_compute_duration_usec"],
+		LinuxArm64ExecutionComputeDurationUsec:            hInt64["linux_arm64_execution_compute_duration_usec"],
+		LinuxX86_64ExecutionBurstableComputeDurationUsec:  hInt64["linux_x86_64_execution_burstable_compute_duration_usec"],
+		LinuxX86_64ExecutionComputeDurationUsec:           hInt64["linux_x86_64_execution_compute_duration_usec"],
+		DarwinArm64ExecutionBurstableComputeDurationUsec:  hInt64["darwin_arm64_execution_burstable_compute_duration_usec"],
+		DarwinArm64ExecutionComputeDurationUsec:           hInt64["darwin_arm64_execution_compute_duration_usec"],
+		DarwinX86_64ExecutionBurstableComputeDurationUsec: hInt64["darwin_x86_64_execution_burstable_compute_duration_usec"],
+		DarwinX86_64ExecutionComputeDurationUsec:          hInt64["darwin_x86_64_execution_compute_duration_usec"],
+		LocalSnapshotSavedBytes:                           hInt64["local_snapshot_saved_bytes"],
+		RemoteSnapshotSavedBytes:                          hInt64["remote_snapshot_saved_bytes"],
 	}, nil
 }

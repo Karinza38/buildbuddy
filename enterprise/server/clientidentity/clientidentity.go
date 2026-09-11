@@ -2,47 +2,123 @@ package clientidentity
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/jonboulle/clockwork"
 	"google.golang.org/grpc/metadata"
 )
 
 const (
-	IdentityHeaderName = "x-buildbuddy-client-identity"
-	DefaultExpiration  = 5 * time.Minute
+	DefaultExpiration = 5 * time.Minute
 
 	cachedHeaderExpiration      = 1 * time.Minute
 	validatedIdentityContextKey = "validatedClientIdentity"
 )
 
 var (
-	signingKey = flag.String("app.client_identity.key", "", "The key used to sign and verify identity JWTs.", flag.Secret)
-	client     = flag.String("app.client_identity.client", "", "The client identifier to place in the identity header.")
-	origin     = flag.String("app.client_identity.origin", "", "The origin identifier to place in the identity header.")
+	signingKey                = flag.String("app.client_identity.key", "", "The key used to sign and verify identity JWTs.", flag.Secret)
+	additionalVerificationKey = flag.String("app.client_identity.additional_verification_key", "", "An additional key accepted when verifying identity JWTs. Used to keep old and new keys trusted simultaneously during key rotation.", flag.Secret)
+	client                    = flag.String("app.client_identity.client", "", "The client identifier to place in the identity header.")
+	origin                    = flag.String("app.client_identity.origin", "", "The origin identifier to place in the identity header.")
+	expiration                = flag.Duration("app.client_identity.expiration", DefaultExpiration, "The expiration time for the identity header.")
+	required                  = flag.Bool("app.client_identity.required", false, "If set, a client identity is required.")
 )
+
+type cachedHeader struct {
+	header   string
+	cachedAt time.Time
+}
+
+// headerCache caches a signed identity header per client identity, re-signing
+// each at most once per cachedHeaderExpiration.
+type headerCache struct {
+	clock clockwork.Clock
+	sign  func(si *interfaces.ClientIdentity) (string, error)
+
+	mu      sync.RWMutex
+	entries map[interfaces.ClientIdentity]cachedHeader
+}
+
+func newHeaderCache(clock clockwork.Clock, expiration time.Duration, sign func(*interfaces.ClientIdentity) (string, error)) (*headerCache, error) {
+	// A cached header is reused for up to cachedHeaderExpiration, so if the
+	// signed JWT's own lifetime doesn't exceed that window we could hand out a
+	// token that has already expired. Require expiration > cachedHeaderExpiration
+	// rather than silently serving stale identities.
+	if expiration <= cachedHeaderExpiration {
+		return nil, status.InvalidArgumentErrorf("app.client_identity.expiration (%s) must be greater than the header cache expiration (%s)", expiration, cachedHeaderExpiration)
+	}
+	return &headerCache{
+		clock:   clock,
+		sign:    sign,
+		entries: make(map[interfaces.ClientIdentity]cachedHeader),
+	}, nil
+}
+
+// Get returns the cached header for si, signing and caching a fresh one when the
+// cached value is missing or older than cachedHeaderExpiration.
+func (c *headerCache) Get(si *interfaces.ClientIdentity) (string, error) {
+	key := *si
+	c.mu.RLock()
+	e, ok := c.entries[key]
+	c.mu.RUnlock()
+	if ok && c.clock.Since(e.cachedAt) < cachedHeaderExpiration {
+		return e.header, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Check again in case it was updated while we were waiting for the lock.
+	if e, ok := c.entries[key]; ok && c.clock.Since(e.cachedAt) < cachedHeaderExpiration {
+		return e.header, nil
+	}
+	header, err := c.sign(si)
+	if err != nil {
+		return "", err
+	}
+	c.entries[key] = cachedHeader{header: header, cachedAt: c.clock.Now()}
+	return header, nil
+}
 
 type Service struct {
 	signingKey []byte
+	// verificationKeys holds the signing key followed by the optional additional
+	// verification key; incoming JWTs are accepted if either key verifies them.
+	verificationKeys [][]byte
 
 	clock clockwork.Clock
 
-	mu               sync.Mutex
-	cachedHeader     string
-	cachedHeaderTime time.Time
+	headerCache *headerCache
 }
 
 func New(clock clockwork.Clock) (*Service, error) {
-	return &Service{
-		signingKey: []byte(*signingKey),
-		clock:      clock,
-	}, nil
+	if *signingKey == "" {
+		return nil, status.InvalidArgumentError("ClientIdentityService requires a signing key")
+	}
+	verificationKeys := [][]byte{[]byte(*signingKey)}
+	if *additionalVerificationKey != "" {
+		verificationKeys = append(verificationKeys, []byte(*additionalVerificationKey))
+	}
+	s := &Service{
+		signingKey:       []byte(*signingKey),
+		verificationKeys: verificationKeys,
+		clock:            clock,
+	}
+	headerCache, err := newHeaderCache(clock, *expiration, func(si *interfaces.ClientIdentity) (string, error) {
+		return s.NewIdentityHeader(si, *expiration)
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.headerCache = headerCache
+	return s, nil
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -62,37 +138,56 @@ type claims struct {
 	interfaces.ClientIdentity
 }
 
-func (s *Service) IdentityHeader(si *interfaces.ClientIdentity, expiration time.Duration) (string, error) {
+// Clears the client-identity from the outgoing gRPC context.
+func ClearIdentity(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, validatedIdentityContextKey, nil)
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if ok {
+		md = md.Copy()
+		delete(md, authutil.ClientIdentityHeaderName)
+		ctx = metadata.NewOutgoingContext(ctx, md)
+	}
+	return ctx
+}
+
+func (s *Service) NewIdentityHeader(si *interfaces.ClientIdentity, expiration time.Duration) (string, error) {
 	expirationTime := s.clock.Now().Add(expiration)
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, &claims{
-		StandardClaims: jwt.StandardClaims{ExpiresAt: expirationTime.Unix()},
+		ExpiresAt:      expirationTime.Unix(),
 		ClientIdentity: *si,
 	})
 	return t.SignedString(s.signingKey)
 }
 
+// CachedIdentityHeader returns a signed identity header for the given identity,
+// re-signing it at most once per cachedHeaderExpiration.
+func (s *Service) CachedIdentityHeader(si *interfaces.ClientIdentity) (string, error) {
+	return s.headerCache.Get(si)
+}
+
 func (s *Service) AddIdentityToContext(ctx context.Context) (context.Context, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.clock.Since(s.cachedHeaderTime) < cachedHeaderExpiration {
-		return metadata.AppendToOutgoingContext(ctx, IdentityHeaderName, s.cachedHeader), nil
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		if vals := md.Get(authutil.ClientIdentityHeaderName); len(vals) > 0 {
+			return ctx, nil
+		}
 	}
-	header, err := s.IdentityHeader(&interfaces.ClientIdentity{
+	header, err := s.CachedIdentityHeader(&interfaces.ClientIdentity{
 		Origin: *origin,
 		Client: *client,
-	}, DefaultExpiration)
+	})
 	if err != nil {
 		return ctx, err
 	}
-	s.cachedHeader = header
-	s.cachedHeaderTime = s.clock.Now()
-	return metadata.AppendToOutgoingContext(ctx, IdentityHeaderName, header), nil
+	return metadata.AppendToOutgoingContext(ctx, authutil.ClientIdentityHeaderName, header), nil
 }
 
 func (s *Service) ValidateIncomingIdentity(ctx context.Context) (context.Context, error) {
-	vals := metadata.ValueFromIncomingContext(ctx, IdentityHeaderName)
+	vals := metadata.ValueFromIncomingContext(ctx, authutil.ClientIdentityHeaderName)
 	if len(vals) == 0 {
-		return ctx, nil
+		if !*required {
+			return ctx, nil
+		}
+		return nil, status.NotFoundError("identity not presented")
 	}
 	if len(vals) > 1 {
 		// When --experimental_remote_downloader is enabled in Bazel, it seems
@@ -103,14 +198,22 @@ func (s *Service) ValidateIncomingIdentity(ctx context.Context) (context.Context
 		}
 	}
 	headerValue := vals[0]
-	c := &claims{}
-	if _, err := jwt.ParseWithClaims(headerValue, c, func(token *jwt.Token) (interface{}, error) {
-		return s.signingKey, nil
-	}); err != nil {
-		return ctx, status.PermissionDeniedErrorf("invalid identity header: %s", err)
+	var verifyErr error
+	for _, key := range s.verificationKeys {
+		c := &claims{}
+		_, err := jwt.ParseWithClaims(headerValue, c, func(token *jwt.Token) (any, error) {
+			return key, nil
+		})
+		if err == nil {
+			return context.WithValue(ctx, validatedIdentityContextKey, &c.ClientIdentity), nil
+		}
+		verifyErr = err
+		// Only a signature mismatch can be resolved by trying another key.
+		if !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+			break
+		}
 	}
-
-	return context.WithValue(ctx, validatedIdentityContextKey, &c.ClientIdentity), nil
+	return ctx, status.PermissionDeniedErrorf("invalid identity header: %s", verifyErr)
 }
 
 func (s *Service) IdentityFromContext(ctx context.Context) (*interfaces.ClientIdentity, error) {

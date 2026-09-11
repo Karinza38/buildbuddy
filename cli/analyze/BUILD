@@ -1,4 +1,6 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+package(default_visibility = ["//cli:__subpackages__"])
 
 go_library(
     name = "analyze",
@@ -15,4 +17,12 @@ go_library(
     ],
 )
 
-package(default_visibility = ["//cli:__subpackages__"])
+go_test(
+    name = "analyze_test",
+    srcs = ["analyze_test.go"],
+    embed = [":analyze"],
+    deps = [
+        "//proto:bazel_query_go_proto",
+        "@com_github_stretchr_testify//require",
+    ],
+)

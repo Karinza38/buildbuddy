@@ -60,12 +60,12 @@ func randomString() string {
 }
 
 func getBuildbuddyUrlOrDie(stderr string) string {
-	if !strings.Contains(stderr, "Streaming build results to: ") {
+	_, split, found := strings.Cut(stderr, "Streaming build results to: ")
+	if !found {
 		log.Fatalf("no buildbuddy url found in stderr: %s", stderr)
 		return ""
 	}
-	split := strings.Split(stderr, "Streaming build results to: ")[1]
-	bburl := strings.Split(split, "\n")[0]
+	bburl, _, _ := strings.Cut(split, "\n")
 	if bburl == "" {
 		log.Fatalf("buildbuddy url is empty, stderr: %s", stderr)
 	}
@@ -83,7 +83,7 @@ func newCommand(target, environment, apiKey, remoteInstanceName, tag string, ext
 		envSuffix = "io"
 	}
 	// Add these first so the buildbuddy flags take precedence.
-	for i := 0; i < len(extraFlags); i++ {
+	for i := range extraFlags {
 		if extraFlags[i] != "" {
 			cmd = append(cmd, extraFlags[i])
 		}

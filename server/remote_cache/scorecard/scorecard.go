@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
+	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
 	"github.com/buildbuddy-io/buildbuddy/server/util/paging"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -52,14 +53,14 @@ func GetCacheScoreCard(ctx context.Context, env environment.Env, req *capb.GetCa
 				// it's okay for scorecards to be missing for prior attempts
 				continue
 			}
-			return nil, err
+			return nil, status.WrapErrorf(err, "read cache scorecard for invocation %s attempt %d", req.GetInvocationId(), attempt)
 		}
 		scorecard.Misses = append(scorecard.Misses, sc.Misses...)
 		scorecard.Results = append(scorecard.Results, sc.Results...)
 	}
 	sc, err := Read(ctx, env, req.InvocationId, invocation.Attempt)
 	if err != nil {
-		return nil, err
+		return nil, status.WrapErrorf(err, "read cache scorecard for invocation %s attempt %d", req.GetInvocationId(), invocation.Attempt)
 	}
 	scorecard.Misses = append(scorecard.Misses, sc.Misses...)
 	scorecard.Results = append(scorecard.Results, sc.Results...)
@@ -69,14 +70,8 @@ func GetCacheScoreCard(ctx context.Context, env environment.Env, req *capb.GetCa
 		return nil, err
 	}
 
-	start := page.Offset
-	if start > int64(len(results)) {
-		start = int64(len(results))
-	}
-	end := start + page.Limit
-	if end > int64(len(results)) {
-		end = int64(len(results))
-	}
+	start := min(page.Offset, int64(len(results)))
+	end := min(start+page.Limit, int64(len(results)))
 
 	nextPageToken := ""
 	if end < int64(len(results)) {
@@ -303,7 +298,7 @@ func blobNameDeprecated(invocationID string) string {
 // uploaded via BEP.
 func FillBESMetadata(sc *capb.ScoreCard, files map[string]*bespb.File) {
 	for _, result := range sc.Results {
-		if result.ActionId != "bes-upload" {
+		if result.ActionId != bazel_request.BESUploadActionID {
 			continue
 		}
 		f := files[result.Digest.GetHash()]
@@ -331,16 +326,14 @@ func Read(ctx context.Context, env environment.Env, invocationID string, invocat
 
 	sc := &capb.ScoreCard{}
 	if err := proto.Unmarshal(buf, sc); err != nil {
-		return nil, err
+		return nil, status.WrapError(err, "unmarshal cache scorecard")
 	}
 	return sc, nil
 }
 
 // Write writes the invocation cache scorecard to the configured blobstore.
 func Write(ctx context.Context, env environment.Env, invocationID string, invocationAttempt uint64, scoreCard *capb.ScoreCard) error {
-	// Use MarshalOld b/c ScoreCard.MarshalVT is 50% slower than standard Marshal()
-	// See https://github.com/buildbuddy-io/buildbuddy-internal/issues/3018
-	scoreCardBuf, err := proto.MarshalOld(scoreCard)
+	scoreCardBuf, err := proto.Marshal(scoreCard)
 	if err != nil {
 		return err
 	}

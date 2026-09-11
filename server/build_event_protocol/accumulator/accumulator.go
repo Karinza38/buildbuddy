@@ -3,7 +3,7 @@ package accumulator
 import (
 	"context"
 	"net/url"
-	"regexp"
+	"strings"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
@@ -11,35 +11,32 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/invocation_format"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
-	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 )
 
 const (
 	workflowIDFieldName                   = "workflowID"
 	actionNameFieldName                   = "actionName"
+	commitStatusLabelFieldName            = "commitStatusLabel"
 	disableCommitStatusReportingFieldName = "disableCommitStatusReporting"
 	disableTargetTrackingFieldName        = "disableTargetTracking"
 
-	// The maximum number of important files and artifacts to possibly copy
+	// The maximum number of important TestRunner artifacts to possibly copy
 	// from cache -> blobstore. If more than this number are present, they
 	// will be dropped.
-	maxPersistableArtifacts = 1000
-
-	// If codesearch is enabled, and an invocation contains a single file with the
-	// following name, attempt to ingest this kythe sstable file in codesearch.
-	KytheOutputName = "kythe_serving.sst"
+	maxPersistableTestArtifacts = 1000
 )
 
 var (
 	buildMetadataFieldMapping = map[string]string{
 		"DISABLE_COMMIT_STATUS_REPORTING": disableCommitStatusReportingFieldName,
 		"DISABLE_TARGET_TRACKING":         disableTargetTrackingFieldName,
+		"COMMIT_STATUS_LABEL":             commitStatusLabelFieldName,
 	}
-	bytestreamURIPattern = regexp.MustCompile(`^bytestream://.*/blobs/([a-z0-9]{64})/\d+$`)
 )
 
 type Accumulator interface {
@@ -61,6 +58,7 @@ type Accumulator interface {
 	DisableTargetTracking() bool
 	WorkflowID() string
 	ActionName() string
+	CommitStatusLabel() string
 	Pattern() string
 
 	BuildFinished() bool
@@ -76,18 +74,20 @@ type Accumulator interface {
 // memory for the life of the stream, so it should not save every single event
 // in full (that data lives in blobstore).
 type BEValues struct {
-	valuesMap                      map[string]string
-	unprocessedMetadataEvents      map[string]struct{}
-	sawStartedEvent                bool
-	sawFinishedEvent               bool
-	buildStartTime                 time.Time
-	buildToolLogURIs               []*url.URL
-	outputFilesMap                 map[string]*build_event_stream.File
-	kytheSSTableResourceName       *rspb.ResourceName
-	profileName                    string
-	hasBytestreamTestActionOutputs bool
+	valuesMap                 map[string]string
+	unprocessedMetadataEvents map[string]struct{}
+	sawStartedEvent           bool
+	sawFinishedEvent          bool
+	buildStartTime            time.Time
+	buildToolLogURIs          []*url.URL
+	outputFilesMap            map[string]*build_event_stream.File
+	profileName               string
+	gitFetchTotalBytes        int64
+	gitFetchDuration          time.Duration
+	gitFetchRetryCount        int64
 
-	testOutputURIs []*url.URL
+	failedTestOutputURIs []*url.URL
+	passedTestOutputURIs []*url.URL
 	// TODO(bduffany): Migrate all parser functionality directly into the
 	// accumulator. The parser is a separate entity only for historical reasons.
 	parser *event_parser.StreamingEventParser
@@ -111,22 +111,16 @@ func (v *BEValues) maybeExtractOutputFile(files ...*build_event_stream.File) {
 		if file.GetName() == "" {
 			continue
 		}
-		if m := bytestreamURIPattern.FindStringSubmatch(file.GetUri()); len(m) >= 1 {
-			digestHash := m[1]
-			v.outputFilesMap[digestHash] = file
+		uri, err := url.Parse(file.GetUri())
+		if err != nil || uri.Scheme != "bytestream" {
+			continue
 		}
-		// Special case: check for kythe output files.
-		if file.GetName() == KytheOutputName {
-			uri, err := url.Parse(file.GetUri())
-			if err != nil {
-				continue
-			}
-			rn, err := digest.ParseDownloadResourceName(uri.Path)
-			if err != nil {
-				continue
-			}
-			v.kytheSSTableResourceName = rn.ToProto()
+		rn, err := digest.ParseDownloadResourceName(strings.TrimPrefix(uri.Path, "/"))
+		if err != nil {
+			continue
 		}
+		digestHash := rn.GetDigest().GetHash()
+		v.outputFilesMap[digestHash] = proto.Clone(file).(*build_event_stream.File)
 	}
 }
 
@@ -162,11 +156,16 @@ func (v *BEValues) AddEvent(event *build_event_stream.BuildEvent) error {
 		v.populateWorkspaceInfoFromBuildMetadata(p.BuildMetadata)
 	case *build_event_stream.BuildEvent_WorkflowConfigured:
 		v.handleWorkflowConfigured(p.WorkflowConfigured)
+	case *build_event_stream.BuildEvent_GitFetchCompleted:
+		// The remote runner reports cumulative totals, so the last event wins.
+		v.gitFetchTotalBytes = p.GitFetchCompleted.GetTotalBytes()
+		v.gitFetchDuration = p.GitFetchCompleted.GetDuration().AsDuration()
+		v.gitFetchRetryCount = p.GitFetchCompleted.GetRetryCount()
 	case *build_event_stream.BuildEvent_Finished:
 		v.sawFinishedEvent = true
 	case *build_event_stream.BuildEvent_BuildToolLogs:
 		v.maybeExtractOutputFile(p.BuildToolLogs.GetLog()...)
-		for _, toolLog := range p.BuildToolLogs.Log {
+		for _, toolLog := range p.BuildToolLogs.GetLog() {
 			if uri := toolLog.GetUri(); uri != "" {
 				if url, err := url.Parse(uri); err != nil {
 					log.Warningf("Error parsing uri from BuildToolLogs: %s", uri)
@@ -177,22 +176,23 @@ func (v *BEValues) AddEvent(event *build_event_stream.BuildEvent) error {
 		}
 	case *build_event_stream.BuildEvent_TestResult:
 		v.maybeExtractOutputFile(p.TestResult.GetTestActionOutput()...)
-		for _, f := range p.TestResult.TestActionOutput {
+		for _, f := range p.TestResult.GetTestActionOutput() {
 			u, err := url.Parse(f.GetUri())
 			if err != nil {
 				log.Warningf("Error parsing uri from TestResult: %s", f.GetUri())
 				continue
 			}
-			if u.Scheme == "bytestream" {
-				v.hasBytestreamTestActionOutputs = true
-
-				// To protect our backends from thrashing -- stop
-				// copying outputs if there are way too many. This can
-				// happen if a ruleset is buggy.
-				if len(v.testOutputURIs) >= maxPersistableArtifacts {
-					continue
+			if u.Scheme != "bytestream" {
+				continue
+			}
+			if p.TestResult.GetStatus() == build_event_stream.TestStatus_PASSED {
+				if len(v.passedTestOutputURIs) < maxPersistableTestArtifacts {
+					v.passedTestOutputURIs = append(v.passedTestOutputURIs, u)
 				}
-				v.testOutputURIs = append(v.testOutputURIs, u)
+				continue
+			}
+			if len(v.failedTestOutputURIs) < maxPersistableTestArtifacts {
+				v.failedTestOutputURIs = append(v.failedTestOutputURIs, u)
 			}
 		}
 	}
@@ -228,8 +228,22 @@ func (v *BEValues) OutputFiles() map[string]*build_event_stream.File {
 	return v.outputFilesMap
 }
 
-func (v *BEValues) KytheSSTableResourceName() *rspb.ResourceName {
-	return v.kytheSSTableResourceName
+// GitFetchTotalBytes returns the total number of bytes fetched by git while
+// a remote runner set up the git repository, or 0 if not reported.
+func (v *BEValues) GitFetchTotalBytes() int64 {
+	return v.gitFetchTotalBytes
+}
+
+// GitFetchDuration returns the total time a remote runner spent running git
+// fetch commands, or 0 if not reported.
+func (v *BEValues) GitFetchDuration() time.Duration {
+	return v.gitFetchDuration
+}
+
+// GitFetchRetryCount returns the number of git fetch retries a remote runner
+// made after low-speed aborts, or 0 if not reported.
+func (v *BEValues) GitFetchRetryCount() int64 {
+	return v.gitFetchRetryCount
 }
 
 func (v *BEValues) DisableCommitStatusReporting() bool {
@@ -252,6 +266,10 @@ func (v *BEValues) ActionName() string {
 	return v.getStringValue(actionNameFieldName)
 }
 
+func (v *BEValues) CommitStatusLabel() string {
+	return v.getStringValue(commitStatusLabelFieldName)
+}
+
 func (v *BEValues) BuildFinished() bool {
 	return v.sawFinishedEvent
 }
@@ -260,12 +278,12 @@ func (v *BEValues) BuildToolLogURIs() []*url.URL {
 	return v.buildToolLogURIs
 }
 
-func (v *BEValues) HasBytestreamTestActionOutputs() bool {
-	return v.hasBytestreamTestActionOutputs
+func (v *BEValues) PassedTestOutputURIs() []*url.URL {
+	return v.passedTestOutputURIs
 }
 
-func (v *BEValues) TestOutputURIs() []*url.URL {
-	return v.testOutputURIs
+func (v *BEValues) FailedTestOutputURIs() []*url.URL {
+	return v.failedTestOutputURIs
 }
 
 func (v *BEValues) getStringValue(fieldName string) string {

@@ -3,29 +3,20 @@ package schema
 import (
 	"encoding/hex"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/go-faker/faker/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/go-faker/faker/v4"
 )
-
-func isInList(fieldName string, fields []string) bool {
-	for _, fn := range fields {
-		if fn == fieldName {
-			return true
-		}
-	}
-	return false
-}
 
 func TestSchemaInSync(t *testing.T) {
 	tests := []struct {
 		clickhouseTable Table
-		primaryDBTable  interface{}
+		primaryDBTable  any
 	}{
 		{
 			clickhouseTable: &Invocation{},
@@ -43,6 +34,12 @@ func TestSchemaInSync(t *testing.T) {
 		{
 			clickhouseTable: &AuditLog{},
 			// Not in primary DB.
+			primaryDBTable: nil,
+		},
+		{
+			clickhouseTable: &RawUsage{},
+			// Not in primary DB. There is a Usage table but it has an
+			// incompatible schema.
 			primaryDBTable: nil,
 		},
 	}
@@ -77,7 +74,7 @@ func TestSchemaInSync(t *testing.T) {
 			}
 			for _, chField := range chFields {
 				_, found := primaryDBType.FieldByName(chField.Name)
-				isIncluded := isInList(chField.Name, additionalFields)
+				isIncluded := slices.Contains(additionalFields, chField.Name)
 				if isIncluded {
 					assert.False(t, found, "Field %q is found in %s, but it's marked as additional", chField.Name, primaryDBType)
 				} else {
@@ -91,7 +88,7 @@ func TestSchemaInSync(t *testing.T) {
 				}
 
 				_, found := chType.FieldByName(primaryField.Name)
-				isExcluded := isInList(primaryField.Name, excludedFields)
+				isExcluded := slices.Contains(excludedFields, primaryField.Name)
 				if isExcluded {
 					assert.False(t, found, "Field %q is found in %s, but it's marked as excluded", primaryField.Name, chType)
 				} else {
@@ -126,7 +123,7 @@ func TestToInvocationFromPrimaryDB(t *testing.T) {
 	assert.Equal(t, dest.Tags, strings.Split(src.Tags, ","))
 
 	for _, primaryField := range primaryInvFields {
-		if isInList(primaryField.Name, excludedFields) || primaryField.Anonymous || isInList(primaryField.Name, NonStandardInvocationCopyFields) {
+		if slices.Contains(excludedFields, primaryField.Name) || primaryField.Anonymous || slices.Contains(NonStandardInvocationCopyFields, primaryField.Name) {
 			// already checked fields that don't do direct copies seperately above.
 			continue
 		}
@@ -180,4 +177,31 @@ SETTINGS index_granularity = 8192
 	assert.Contains(t, projectionNames, "projection_commits")
 	assert.Contains(t, projectionNames, "projection_targets")
 
+}
+
+func TestUsageViewQuery(t *testing.T) {
+	const expectedQuery = "SELECT group_id, period_start, sku, labels, SUM(count) AS count " +
+		"FROM RawUsage FINAL GROUP BY group_id, period_start, sku, labels"
+
+	// RawUsage may contain duplicate flushes from Redis buffers, so the view
+	// deduplicates with FINAL before aggregating counts by Usage dimensions.
+	assert.Equal(t, expectedQuery, (&Usage{}).ViewQuery())
+}
+
+func TestSameViewQuery(t *testing.T) {
+	// ClickHouse may store the saved SELECT with different formatting and
+	// function casing, so avoid replacing the view when the query is
+	// semantically the same for this generated view.
+	assert.True(t, sameViewQuery(
+		"SELECT `group_id`, `period_start`, `sku`, `labels`, sum(`count`) AS `count` FROM `db_name`.`RawUsage` FINAL GROUP BY `group_id`, `period_start`, `sku`, `labels`",
+		"SELECT group_id, period_start, sku, labels, SUM(count) AS count FROM RawUsage FINAL GROUP BY group_id, period_start, sku, labels",
+		"db_name",
+	))
+
+	// A different grouping or aggregate expression should trigger replacement.
+	assert.False(t, sameViewQuery(
+		"SELECT group_id, period_start, sku, SUM(count) AS count FROM RawUsage FINAL GROUP BY group_id, period_start, sku",
+		"SELECT group_id, period_start, sku, labels, SUM(count) AS count FROM RawUsage FINAL GROUP BY group_id, period_start, sku, labels",
+		"",
+	))
 }

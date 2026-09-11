@@ -1,20 +1,20 @@
+import { Bird, Search, XCircle } from "lucide-react";
 import React from "react";
-import rpcService from "../../../app/service/rpc_service";
-import errorService from "../../../app/errors/error_service";
-import { search } from "../../../proto/search_ts_proto";
-import Spinner from "../../../app/components/spinner/spinner";
-import { FilterInput } from "../../../app/components/filter_input/filter_input";
-import TextInput from "../../../app/components/input/input";
 import FilledButton from "../../../app/components/button/button";
+import Spinner from "../../../app/components/spinner/spinner";
+import errorService from "../../../app/errors/error_service";
 import router from "../../../app/router/router";
+import rpcService from "../../../app/service/rpc_service";
 import shortcuts, { KeyCombo } from "../../../app/shortcuts/shortcuts";
+import { BuildBuddyError } from "../../../app/util/errors";
+import { search } from "../../../proto/search_ts_proto";
 import ResultComponent from "./result";
-import { Bird, Search } from "lucide-react";
 
 interface State {
   loading: boolean;
   response?: search.SearchResponse;
   inputText: string;
+  errorMessage?: string;
 }
 
 interface Props {
@@ -29,8 +29,12 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
     inputText: this.getQuery(),
   };
 
+  hasQuery() {
+    return this.props.search.has("q");
+  }
+
   getQuery() {
-    return this.props.search.get("q") || "";
+    return (this.props.search.get("q") || "").trim();
   }
 
   search() {
@@ -44,7 +48,14 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
       .then((response) => {
         this.setState({ response: response });
       })
-      .catch((e) => errorService.handleError(e))
+      .catch((e) => {
+        const parsedError = BuildBuddyError.parse(e);
+        if (parsedError.code == "InvalidArgument") {
+          this.setState({ errorMessage: String(parsedError.description) });
+        } else {
+          errorService.handleError(e);
+        }
+      })
       .finally(() => this.setState({ loading: false }));
   }
 
@@ -54,21 +65,24 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
     }
   }
 
-  handleInputChange(event: React.ChangeEvent<HTMLInputElement>) {
-    this.setState({
-      inputText: event.target.value,
-    });
-  }
-
   componentDidMount() {
     this.keyboardShortcutHandle = shortcuts.register(KeyCombo.slash, () => {
       this.focusSearchBox();
     });
+    this.focusSearchBox();
     this.search();
   }
 
   componentWillUnmount() {
     shortcuts.deregister(this.keyboardShortcutHandle);
+  }
+
+  getStat(name: string): number {
+    if (!this.state.response?.performanceMetrics) {
+      return 0;
+    }
+    let match = this.state.response.performanceMetrics.metrics.find((metric) => metric.name == name);
+    return +(match?.value || 0);
   }
 
   renderTheRestOfTheOwl() {
@@ -81,28 +95,22 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
       return (
         <div className="no-results">
           <div className="circle">
-            <Search className="icon gray" />
+            <Search className="big-icon gray" />
             <h2>Empty Query</h2>
-            <p>
-              To see results, try entering a query. Here are some examples:
-              <ul>
-                <li>
-                  <a href={`/search/?q=${encodeURIComponent("case:yes Hello World")}`}>
-                    <code className="inline-code">case:yes Hello World</code>
-                  </a>
-                </li>
-                <li>
-                  <a href={`/search/?q=${encodeURIComponent("lang:css padding-(left|right)")}`}>
-                    <code className="inline-code">lang:css padding-(left|right)</code>
-                  </a>
-                </li>
-                <li>
-                  <a href={`/search/?q=${encodeURIComponent("lang:go flag.String")}`}>
-                    <code className="inline-code">lang:go flag.String</code>
-                  </a>
-                </li>
-              </ul>
-            </p>
+            <p>To see results, try entering a query. Here are some examples:</p>
+            {this.renderExamples()}
+          </div>
+        </div>
+      );
+    }
+
+    if (this.state.errorMessage) {
+      return (
+        <div className="no-results">
+          <div className="circle">
+            <XCircle className="big-icon gray" />
+            <h2>Invalid Search Query</h2>
+            <p>{this.state.errorMessage}</p>
           </div>
         </div>
       );
@@ -116,7 +124,7 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
       return (
         <div className="no-results">
           <div className="circle">
-            <Bird className="icon gray" />
+            <Bird className="big-icon gray" />
             <h2>No results found</h2>
           </div>
         </div>
@@ -127,9 +135,17 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
     const highlight = new RegExp(parsedQuery.replace(/\(\?[imsU]+\)/g, ""), "igmd");
     return (
       <div>
-        {this.state.response.results.map((result) => (
-          <ResultComponent result={result} highlight={highlight}></ResultComponent>
-        ))}
+        <div>
+          {this.state.response.results.map((result) => (
+            <ResultComponent result={result} highlight={highlight}></ResultComponent>
+          ))}
+        </div>
+        <div className="statsForNerds">
+          <span>
+            Found {this.getStat("TOTAL_DOCS_SCORED_COUNT")} results (
+            {(this.getStat("TOTAL_SEARCH_DURATION") / 1e6).toFixed(2)}ms)
+          </span>
+        </div>
       </div>
     );
   }
@@ -138,32 +154,76 @@ export default class CodeSearchComponent extends React.Component<Props, State> {
     (document.querySelector(".searchbox") as HTMLElement | undefined)?.focus();
   }
 
+  renderExamples() {
+    return (
+      <div className="examples">
+        <p>Try:</p>
+        <ul className="examples">
+          <li>
+            <a href={`/search/?q=${encodeURIComponent("case:yes Hello World")}`}>
+              <code className="inline-code">case:yes Hello World</code>
+            </a>
+          </li>
+          <li>
+            <a href={`/search/?q=${encodeURIComponent("lang:css padding-(left|right)")}`}>
+              <code className="inline-code">lang:css padding-(left|right)</code>
+            </a>
+          </li>
+          <li>
+            <a href={`/search/?q=${encodeURIComponent("lang:go flag.String")}`}>
+              <code className="inline-code">lang:go flag.String</code>
+            </a>
+          </li>
+        </ul>
+      </div>
+    );
+  }
+
+  renderSearchBox() {
+    return (
+      <form
+        className="form-bs"
+        onSubmit={(e) => {
+          e.preventDefault();
+          router.updateParams({ q: this.state.inputText });
+        }}>
+        <input
+          type="text"
+          className="searchbox"
+          value={this.state.inputText}
+          onChange={(e) => {
+            this.setState({ inputText: e.target.value });
+          }}
+        />
+        <Search />
+      </form>
+    );
+  }
+
   render() {
+    if (!this.hasQuery()) {
+      // Show nice search box, centered within the page
+      return (
+        <div className="code-search landing">
+          <h1 className="cs-title">Code search</h1>
+          {this.renderSearchBox()}
+          {this.renderExamples()}
+        </div>
+      );
+    }
+
     return (
       <div className="code-search">
         <div className="shelf">
           <div className="title-bar">
-            <div className="cs-title">Code search</div>
-            <form
-              className="form-bs"
-              onSubmit={(e) => {
-                e.preventDefault();
-                router.updateParams({ q: this.state.inputText });
-              }}>
-              <input
-                type="text"
-                className="searchbox"
-                value={this.state.inputText}
-                onChange={this.handleInputChange.bind(this)}
-              />
-              <FilledButton type="submit">SEARCH</FilledButton>
-            </form>
+            <h1 className="cs-title">Code search</h1>
+            {this.renderSearchBox()}
           </div>
         </div>
         <div>
           {this.state.loading && (
             <div className="spinner-center">
-              <Spinner></Spinner>
+              <Spinner />
             </div>
           )}
           {!this.state.loading && this.renderTheRestOfTheOwl()}

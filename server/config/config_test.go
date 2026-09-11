@@ -3,6 +3,7 @@ package config_test
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -238,6 +239,20 @@ secret_struct_slice_flag:
 		require.Equal(t, []secretHolder{{Secret: "FIRST\nSECRET"}, {Secret: "SECOND\nSECRET"}}, *secretStructSliceFlag)
 	}
 
+	// Secrets inside a struct.
+	{
+		replaceFlagsForTesting(t)
+		config.SecretProvider = &fakeSecretProvider{
+			secrets: map[string]string{"FOO": "FIRST\nSECRET"},
+		}
+		secretStructFlag := flag.Struct("secret_struct_flag", secretHolder{}, "")
+		err := config.LoadFromData(strings.TrimSpace(`
+secret_struct_flag: 
+  secret: ${SECRET:FOO}
+	`))
+		require.NoError(t, err)
+		require.Equal(t, secretHolder{Secret: "FIRST\nSECRET"}, *secretStructFlag)
+	}
 }
 
 func TestLoadFromData(t *testing.T) {
@@ -262,4 +277,23 @@ must_be_a_number: "not a string, like this"
 		require.Contains(t, err.Error(), "retyping YAML map")
 		require.Contains(t, err.Error(), "into int")
 	}
+}
+
+func TestOnReload(t *testing.T) {
+	replaceFlagsForTesting(t)
+
+	// Point config.Path() at a config file we control.
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(configFile, []byte(""), 0644))
+	configPathFlag := flag.CommandLine.Lookup("config_file")
+	require.NotNil(t, configPathFlag)
+	previousPath := config.Path()
+	require.NoError(t, configPathFlag.Value.Set(configFile))
+	t.Cleanup(func() { configPathFlag.Value.Set(previousPath) })
+
+	calls := 0
+	config.OnReload(func() { calls++ })
+
+	require.NoError(t, config.Reload())
+	require.Equal(t, 1, calls)
 }

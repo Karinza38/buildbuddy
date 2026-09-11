@@ -3,12 +3,14 @@ package resources
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flagutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
@@ -19,21 +21,25 @@ import (
 )
 
 var (
-	customResources = flag.Slice("executor.custom_resources", []CustomResource{}, "Optional allocatable custom resources. This works similarly to bazel's local_extra_resources flag. Request these resources in exec_properties using the 'resources:<name>': '<value>' syntax.")
-	memoryBytes     = flag.Int64("executor.memory_bytes", 0, "Optional maximum memory to allocate to execution tasks (approximate). Cannot set both this option and the SYS_MEMORY_BYTES env var.")
-	mmapMemoryBytes = flag.Int64("executor.mmap_memory_bytes", 10e9, "Maximum memory to be allocated towards mmapped files for Firecracker copy-on-write functionality. This is subtraced from the configured memory_bytes. Has no effect if firecracker is disabled or snapshot sharing is disabled.")
-	milliCPU        = flag.Int64("executor.millicpu", 0, "Optional maximum CPU milliseconds to allocate to execution tasks (approximate). Cannot set both this option and the SYS_CPU env var.")
-	zoneOverride    = flag.String("zone_override", "", "A value that will override the auto-detected zone. Ignored if empty")
+	customResources   = flag.Slice("executor.custom_resources", []CustomResource{}, "Optional allocatable custom resources. This works similarly to bazel's local_extra_resources flag. Request these resources in exec_properties using the 'resources:<name>': '<value>' syntax.")
+	memoryBytes       = flag.Int64("executor.memory_bytes", 0, "Optional maximum memory to allocate to execution tasks (approximate). Cannot set both this option and the SYS_MEMORY_BYTES env var.")
+	mmapMemoryBytes   = flag.Int64("executor.mmap_memory_bytes", 10e9, "Maximum memory to be allocated towards mmapped files for Firecracker copy-on-write functionality. This is subtraced from the configured memory_bytes. Has no effect if firecracker is disabled or snapshot sharing is disabled.")
+	milliCPU          = flag.Int64("executor.millicpu", 0, "Optional maximum CPU milliseconds to allocate to execution tasks (approximate). Cannot set both this option and the SYS_CPU env var.")
+	diskBytes         = flag.Int64("executor.disk_bytes", 0, "Optional maximum disk bytes to allocate to execution task workspaces (approximate). If unset, this is derived from the capacity of the filesystem holding the build root, scaled by executor.disk_capacity_ratio.")
+	diskCapacityRatio = flag.Float64("executor.disk_capacity_ratio", 0.9, "Fraction of the build root filesystem's total capacity to report as assignable to task workspaces. Leaves headroom for the OS, the local filecache, and root-reserved blocks. Ignored if executor.disk_bytes is set.")
+	zoneOverride      = flag.String("zone_override", "", "A value that will override the auto-detected zone. Ignored if empty")
 )
 
 const (
-	cpuEnvVarName      = "SYS_CPU"
-	memoryEnvVarName   = "SYS_MEMORY_BYTES"
-	nodeEnvVarName     = "MY_NODENAME"
-	hostnameEnvVarName = "MY_HOSTNAME"
-	portEnvVarName     = "MY_PORT"
-	poolEnvVarName     = "MY_POOL"
-	podUIDVarName      = "K8S_POD_UID"
+	cpuEnvVarName       = "SYS_CPU"
+	memoryEnvVarName    = "SYS_MEMORY_BYTES"
+	nodeNameEnvVarName  = "MY_NODE_NAME"
+	hostnameEnvVarName  = "MY_HOSTNAME"
+	namespaceEnvVarName = "MY_NAMESPACE"
+	podNameEnvVarName   = "MY_POD_NAME"
+	portEnvVarName      = "MY_PORT"
+	poolEnvVarName      = "MY_POOL"
+	podUIDVarName       = "K8S_POD_UID"
 
 	// SYS_MILLICPU is deprecated because it is misnamed - it expects CPU cores
 	// rather than CPU-millis as the name implies.
@@ -48,6 +54,7 @@ var (
 	allocatedRAMBytes     int64
 	allocatedMmapRAMBytes int64
 	allocatedCPUMillis    int64
+	allocatedDiskBytes    int64
 )
 
 var (
@@ -164,16 +171,61 @@ func Configure(mmapLRUEnabled bool) error {
 		allocatedRAMBytes -= allocatedMmapRAMBytes
 	}
 
+	// Note: disk capacity is configured separately via ConfigureDiskCapacity,
+	// which must run after the build root directory exists.
+	allocatedDiskBytes = *diskBytes
+
 	log.Debugf("Set allocatedRAMBytes to %d", allocatedRAMBytes)
 	log.Debugf("Set allocatedCPUMillis to %d", allocatedCPUMillis)
 
 	return nil
 }
 
-func GetSysFreeRAMBytes() int64 {
+// ConfigureDiskCapacity sets the disk capacity reported as assignable to task
+// workspaces. If executor.disk_bytes is set, that value is used directly.
+// Otherwise the capacity is derived from the total size of the filesystem
+// holding buildRoot, scaled by executor.disk_capacity_ratio.
+//
+// This is separate from Configure because it needs the build root to exist.
+func ConfigureDiskCapacity(buildRoot string) error {
+	if *diskBytes > 0 {
+		allocatedDiskBytes = *diskBytes
+		log.Debugf("Set allocatedDiskBytes to %d (from executor.disk_bytes)", allocatedDiskBytes)
+		return nil
+	}
+	if *diskCapacityRatio <= 0 || *diskCapacityRatio > 1 {
+		return status.InvalidArgumentError("executor.disk_capacity_ratio must be in (0, 1]")
+	}
+	du, err := disk.GetDirUsage(buildRoot)
+	if err != nil {
+		return fmt.Errorf("get disk usage for build root %q: %w", buildRoot, err)
+	}
+	allocatedDiskBytes = int64(float64(du.TotalBytes) * *diskCapacityRatio)
+	log.Debugf("Set allocatedDiskBytes to %d (%.2f of %d total bytes on %q)",
+		allocatedDiskBytes, *diskCapacityRatio, du.TotalBytes, buildRoot)
+	return nil
+}
+
+// GetSysTotalRAMBytes returns the total system memory. Note that in a
+// container this reflects the host, not the container's cgroup.
+func GetSysTotalRAMBytes() (int64, error) {
 	mem := gosigar.Mem{}
-	mem.Get()
-	return int64(mem.ActualFree)
+	if err := mem.Get(); err != nil {
+		return 0, fmt.Errorf("get memory info: %w", err)
+	}
+	return int64(mem.Total), nil
+}
+
+// GetSysFreeRAMBytes returns the system memory available to new workloads,
+// including reclaimable page cache (MemAvailable from /proc/meminfo), not
+// strictly free memory. Note that in a container this reflects the host, not
+// the container's cgroup.
+func GetSysFreeRAMBytes() (int64, error) {
+	mem := gosigar.Mem{}
+	if err := mem.Get(); err != nil {
+		return 0, fmt.Errorf("get memory info: %w", err)
+	}
+	return int64(mem.ActualFree), nil
 }
 
 func GetAllocatedRAMBytes() int64 {
@@ -188,25 +240,85 @@ func GetAllocatedCPUMillis() int64 {
 	return allocatedCPUMillis
 }
 
-// Struct version of scpb.CustomResource (for YAML configuration).
-type CustomResource struct {
-	Name  string  `yaml:"name" json:"name"`
-	Value float64 `yaml:"value" json:"value"`
+// GetAllocatedDiskBytes returns the disk capacity allocated to task workspaces,
+// or 0 if it could not be determined (in which case disk should not be used as
+// a scheduling constraint).
+func GetAllocatedDiskBytes() int64 {
+	return allocatedDiskBytes
 }
 
-func GetAllocatedCustomResources() []*scpb.CustomResource {
+// Struct version of scpb.CustomResource (for YAML configuration).
+type CustomResource struct {
+	Name             string  `yaml:"name" json:"name"`
+	Value            float64 `yaml:"value" json:"value"`
+	Parent           string  `yaml:"parent" json:"parent"`
+	ParentAccounting string  `yaml:"parent_accounting" json:"parent_accounting"`
+}
+
+func GetAllocatedCustomResources() ([]*scpb.CustomResource, error) {
 	out := make([]*scpb.CustomResource, 0, len(*customResources))
 	for _, r := range *customResources {
+		// Bazel doesn't support custom resource names that contain periods:
+		// https://github.com/bazelbuild/bazel/issues/27911
+		if strings.Contains(r.Name, ".") {
+			return []*scpb.CustomResource{}, status.InvalidArgumentError("Custom resource names may not contain periods")
+		}
 		out = append(out, &scpb.CustomResource{
 			Name:  r.Name,
 			Value: float32(r.Value),
 		})
 	}
-	return out
+	return out, nil
 }
 
-func GetNodeName() string {
-	return os.Getenv(nodeEnvVarName)
+// CustomResourceParent describes how a child's usage is charged to its parent.
+type CustomResourceParent struct {
+	Name       string
+	Accounting string
+}
+
+const (
+	ParentAccountingSum  = "sum"
+	ParentAccountingCeil = "ceil"
+)
+
+func GetCustomResourceParentMap() (map[string]CustomResourceParent, error) {
+	configured := make(map[string]CustomResource, len(*customResources))
+	for _, r := range *customResources {
+		configured[r.Name] = r
+	}
+
+	parentByChild := make(map[string]CustomResourceParent)
+	for _, r := range *customResources {
+		if r.Parent == "" {
+			if r.ParentAccounting != "" {
+				return nil, status.InvalidArgumentErrorf("Custom resource %q sets parent_accounting without a parent", r.Name)
+			}
+			continue
+		}
+		parent, ok := configured[r.Parent]
+		if !ok {
+			return nil, status.InvalidArgumentErrorf("Custom resource %q parent %q is not configured", r.Name, r.Parent)
+		}
+		if r.Parent == r.Name {
+			return nil, status.InvalidArgumentErrorf("Custom resource %q cannot be its own parent", r.Name)
+		}
+		if parent.Parent != "" {
+			return nil, status.InvalidArgumentErrorf("Custom resource %q parent %q cannot itself have a parent", r.Name, r.Parent)
+		}
+		if r.ParentAccounting == "" {
+			r.ParentAccounting = ParentAccountingSum
+		}
+		if r.ParentAccounting != ParentAccountingSum && r.ParentAccounting != ParentAccountingCeil {
+			return nil, status.InvalidArgumentErrorf("Custom resource %q has unsupported parent_accounting %q", r.Name, r.ParentAccounting)
+		}
+		parentByChild[r.Name] = CustomResourceParent{Name: r.Parent, Accounting: r.ParentAccounting}
+	}
+	return parentByChild, nil
+}
+
+func GetK8sNodeName() string {
+	return os.Getenv(nodeNameEnvVarName)
 }
 
 func GetPoolName() string {
@@ -217,8 +329,30 @@ func GetArch() string {
 	return runtime.GOARCH
 }
 
-func GetOS() string {
+func GetOSFamily() string {
 	return runtime.GOOS
+}
+
+func GetOSDisplayName() string {
+	var command []string
+	switch runtime.GOOS {
+	case "darwin":
+		command = []string{"sh", "-c", "echo \"$(sw_vers -productName) $(sw_vers -productVersion)\""}
+	case "linux":
+		command = []string{"sh", "-c", "grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '\"'"}
+	case "windows":
+		// Calling PowerShell 7 (or newer) which include OS information.
+		command = []string{"pwsh", "-Command", "$PSVersionTable.OS"}
+	}
+	if len(command) == 0 {
+		return runtime.GOOS
+	}
+	b, err := exec.Command(command[0], command[1:]...).Output()
+	if err != nil {
+		log.Warningf("Error getting operating system display name: %v", err)
+		return runtime.GOOS
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func GetMyHostname() (string, error) {
@@ -252,6 +386,14 @@ func GetZone() string {
 		}
 	}
 	return ""
+}
+
+func GetK8sNamespace() string {
+	return os.Getenv(namespaceEnvVarName)
+}
+
+func GetK8sPodName() string {
+	return os.Getenv(podNameEnvVarName)
 }
 
 func GetK8sPodUID() (string, error) {

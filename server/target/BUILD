@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "target",
@@ -25,6 +25,35 @@ go_library(
         "//server/util/query_builder",
         "//server/util/status",
         "//server/util/uuid",
+        "@org_golang_google_protobuf//types/known/durationpb",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)
+
+go_test(
+    name = "target_test",
+    srcs = ["target_test.go"],
+    exec_properties = {
+        "test.workload-isolation-type": "firecracker",
+        "test.container-image": "docker://gcr.io/flame-public/rbe-ubuntu20-04@sha256:09261f2019e9baa7482f7742cdee8e9972a3971b08af27363a61816b2968f622",
+        "test.init-dockerd": "true",
+        "test.recycle-runner": "true",
+        "test.runner-recycling-key": "clickhouse25.3",
+    },
+    tags = ["docker"],
+    deps = [
+        ":target",
+        "//proto:build_event_stream_go_proto",
+        "//proto:context_go_proto",
+        "//proto:target_go_proto",
+        "//proto/api/v1:common_go_proto",
+        "//server/testutil/testauth",
+        "//server/testutil/testenv",
+        "//server/util/clickhouse/schema",
+        "//server/util/testing/flags",
+        "@com_github_google_go_cmp//cmp",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_protobuf//testing/protocmp",
         "@org_golang_google_protobuf//types/known/durationpb",
         "@org_golang_google_protobuf//types/known/timestamppb",
     ],

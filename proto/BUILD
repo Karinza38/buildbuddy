@@ -1,9 +1,20 @@
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:compiler.bzl", "go_proto_compiler")
-load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
-load("@rules_proto//proto:defs.bzl", "proto_library")
-load(":defs.bzl", "ts_proto_library")
+load(":defs.bzl", "go_proto_library", "ts_proto_library")
 
 package(default_visibility = ["//visibility:public"])
+
+# gazelle:ts disable
+
+go_proto_compiler(
+    name = "vtprotobuf_view_compiler",
+    plugin = "//tools/protoc-gen-go-vtproto-view",
+    suffix = "_vtview.pb.go",
+    valid_archive = False,
+    deps = [
+        "@com_github_planetscale_vtprotobuf//protohelpers",
+    ],
+)
 
 go_proto_compiler(
     name = "vtprotobuf_compiler",
@@ -42,7 +53,10 @@ proto_library(
     name = "api_key_proto",
     srcs = ["api_key.proto"],
     deps = [
+        ":capability_proto",
         ":context_proto",
+        "@com_google_protobuf//:duration_proto",
+        "@com_google_protobuf//:timestamp_proto",
     ],
 )
 
@@ -60,6 +74,8 @@ proto_library(
         ":invocation_proto",
         ":iprules_proto",
         ":secrets_proto",
+        ":usage_proto",
+        ":user_list_proto",
         ":workflow_proto",
         "@com_google_protobuf//:timestamp_proto",
     ],
@@ -76,11 +92,38 @@ proto_library(
 )
 
 proto_library(
+    name = "bazel_flags_proto",
+    srcs = ["bazel_flags.proto"],
+)
+
+proto_library(
     name = "bazel_query_proto",
     srcs = ["bazel_query.proto"],
     deps = [
         ":stardoc_output_proto",
     ],
+)
+
+proto_library(
+    name = "buck_data_proto",
+    srcs = ["buck_data.proto"],
+    deps = [
+        ":buck_error_proto",
+        ":buck_host_sharing_proto",
+        "@com_google_protobuf//:duration_proto",
+        "@com_google_protobuf//:empty_proto",
+        "@com_google_protobuf//:timestamp_proto",
+    ],
+)
+
+proto_library(
+    name = "buck_error_proto",
+    srcs = ["buck_error.proto"],
+)
+
+proto_library(
+    name = "buck_host_sharing_proto",
+    srcs = ["buck_host_sharing.proto"],
 )
 
 proto_library(
@@ -123,6 +166,24 @@ proto_library(
 )
 
 proto_library(
+    name = "cache_proxy_proto",
+    srcs = ["cache_proxy.proto"],
+    deps = [
+        ":acl_proto",
+        ":context_proto",
+        ":upgrade_proto",
+        "@com_google_protobuf//:timestamp_proto",
+    ],
+)
+
+proto_library(
+    name = "capability_proto",
+    srcs = [
+        "capability.proto",
+    ],
+)
+
+proto_library(
     name = "certgenerator_proto",
     srcs = [
         "certgenerator.proto",
@@ -149,8 +210,20 @@ proto_library(
         "distributed_cache.proto",
     ],
     deps = [
+        ":reference_proto",
+        ":remote_execution_proto",
         ":resource_proto",
         "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_proto",
+    ],
+)
+
+proto_library(
+    name = "reference_proto",
+    srcs = [
+        "reference.proto",
+    ],
+    deps = [
+        ":storage_proto",
     ],
 )
 
@@ -161,6 +234,13 @@ proto_library(
     ],
     deps = [
         ":remote_execution_proto",
+    ],
+)
+
+proto_library(
+    name = "routing_proto",
+    srcs = [
+        "routing.proto",
     ],
 )
 
@@ -176,6 +256,7 @@ proto_library(
         ":remote_execution_proto",
         ":scheduler_proto",
         ":stat_filter_proto",
+        "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
         "@googleapis//google/longrunning:operations_proto",
         "@googleapis//google/rpc:status_proto",
@@ -197,12 +278,45 @@ proto_library(
     srcs = ["firecracker.proto"],
     deps = [
         ":remote_execution_proto",
+        "@com_google_protobuf//:timestamp_proto",
     ],
 )
 
 proto_library(
     name = "git_proto",
     srcs = ["git.proto"],
+)
+
+proto_library(
+    name = "gateway_proto",
+    srcs = ["gateway.proto"],
+    deps = [
+        "@com_google_protobuf//:timestamp_proto",
+        "@googleapis//google/rpc:status_proto",
+    ],
+)
+
+go_proto_library(
+    name = "gateway_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/gateway",
+    proto = ":gateway_proto",
+    deps = [
+        "@org_golang_google_genproto_googleapis_rpc//status",
+    ],
+)
+
+proto_library(
+    name = "gateway_service_proto",
+    srcs = ["gateway_service.proto"],
+    deps = [":gateway_proto"],
+)
+
+go_proto_library(
+    name = "gateway_service_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/gateway_service",
+    mode = "services_only",
+    proto = ":gateway_service_proto",
+    deps = [":gateway_go_proto"],
 )
 
 proto_library(
@@ -255,15 +369,36 @@ proto_library(
 )
 
 proto_library(
+    name = "storage_proto",
+    srcs = [
+        "storage.proto",
+    ],
+    deps = [
+        ":remote_execution_proto",
+        ":resource_proto",
+        ":view_proto",
+        "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_proto",
+    ],
+)
+
+proto_library(
     name = "raft_proto",
     srcs = [
         "raft.proto",
     ],
     deps = [
-        ":remote_execution_proto",
-        ":resource_proto",
-        "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_proto",
+        ":storage_proto",
         "@googleapis//google/rpc:status_proto",
+    ],
+)
+
+proto_library(
+    name = "metadata_proto",
+    srcs = [
+        "metadata.proto",
+    ],
+    deps = [
+        ":storage_proto",
     ],
 )
 
@@ -272,17 +407,6 @@ proto_library(
     srcs = ["secrets.proto"],
     deps = [
         ":context_proto",
-    ],
-)
-
-proto_library(
-    name = "soci_proto",
-    srcs = [
-        "soci.proto",
-    ],
-    deps = [
-        ":registry_proto",
-        ":remote_execution_proto",
     ],
 )
 
@@ -351,6 +475,18 @@ proto_library(
     ],
     deps = [
         ":context_proto",
+        ":user_id_proto",
+        "@com_google_protobuf//:timestamp_proto",
+    ],
+)
+
+proto_library(
+    name = "view_proto",
+    srcs = [
+        "view.proto",
+    ],
+    deps = [
+        "@com_google_protobuf//:descriptor_proto",
     ],
 )
 
@@ -361,6 +497,8 @@ proto_library(
     ],
     deps = [
         ":context_proto",
+        ":invocation_status_proto",
+        "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_proto",
     ],
 )
 
@@ -372,7 +510,6 @@ proto_library(
     deps = [
         ":context_proto",
         ":firecracker_proto",
-        ":git_proto",
         ":invocation_status_proto",
         ":remote_execution_proto",
         "@com_google_protobuf//:duration_proto",
@@ -387,7 +524,6 @@ proto_library(
     ],
     deps = [
         ":context_proto",
-        ":git_proto",
     ],
 )
 
@@ -470,9 +606,9 @@ proto_library(
     srcs = ["invocation.proto"],
     deps = [
         ":acl_proto",
-        ":api_key_proto",
         ":build_event_stream_proto",
         ":cache_proto",
+        ":capability_proto",
         ":command_line_proto",
         ":context_proto",
         ":invocation_status_proto",
@@ -508,6 +644,15 @@ proto_library(
 )
 
 proto_library(
+    name = "user_list_proto",
+    srcs = ["user_list.proto"],
+    deps = [
+        ":context_proto",
+        ":user_id_proto",
+    ],
+)
+
+proto_library(
     name = "user_id_proto",
     srcs = ["user_id.proto"],
 )
@@ -518,9 +663,10 @@ proto_library(
         "grp.proto",
     ],
     deps = [
-        ":api_key_proto",
+        ":capability_proto",
         ":context_proto",
         ":user_id_proto",
+        ":user_list_proto",
     ],
 )
 
@@ -541,6 +687,14 @@ proto_library(
 )
 
 proto_library(
+    name = "metadata_service_proto",
+    srcs = ["metadata_service.proto"],
+    deps = [
+        ":metadata_proto",
+    ],
+)
+
+proto_library(
     name = "ping_service_proto",
     srcs = ["ping_service.proto"],
 )
@@ -553,14 +707,17 @@ proto_library(
         ":auditlog_proto",
         ":bazel_config_proto",
         ":cache_proto",
+        ":cache_proxy_proto",
         ":encryption_proto",
         ":eventlog_proto",
         ":execution_stats_proto",
         ":gcp_proto",
         ":github_proto",
         ":group_proto",
+        ":index_proto",
         ":invocation_proto",
         ":iprules_proto",
+        ":notification_proto",
         ":quota_proto",
         ":repo_proto",
         ":resource_proto",
@@ -572,11 +729,25 @@ proto_library(
         ":suggestion_proto",
         ":target_proto",
         ":usage_proto",
+        ":user_list_proto",
         ":user_proto",
         ":workflow_proto",
         ":workspace_proto",
         ":zip_proto",
     ],
+)
+
+proto_library(
+    name = "notification_proto",
+    srcs = ["notification.proto"],
+    deps = [
+        ":context_proto",
+    ],
+)
+
+proto_library(
+    name = "upgrade_proto",
+    srcs = ["upgrade.proto"],
 )
 
 proto_library(
@@ -678,6 +849,7 @@ proto_library(
         ":acl_proto",
         ":context_proto",
         ":trace_proto",
+        ":upgrade_proto",
         "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
         "@googleapis//google/rpc:status_proto",
@@ -697,9 +869,9 @@ proto_library(
     srcs = ["trace.proto"],
 )
 
-proto_library(
+alias(
     name = "worker_proto",
-    srcs = ["worker.proto"],
+    actual = "@bazel_worker_api//:worker_protocol_proto",
 )
 
 proto_library(
@@ -712,7 +884,6 @@ proto_library(
     srcs = ["zip.proto"],
     deps = [
         ":context_proto",
-        ":remote_execution_proto",
         "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_proto",
     ],
 )
@@ -748,9 +919,27 @@ proto_library(
     srcs = ["search.proto"],
     deps = [
         ":context_proto",
+        "@io_kythe//kythe/proto:common_proto",
         "@io_kythe//kythe/proto:filetree_proto",
         "@io_kythe//kythe/proto:graph_proto",
         "@io_kythe//kythe/proto:xref_proto",
+    ],
+)
+
+proto_library(
+    name = "search_rating_proto",
+    srcs = ["search_rating.proto"],
+    deps = [
+        ":git_proto",
+        ":search_proto",
+    ],
+)
+
+proto_library(
+    name = "cache_service_proto",
+    srcs = ["cache_service.proto"],
+    deps = [
+        ":cache_proto",
     ],
 )
 
@@ -813,23 +1002,32 @@ proto_library(
     ],
 )
 
-# Go proto rules below here
-go_proto_library(
-    name = "prometheus_client_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
-    importpath = "github.com/prometheus/client_model/go",
-    proto = "@com_github_prometheus_client_model//io/prometheus/client:io_prometheus_client_proto",
+proto_library(
+    name = "ociregistry_proto",
+    srcs = ["ociregistry.proto"],
 )
+
+proto_library(
+    name = "oci_fetcher_proto",
+    srcs = ["oci_fetcher.proto"],
+    deps = [":registry_proto"],
+)
+
+proto_library(
+    name = "hit_tracker_proto",
+    srcs = ["hit_tracker.proto"],
+    deps = [
+        ":cache_proto",
+        ":remote_execution_proto",
+        ":resource_proto",
+        "@com_google_protobuf//:duration_proto",
+    ],
+)
+
+# Go proto rules below here
 
 go_proto_library(
     name = "acl_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/acl",
     proto = ":acl_proto",
     deps = [
@@ -839,33 +1037,22 @@ go_proto_library(
 
 go_proto_library(
     name = "action_cache_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/action_cache",
     proto = ":action_cache_proto",
 )
 
 go_proto_library(
     name = "api_key_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/api_key",
     proto = ":api_key_proto",
     deps = [
+        ":capability_go_proto",
         ":context_go_proto",
     ],
 )
 
 go_proto_library(
     name = "auditlog_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/auditlog",
     proto = ":auditlog_proto",
     deps = [
@@ -877,37 +1064,33 @@ go_proto_library(
         ":invocation_go_proto",
         ":iprules_go_proto",
         ":secrets_go_proto",
+        ":usage_go_proto",
+        ":user_list_go_proto",
         ":workflow_go_proto",
     ],
 )
 
 go_proto_library(
     name = "auth_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/auth",
+    mode = "messages_and_services",
     proto = ":auth_proto",
 )
 
 go_proto_library(
     name = "stardoc_output_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/stardoc_output",
     proto = ":stardoc_output_proto",
 )
 
 go_proto_library(
+    name = "bazel_flags_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/bazel_flags",
+    proto = ":bazel_flags_proto",
+)
+
+go_proto_library(
     name = "bazel_query_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/bazel_query",
     proto = ":bazel_query_proto",
     deps = [
@@ -916,21 +1099,35 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "build_status_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
+    name = "buck_data_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckdata",
+    proto = ":buck_data_proto",
+    deps = [
+        ":buck_error_go_proto",
+        ":buck_host_sharing_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "buck_error_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckerror",
+    proto = ":buck_error_proto",
+)
+
+go_proto_library(
+    name = "buck_host_sharing_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/buckhostsharing",
+    proto = ":buck_host_sharing_proto",
+)
+
+go_proto_library(
+    name = "build_status_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/build_status",
     proto = ":build_status_proto",
 )
 
 go_proto_library(
     name = "build_events_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/build_events",
     proto = ":build_events_proto",
     deps = [
@@ -940,30 +1137,18 @@ go_proto_library(
 
 go_proto_library(
     name = "config_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/config",
     proto = ":config_proto",
 )
 
 go_proto_library(
     name = "server_notification_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/server_notification",
     proto = ":server_notification_proto",
 )
 
 go_proto_library(
     name = "execution_stats_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/execution_stats",
     proto = ":execution_stats_proto",
     deps = [
@@ -981,20 +1166,12 @@ go_proto_library(
 
 go_proto_library(
     name = "failure_details_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/failure_details",
     proto = ":failure_details_proto",
 )
 
 go_proto_library(
     name = "firecracker_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/firecracker",
     proto = ":firecracker_proto",
     deps = [
@@ -1004,10 +1181,6 @@ go_proto_library(
 
 go_proto_library(
     name = "git_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/git",
     proto = ":git_proto",
     deps = [
@@ -1016,10 +1189,6 @@ go_proto_library(
 
 go_proto_library(
     name = "github_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/github",
     proto = ":github_proto",
     deps = [
@@ -1029,10 +1198,6 @@ go_proto_library(
 
 go_proto_library(
     name = "gcp_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/gcp",
     proto = ":gcp_proto",
     deps = [
@@ -1042,32 +1207,20 @@ go_proto_library(
 
 go_proto_library(
     name = "pagination_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/pagination",
     proto = ":pagination_proto",
 )
 
 go_proto_library(
     name = "package_load_metrics_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/package_load_metrics",
     proto = ":package_load_metrics_proto",
 )
 
 go_proto_library(
     name = "publish_build_event_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event",
+    mode = "messages_and_services",
     proto = ":publish_build_event_proto",
     deps = [
         ":build_events_go_proto",
@@ -1077,23 +1230,17 @@ go_proto_library(
 
 go_proto_library(
     name = "usage_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/usage",
     proto = ":usage_proto",
     deps = [
         ":context_go_proto",
+        ":user_id_go_proto",
+        "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )
 
 go_proto_library(
     name = "build_event_stream_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream",
     proto = ":build_event_stream_proto",
     deps = [
@@ -1107,10 +1254,6 @@ go_proto_library(
 
 go_proto_library(
     name = "quota_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/quota",
     proto = ":quota_proto",
     deps = [
@@ -1120,10 +1263,6 @@ go_proto_library(
 
 go_proto_library(
     name = "secrets_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/secrets",
     proto = ":secrets_proto",
     deps = [
@@ -1132,26 +1271,7 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "soci_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/soci",
-    proto = ":soci_proto",
-    deps = [
-        ":registry_go_proto",
-        ":remote_execution_go_proto",
-    ],
-)
-
-go_proto_library(
     name = "spawn_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/spawn",
     proto = ":spawn_proto",
     deps = [
@@ -1163,10 +1283,6 @@ go_proto_library(
 
 go_proto_library(
     name = "spawn_diff_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/spawn_diff",
     proto = ":spawn_diff_proto",
     deps = [
@@ -1176,10 +1292,6 @@ go_proto_library(
 
 go_proto_library(
     name = "stat_filter_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/stat_filter",
     proto = ":stat_filter_proto",
     deps = [
@@ -1189,10 +1301,6 @@ go_proto_library(
 
 go_proto_library(
     name = "stats_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/stats",
     proto = ":stats_proto",
     deps = [
@@ -1204,10 +1312,6 @@ go_proto_library(
 
 go_proto_library(
     name = "target_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/target",
     proto = ":target_proto",
     deps = [
@@ -1219,35 +1323,25 @@ go_proto_library(
 
 go_proto_library(
     name = "target_pagination_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/target_pagination",
     proto = ":target_pagination_proto",
 )
 
 go_proto_library(
     name = "eventlog_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/eventlog",
     proto = ":eventlog_proto",
     deps = [
         ":context_go_proto",
+        ":invocation_status_go_proto",
+        "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_go_proto",
     ],
 )
 
 go_proto_library(
     name = "vmexec_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/vmexec",
+    mode = "messages_and_services",
     proto = ":vmexec_proto",
     deps = [
         ":remote_execution_go_proto",
@@ -1257,12 +1351,8 @@ go_proto_library(
 
 go_proto_library(
     name = "vmvfs_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/vmvfs",
+    mode = "messages_and_services",
     proto = ":vmvfs_proto",
     deps = [
         ":remote_execution_go_proto",
@@ -1271,27 +1361,18 @@ go_proto_library(
 
 go_proto_library(
     name = "vfs_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/vfs",
+    mode = "messages_and_services",
     proto = ":vfs_proto",
 )
 
 go_proto_library(
     name = "workflow_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/workflow",
     proto = ":workflow_proto",
     deps = [
         ":context_go_proto",
         ":firecracker_go_proto",
-        ":git_go_proto",
         ":invocation_status_go_proto",
         ":remote_execution_go_proto",
         "@org_golang_google_genproto_googleapis_rpc//status",
@@ -1300,10 +1381,6 @@ go_proto_library(
 
 go_proto_library(
     name = "workspace_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/workspace",
     proto = ":workspace_proto",
     deps = [
@@ -1312,27 +1389,45 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "raft_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/raft",
-    proto = ":raft_proto",
+    name = "storage_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/storage",
+    proto = ":storage_proto",
+    views = True,
     deps = [
         ":remote_execution_go_proto",
         ":resource_go_proto",
+        ":view_go_proto",
         "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_go_proto",
+    ],
+)
+
+go_proto_library(
+    name = "view_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/view",
+    proto = ":view_proto",
+)
+
+go_proto_library(
+    name = "raft_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/raft",
+    proto = ":raft_proto",
+    deps = [
+        ":storage_go_proto",
         "@org_golang_google_genproto_googleapis_rpc//status",
     ],
 )
 
 go_proto_library(
-    name = "runner_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
+    name = "metadata_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/metadata",
+    proto = ":metadata_proto",
+    deps = [
+        ":storage_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "runner_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/runner",
     proto = ":runner_proto",
     deps = [
@@ -1344,10 +1439,6 @@ go_proto_library(
 
 go_proto_library(
     name = "invocation_policy_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/invocation_policy",
     proto = ":invocation_policy_proto",
     deps = [
@@ -1357,20 +1448,12 @@ go_proto_library(
 
 go_proto_library(
     name = "strategy_policy_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/strategy_policy",
     proto = ":strategy_policy_proto",
 )
 
 go_proto_library(
     name = "command_line_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/command_line",
     proto = ":command_line_proto",
     deps = [
@@ -1380,10 +1463,6 @@ go_proto_library(
 
 go_proto_library(
     name = "resource_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/resource",
     proto = ":resource_proto",
     deps = [
@@ -1392,28 +1471,26 @@ go_proto_library(
 )
 
 go_proto_library(
+    name = "routing_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/routing",
+    proto = ":routing_proto",
+)
+
+go_proto_library(
     name = "option_filters_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/options",
     proto = ":option_filters_proto",
 )
 
 go_proto_library(
     name = "invocation_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/invocation",
     proto = ":invocation_proto",
     deps = [
         ":acl_go_proto",
-        ":api_key_go_proto",
         ":build_event_stream_go_proto",
         ":cache_go_proto",
+        ":capability_go_proto",
         ":command_line_go_proto",
         ":context_go_proto",
         ":invocation_status_go_proto",
@@ -1424,21 +1501,14 @@ go_proto_library(
 
 go_proto_library(
     name = "invocation_status_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/invocation_status",
     proto = ":invocation_status_proto",
 )
 
 go_proto_library(
     name = "iprules_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/iprules",
+    mode = "messages_and_services",
     proto = ":iprules_proto",
     deps = [
         ":context_go_proto",
@@ -1447,12 +1517,8 @@ go_proto_library(
 
 go_proto_library(
     name = "raft_service_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/raft_service",
+    mode = "services_only",
     proto = ":raft_service_proto",
     deps = [
         ":raft_go_proto",
@@ -1460,38 +1526,43 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "ping_service_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
+    name = "metadata_service_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/metadata_service",
+    mode = "services_only",
+    proto = ":metadata_service_proto",
+    deps = [
+        ":metadata_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "ping_service_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/ping_service",
+    mode = "messages_and_services",
     proto = ":ping_service_proto",
 )
 
 go_proto_library(
     name = "buildbuddy_service_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service",
+    mode = "services_only",
     proto = ":buildbuddy_service_proto",
     deps = [
         ":api_key_go_proto",
         ":auditlog_go_proto",
         ":bazel_config_go_proto",
         ":cache_go_proto",
+        ":cache_proxy_go_proto",
         ":encryption_go_proto",
         ":eventlog_go_proto",
         ":execution_stats_go_proto",
         ":gcp_go_proto",
         ":github_go_proto",
         ":group_go_proto",
+        ":index_go_proto",
         ":invocation_go_proto",
         ":iprules_go_proto",
+        ":notification_go_proto",
         ":quota_go_proto",
         ":repo_go_proto",
         ":resource_go_proto",
@@ -1504,6 +1575,7 @@ go_proto_library(
         ":target_go_proto",
         ":usage_go_proto",
         ":user_go_proto",
+        ":user_list_go_proto",
         ":workflow_go_proto",
         ":workspace_go_proto",
         ":zip_go_proto",
@@ -1511,54 +1583,49 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "semver_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
+    name = "notification_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/notification",
+    proto = ":notification_proto",
+    deps = [
+        ":context_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "upgrade_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/upgrade",
+    proto = ":upgrade_proto",
+)
+
+go_proto_library(
+    name = "semver_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/semver",
     proto = ":semver_proto",
 )
 
 go_proto_library(
     name = "sidecar_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/sidecar",
+    mode = "messages_and_services",
     proto = ":sidecar_proto",
 )
 
 go_proto_library(
     name = "registry_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/registry",
+    mode = "messages_and_services",
     proto = ":registry_proto",
     deps = [":remote_execution_go_proto"],
 )
 
 go_proto_library(
     name = "user_id_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/user_id",
     proto = ":user_id_proto",
 )
 
 go_proto_library(
     name = "user_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/user",
     proto = ":user_proto",
     deps = [
@@ -1569,30 +1636,35 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "group_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
-    importpath = "github.com/buildbuddy-io/buildbuddy/proto/group",
-    proto = ":group_proto",
+    name = "user_list_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/user_list",
+    proto = ":user_list_proto",
     deps = [
-        ":api_key_go_proto",
         ":context_go_proto",
         ":user_id_go_proto",
     ],
 )
 
 go_proto_library(
-    name = "cache_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
+    name = "group_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/group",
+    proto = ":group_proto",
+    deps = [
+        ":api_key_go_proto",
+        ":capability_go_proto",
+        ":context_go_proto",
+        ":user_id_go_proto",
+        ":user_list_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "cache_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/cache",
     proto = ":cache_proto",
     deps = [
         ":context_go_proto",
+        ":execution_stats_go_proto",
         ":remote_execution_go_proto",
         ":resource_go_proto",
         "@org_golang_google_genproto_googleapis_rpc//status",
@@ -1600,13 +1672,27 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "certgenerator_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-        "//proto:vtprotobuf_compiler",
+    name = "cache_proxy_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/cache_proxy",
+    mode = "messages_and_services",
+    proto = ":cache_proxy_proto",
+    deps = [
+        ":acl_go_proto",
+        ":context_go_proto",
+        ":upgrade_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "capability_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/capability",
+    proto = ":capability_proto",
+)
+
+go_proto_library(
+    name = "certgenerator_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/certgenerator",
+    mode = "messages_and_services",
     proto = ":certgenerator_proto",
     deps = [
     ],
@@ -1614,10 +1700,6 @@ go_proto_library(
 
 go_proto_library(
     name = "context_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/context",
     proto = ":context_proto",
     deps = [
@@ -1627,10 +1709,6 @@ go_proto_library(
 
 go_proto_library(
     name = "bazel_config_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/bazel_config",
     proto = ":bazel_config_proto",
     deps = [
@@ -1641,27 +1719,30 @@ go_proto_library(
 
 go_proto_library(
     name = "distributed_cache_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/distributed_cache",
+    mode = "messages_and_services",
     proto = ":distributed_cache_proto",
     deps = [
+        ":reference_go_proto",
+        ":remote_execution_go_proto",
         ":resource_go_proto",
         "@com_github_planetscale_vtprotobuf//include/github.com/planetscale/vtprotobuf/vtproto:vtproto_go_proto",
     ],
 )
 
 go_proto_library(
-    name = "remote_asset_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
+    name = "reference_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/reference",
+    proto = ":reference_proto",
+    deps = [
+        ":storage_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "remote_asset_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/remote_asset",
+    mode = "messages_and_services",
     proto = ":remote_asset_proto",
     deps = [
         ":remote_execution_go_proto",
@@ -1674,10 +1755,6 @@ go_proto_library(
 
 go_proto_library(
     name = "remote_execution_log_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/remote_execution_log",
     proto = ":remote_execution_log_proto",
     deps = [
@@ -1691,12 +1768,8 @@ go_proto_library(
 
 go_proto_library(
     name = "remote_execution_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/remote_execution",
+    mode = "messages_and_services",
     proto = ":remote_execution_proto",
     deps = [
         ":scheduler_go_proto",
@@ -1709,10 +1782,6 @@ go_proto_library(
 
 go_proto_library(
     name = "repo_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/repo",
     proto = ":repo_proto",
     deps = [
@@ -1722,12 +1791,8 @@ go_proto_library(
 
 go_proto_library(
     name = "telemetry_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/telemetry",
+    mode = "messages_and_services",
     proto = ":telemetry_proto",
     deps = [
         "@org_golang_google_genproto_googleapis_rpc//status",
@@ -1736,29 +1801,22 @@ go_proto_library(
 
 go_proto_library(
     name = "scheduler_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/scheduler",
+    mode = "messages_and_services",
     proto = ":scheduler_proto",
     deps = [
         ":acl_go_proto",
         ":context_go_proto",
         ":trace_go_proto",
+        ":upgrade_go_proto",
         "@org_golang_google_genproto_googleapis_rpc//status",
     ],
 )
 
 go_proto_library(
     name = "suggestion_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/suggestion",
+    mode = "messages_and_services",
     proto = ":suggestion_proto",
     deps = [
         ":context_go_proto",
@@ -1767,42 +1825,26 @@ go_proto_library(
 
 go_proto_library(
     name = "trace_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/trace",
+    mode = "messages_and_services",
     proto = ":trace_proto",
 )
 
 go_proto_library(
     name = "worker_go_proto",
-    compilers = [
-        "//proto:vtprotobuf_compiler",
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/worker",
+    mode = "messages_and_services",
     proto = ":worker_proto",
 )
 
 go_proto_library(
     name = "stored_invocation_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/stored_invocation",
     proto = ":stored_invocation_proto",
 )
 
 go_proto_library(
     name = "zip_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/zip",
     proto = ":zip_proto",
     deps = [
@@ -1814,11 +1856,8 @@ go_proto_library(
 
 go_proto_library(
     name = "encryption_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/encryption",
+    mode = "messages_and_services",
     proto = ":encryption_proto",
     deps = [
         ":context_go_proto",
@@ -1827,14 +1866,10 @@ go_proto_library(
 
 go_proto_library(
     name = "metrics_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "//proto:vtprotobuf_compiler",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/metrics",
     proto = ":metrics_proto",
     deps = [
-        ":prometheus_client_go_proto",
+        "@com_github_prometheus_client_model//io/prometheus/client:go",
     ],
 )
 
@@ -1855,6 +1890,7 @@ go_proto_library(
     proto = ":search_proto",
     deps = [
         ":context_go_proto",
+        "@io_kythe//kythe/proto:common_go_proto",
         "@io_kythe//kythe/proto:filetree_go_proto",
         "@io_kythe//kythe/proto:graph_go_proto",
         "@io_kythe//kythe/proto:xref_go_proto",
@@ -1862,12 +1898,29 @@ go_proto_library(
 )
 
 go_proto_library(
-    name = "codesearch_service_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
+    name = "search_rating_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/search_rating",
+    proto = ":search_rating_proto",
+    deps = [
+        ":git_go_proto",
+        ":search_go_proto",
     ],
+)
+
+go_proto_library(
+    name = "cache_service_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/cache_service",
+    mode = "services_only",
+    proto = ":cache_service_proto",
+    deps = [
+        ":cache_go_proto",
+    ],
+)
+
+go_proto_library(
+    name = "codesearch_service_go_proto",
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/codesearch_service",
+    mode = "services_only",
     proto = ":codesearch_service_proto",
     deps = [
         ":index_go_proto",
@@ -1877,11 +1930,8 @@ go_proto_library(
 
 go_proto_library(
     name = "kythe_service_go_proto",
-    compilers = [
-        "@io_bazel_rules_go//proto:go_proto",
-        "@io_bazel_rules_go//proto:go_grpc_v2",
-    ],
     importpath = "github.com/buildbuddy-io/buildbuddy/proto/kythe_service",
+    mode = "services_only",
     proto = ":kythe_service_proto",
     deps = [
         "@io_kythe//kythe/proto:analysis_go_proto",
@@ -1893,6 +1943,32 @@ go_proto_library(
         "@io_kythe//kythe/proto:status_service_go_proto",
         "@io_kythe//kythe/proto:storage_go_proto",
         "@io_kythe//kythe/proto:xref_go_proto",
+    ],
+)
+
+go_proto_library(
+    name = "ociregistry_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/ociregistry",
+    proto = ":ociregistry_proto",
+)
+
+go_proto_library(
+    name = "oci_fetcher_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/oci_fetcher",
+    mode = "messages_and_services",
+    proto = ":oci_fetcher_proto",
+    deps = [":registry_go_proto"],
+)
+
+go_proto_library(
+    name = "hit_tracker_go_proto",
+    importpath = "github.com/buildbuddy-io/buildbuddy/proto/hit_tracker",
+    mode = "messages_and_services",
+    proto = ":hit_tracker_proto",
+    deps = [
+        ":cache_go_proto",
+        ":remote_execution_go_proto",
+        ":resource_go_proto",
     ],
 )
 
@@ -1915,7 +1991,10 @@ ts_proto_library(
     name = "api_key_ts_proto",
     proto = ":api_key_proto",
     deps = [
+        ":capability_ts_proto",
         ":context_ts_proto",
+        ":duration_ts_proto",
+        ":timestamp_ts_proto",
     ],
 )
 
@@ -1932,6 +2011,8 @@ ts_proto_library(
         ":iprules_ts_proto",
         ":secrets_ts_proto",
         ":timestamp_ts_proto",
+        ":usage_ts_proto",
+        ":user_list_ts_proto",
         ":workflow_ts_proto",
     ],
 )
@@ -1961,6 +2042,7 @@ ts_proto_library(
     deps = [
         ":acl_ts_proto",
         ":context_ts_proto",
+        ":duration_ts_proto",
         ":google_longrunning_ts_proto",
         ":grpc_status_ts_proto",
         ":invocation_status_ts_proto",
@@ -2070,6 +2152,7 @@ ts_proto_library(
         ":grpc_status_ts_proto",
         ":timestamp_ts_proto",
         ":trace_ts_proto",
+        ":upgrade_ts_proto",
     ],
 )
 
@@ -2135,6 +2218,8 @@ ts_proto_library(
     proto = ":eventlog_proto",
     deps = [
         ":context_ts_proto",
+        ":invocation_status_ts_proto",
+        ":vtproto_ts_proto",
     ],
 )
 
@@ -2145,7 +2230,6 @@ ts_proto_library(
         ":context_ts_proto",
         ":duration_ts_proto",
         ":firecracker_ts_proto",
-        ":git_ts_proto",
         ":grpc_status_ts_proto",
         ":invocation_status_ts_proto",
         ":remote_execution_ts_proto",
@@ -2187,13 +2271,18 @@ ts_proto_library(
 )
 
 ts_proto_library(
+    name = "stored_invocation_ts_proto",
+    proto = ":stored_invocation_proto",
+)
+
+ts_proto_library(
     name = "invocation_ts_proto",
     proto = ":invocation_proto",
     deps = [
         ":acl_ts_proto",
-        ":api_key_ts_proto",
         ":build_event_stream_ts_proto",
         ":cache_ts_proto",
+        ":capability_ts_proto",
         ":command_line_ts_proto",
         ":context_ts_proto",
         ":duration_ts_proto",
@@ -2227,10 +2316,25 @@ ts_proto_library(
 )
 
 ts_proto_library(
+    name = "notification_ts_proto",
+    proto = ":notification_proto",
+    deps = [
+        ":context_ts_proto",
+    ],
+)
+
+ts_proto_library(
+    name = "upgrade_ts_proto",
+    proto = ":upgrade_proto",
+)
+
+ts_proto_library(
     name = "usage_ts_proto",
     proto = ":usage_proto",
     deps = [
         ":context_ts_proto",
+        ":timestamp_ts_proto",
+        ":user_id_ts_proto",
     ],
 )
 
@@ -2239,9 +2343,20 @@ ts_proto_library(
     proto = ":search_proto",
     deps = [
         ":context_ts_proto",
+        ":kythe_common_ts_proto",
         ":kythe_filetree_ts_proto",
         ":kythe_graph_ts_proto",
         ":kythe_xref_ts_proto",
+    ],
+)
+
+ts_proto_library(
+    name = "index_ts_proto",
+    proto = ":index_proto",
+    deps = [
+        ":context_ts_proto",
+        ":git_ts_proto",
+        ":resource_ts_proto",
     ],
 )
 
@@ -2250,8 +2365,10 @@ ts_proto_library(
     proto = ":group_proto",
     deps = [
         ":api_key_ts_proto",
+        ":capability_ts_proto",
         ":context_ts_proto",
         ":user_id_ts_proto",
+        ":user_list_ts_proto",
     ],
 )
 
@@ -2347,12 +2464,29 @@ ts_proto_library(
     deps = [
         ":context_ts_proto",
         ":duration_ts_proto",
+        ":execution_stats_ts_proto",
         ":field_mask_ts_proto",
         ":grpc_status_ts_proto",
         ":remote_execution_ts_proto",
         ":resource_ts_proto",
         ":timestamp_ts_proto",
     ],
+)
+
+ts_proto_library(
+    name = "cache_proxy_ts_proto",
+    proto = ":cache_proxy_proto",
+    deps = [
+        ":acl_ts_proto",
+        ":context_ts_proto",
+        ":timestamp_ts_proto",
+        ":upgrade_ts_proto",
+    ],
+)
+
+ts_proto_library(
+    name = "capability_ts_proto",
+    proto = ":capability_proto",
 )
 
 ts_proto_library(
@@ -2371,6 +2505,15 @@ ts_proto_library(
 )
 
 ts_proto_library(
+    name = "user_list_ts_proto",
+    proto = ":user_list_proto",
+    deps = [
+        ":context_ts_proto",
+        ":user_id_ts_proto",
+    ],
+)
+
+ts_proto_library(
     name = "encryption_ts_proto",
     proto = ":encryption_proto",
     deps = [":context_ts_proto"],
@@ -2383,6 +2526,7 @@ ts_proto_library(
         ":api_key_ts_proto",
         ":auditlog_ts_proto",
         ":bazel_config_ts_proto",
+        ":cache_proxy_ts_proto",
         ":cache_ts_proto",
         ":encryption_ts_proto",
         ":eventlog_ts_proto",
@@ -2390,8 +2534,10 @@ ts_proto_library(
         ":gcp_ts_proto",
         ":github_ts_proto",
         ":group_ts_proto",
+        ":index_ts_proto",
         ":invocation_ts_proto",
         ":iprules_ts_proto",
+        ":notification_ts_proto",
         ":quota_ts_proto",
         ":repo_ts_proto",
         ":runner_ts_proto",
@@ -2402,6 +2548,7 @@ ts_proto_library(
         ":suggestion_ts_proto",
         ":target_ts_proto",
         ":usage_ts_proto",
+        ":user_list_ts_proto",
         ":user_ts_proto",
         ":workflow_ts_proto",
         ":workspace_ts_proto",
@@ -2453,6 +2600,7 @@ ts_proto_library(
     proto = ":firecracker_proto",
     deps = [
         ":remote_execution_ts_proto",
+        ":timestamp_ts_proto",
     ],
 )
 

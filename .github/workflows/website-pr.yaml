@@ -2,9 +2,8 @@ name: Build Website
 
 on:
   pull_request:
-    branches:
-      - master
     paths:
+      - ".github/workflows/website-pr.yaml"
       - "docs/**"
       - "website/**"
       - "server/metrics/**"
@@ -16,13 +15,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Setup Bazel Go module cache
+        uses: ./.github/actions/setup-bazel-go-mod-cache
 
       - name: Build Website
         run: |
           API_KEY="${{ secrets.BUILDBUDDY_ORG_API_KEY }}"
-          API_KEY_ARGS=()
           if [[ "$API_KEY" ]]; then
-            API_KEY_ARGS=("--remote_header=x-buildbuddy-api-key=$API_KEY")
+            echo >>user.bazelrc "common --config=ci --remote_header=x-buildbuddy-api-key=$API_KEY"
+          else
+            echo >>user.bazelrc "common --config=ci-anon"
           fi
-          bazelisk build //website:website --config=ci "${API_KEY_ARGS[@]}"
+          bazelisk build --repository_cache='~/repo-cache/' //website:website

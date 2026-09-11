@@ -1,7 +1,7 @@
+import { AlertCircle, CheckCircle, PlayCircle, XCircle } from "lucide-react";
 import React from "react";
-import format from "../format/format";
-import { AlertCircle, XCircle, PlayCircle, CheckCircle } from "lucide-react";
 import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
+import format from "../format/format";
 import { durationToMillisWithFallback } from "../util/proto";
 import TargetTestSuiteComponent from "./target_test_suite";
 
@@ -29,13 +29,13 @@ export default class TargetTestCasesCardComponent extends React.Component<Props>
   renderStatusIcon() {
     switch (this.props.tagName) {
       case "failure":
-        return <XCircle className="icon red" />;
+        return <XCircle className="red" />;
       case "error":
-        return <AlertCircle className="icon black" />;
+        return <AlertCircle className="black" />;
       case "skipped":
-        return <PlayCircle className="icon" />;
+        return <PlayCircle />;
       default:
-        return <CheckCircle className="icon green" />;
+        return <CheckCircle className="green" />;
     }
   }
 
@@ -53,11 +53,16 @@ export default class TargetTestCasesCardComponent extends React.Component<Props>
   }
 
   render() {
-    let testCases = Array.from(this.props.testSuite.getElementsByTagName("testcase")).filter(
-      (testCase) =>
-        (!this.props.tagName && testCase.children.length == 0) ||
-        (this.props.tagName && testCase.getElementsByTagName(this.props.tagName).length > 0)
-    );
+    let testCases = Array.from(this.props.testSuite.getElementsByTagName("testcase")).filter((testCase) => {
+      let isSuccessCard = this.props.tagName === undefined;
+      let hasMatchingChildren =
+        this.props.tagName !== undefined && testCase.getElementsByTagName(this.props.tagName).length > 0;
+      let hasFailureErrorSkippedChildren =
+        testCase.getElementsByTagName("failure").length > 0 ||
+        testCase.getElementsByTagName("error").length > 0 ||
+        testCase.getElementsByTagName("skipped").length > 0;
+      return (isSuccessCard && !hasFailureErrorSkippedChildren) || (!isSuccessCard && hasMatchingChildren);
+    });
     return (
       testCases.length > 0 && (
         <div className={`card artifacts ${this.getCardClass()}`}>

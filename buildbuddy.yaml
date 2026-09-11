@@ -1,6 +1,8 @@
 actions:
   - name: Test
-    container_image: ubuntu-20.04
+    container_image: ubuntu-22.04
+    resource_requests:
+      disk: 27GB
     triggers:
       push:
         branches:
@@ -9,23 +11,11 @@ actions:
       pull_request:
         branches:
           - "*"
-    bazel_commands:
-      - test //... --config=linux-workflows --config=race --test_tag_filters=-performance,-docker,-bare
-  - name: Test with BzlMod
-    container_image: ubuntu-20.04
-    resource_requests:
-      disk: 27GB
-    triggers:
-      push:
-        branches:
-          - "master"
-      pull_request:
-        branches:
-          - "*"
-    bazel_commands:
-      - test //... --enable_bzlmod --config=linux-workflows --config=race --test_tag_filters=-performance,-docker,-bare
+    steps:
+      - run: "bazel test //enterprise/server/cmd/executor:executor_linux_amd64_static //... --config=linux-workflows --config=race --config=tests-ci --experimental_enable_execution_graph_log --experimental_execution_graph_log_dep_type=all --experimental_execution_graph_include_change_pruned_actions"
+    allow_concurrent_runs: false
   - name: Check style
-    container_image: ubuntu-20.04
+    container_image: ubuntu-22.04
     triggers:
       push:
         branches:
@@ -36,10 +26,13 @@ actions:
     # Do a non-shallow fetch so that we can diff against the previous commit
     # when running on push to master.
     git_fetch_depth: 0
-    bazel_commands:
-      - run //tools/checkstyle --config=linux-workflows
+    steps:
+      - run: "bazel run //tools/lint --config=linux-workflows"
+    allow_concurrent_runs: false
   - name: Test (darwin_amd64)
     os: "darwin"
+    self_hosted: true
+    pool: workflows
     triggers:
       push:
         branches:
@@ -47,22 +40,27 @@ actions:
       pull_request:
         branches:
           - "*"
+        merge_with_base_interval: 3h
     # TODO: Fix the tests below on Mac, and re-enable.
-    bazel_commands:
-      - >-
-        test --config=mac-workflows --test_tag_filters=-performance,-webdriver,-docker,-bare
-        --
-        //...
-        -//server/backends/disk_cache:all
-        -//enterprise/server/backends/pebble_cache:all
-        -//enterprise/server/raft/txn:all
-        -//enterprise/server/raft/store:all
-        -//enterprise/server/remote_execution/commandutil:all
-        -//enterprise/server/remote_execution/runner:all
-        -//enterprise/server/test/integration/...
+    steps:
+      - run: >-
+          bazel test --config=mac-workflows
+          --
+          //...
+          -//server/backends/disk_cache:all
+          -//server/test/integration/remote_asset:all
+          -//enterprise/server/backends/pebble_cache:all
+          -//enterprise/server/raft/txn:all
+          -//enterprise/server/raft/store:all
+          -//enterprise/server/remote_execution/commandutil:all
+          -//enterprise/server/remote_execution/runner:all
+          -//enterprise/server/test/integration/...
+    allow_concurrent_runs: false
   - name: Test (darwin_arm64)
     os: "darwin"
     arch: "arm64"
+    self_hosted: true
+    pool: workflows
     triggers:
       push:
         branches:
@@ -70,43 +68,32 @@ actions:
       pull_request:
         branches:
           - "*"
+        merge_with_base_interval: 3h
     # TODO: Fix the tests below on Mac, and re-enable.
-    bazel_commands:
-      - >-
-        test --config=mac-workflows --test_tag_filters=-performance,-webdriver,-docker,-bare
-        --
-        //...
-        -//server/backends/disk_cache:all
-        -//enterprise/server/backends/pebble_cache:all
-        -//enterprise/server/raft/txn:all
-        -//enterprise/server/raft/store:all
-        -//enterprise/server/remote_execution/commandutil:all
-        -//enterprise/server/remote_execution/runner:all
-        -//enterprise/server/test/integration/...
+    steps:
+      - run: >-
+          bazel test --config=mac-workflows
+          --
+          //...
+          -//server/backends/disk_cache:all
+          -//server/test/integration/remote_asset:all
+          -//enterprise/server/backends/pebble_cache:all
+          -//enterprise/server/raft/txn:all
+          -//enterprise/server/raft/store:all
+          -//enterprise/server/remote_execution/commandutil:all
+          -//enterprise/server/remote_execution/runner:all
+          -//enterprise/server/test/integration/...
+    allow_concurrent_runs: false
   - name: Benchmark
-    container_image: ubuntu-20.04
+    container_image: ubuntu-22.04
     triggers:
       push:
         branches:
           - "master"
-    bazel_commands:
-      - test //... --config=linux-workflows --config=performance --test_tag_filters=+performance
-  # TODO(bduffany): Move docker tests to the Test workflow when they are fast enough.
-  - name: Docker tests
-    container_image: ubuntu-20.04
-    triggers:
-      push:
-        branches:
-          - "master"
-      pull_request:
-        branches:
-          - "*"
-    bazel_commands:
-      # TODO(http://go/b/1249): Increase reliability of runner recycling when
-      # executing with high concurrency, and remove `--jobs=3`
-      - test //... --config=linux-workflows --config=race --test_tag_filters=+docker --build_tag_filters=+docker --jobs=3
+    steps:
+      - run: "bazel test //... --config=linux-workflows --config=performance --config=tests-performance"
   - name: Baremetal tests
-    container_image: ubuntu-20.04
+    container_image: ubuntu-22.04
     triggers:
       push:
         branches:
@@ -114,8 +101,37 @@ actions:
       pull_request:
         branches:
           - "*"
-    bazel_commands:
-      - test //... --config=linux-workflows --config=race --test_tag_filters=+bare --build_tag_filters=+bare
+        merge_with_base_interval: 3h
+    steps:
+      - run: "bazel test //... --config=linux-workflows --config=race --config=tests-bare"
+    allow_concurrent_runs: false
+  - name: Nightly non-determinism check
+    triggers:
+      schedule:
+        crons: ["0 8 * * *"] # 8:00 UTC nightly
+    container_image: ubuntu-22.04
+    resource_requests:
+      disk: 40GB
+      cpu: 8
+      memory: 16GB
+    steps:
+      - run: |
+          bb detect nondeterminism --bazel_command='build //... --config=linux-workflows' --notify_email --notify_slack=BB_CHECKS_SLACK_WEBHOOK_URL
+  - name: Code review
+    container_image: ubuntu-22.04
+    triggers:
+      pull_request:
+        branches:
+          - "*"
+        types:
+          - opened
+          - ready_for_review
+    user: buildbuddy
+    steps:
+      - run: |
+          enterprise/tools/agents/setup-gh.sh
+          enterprise/tools/agents/claude/setup.sh
+          bazel run //enterprise/tools/agent_review --config=linux-workflows
 
 plugins:
   - path: cli/plugins/go-deps

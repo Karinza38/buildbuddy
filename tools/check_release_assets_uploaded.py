@@ -8,15 +8,20 @@ import time
 EXPECTED_ASSETS = [
     # enterprise app
     "buildbuddy-enterprise-darwin-amd64",
+    "buildbuddy-enterprise-darwin-arm64",
     "buildbuddy-enterprise-linux-amd64",
+    "buildbuddy-enterprise-linux-arm64",
     # OSS app
     "buildbuddy-darwin-amd64",
     "buildbuddy-linux-amd64",
+    "buildbuddy-linux-arm64",
     # executor
     "executor-enterprise-darwin-amd64",
     "executor-enterprise-darwin-arm64",
     "executor-enterprise-linux-amd64",
+    "executor-enterprise-linux-amd64-static",
     "executor-enterprise-linux-arm64",
+    "executor-enterprise-linux-arm64-static",
     "executor-enterprise-windows-amd64-beta.exe",
 ]
 
@@ -69,7 +74,7 @@ def main():
         for expected_asset in expected_assets:
             asset_uploaded = False
             for uploaded_asset in asset_urls:
-                if expected_asset in uploaded_asset:
+                if expected_asset == uploaded_asset:
                     asset_uploaded = True
                     break
 
@@ -85,6 +90,7 @@ def main():
 
     if len(expected_assets) > 0:
         print(f"Missing assets {expected_assets}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

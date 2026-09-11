@@ -11,8 +11,11 @@ import (
 
 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
 	dspb "github.com/buildbuddy-io/buildbuddy/proto/distributed_cache"
-	rfpb "github.com/buildbuddy-io/buildbuddy/proto/raft"
+	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	gproto "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -20,15 +23,22 @@ const (
 )
 
 var (
+	benchmarkMarshalResult []byte
+
 	testProtoTypes = map[string]testProtoType{
 		"FileMetadata": testProtoType{
 			providerFn: func() protoMessage {
-				return &rfpb.FileMetadata{}
+				return &sgpb.FileMetadata{}
 			},
 		},
 		"ScoreCard": testProtoType{
 			providerFn: func() protoMessage {
 				return &capb.ScoreCard{}
+			},
+		},
+		"ScoreCardResult": testProtoType{
+			providerFn: func() protoMessage {
+				return &capb.ScoreCard_Result{}
 			},
 		},
 		"TreeCache": testProtoType{
@@ -63,8 +73,11 @@ type testProtoType struct {
 }
 
 func generateProtos(t testing.TB, providerFn providerFunc) []protoMessage {
+	// Reset Faker for each proto type so benchmark fixtures do not depend on
+	// randomized map iteration order.
+	faker.SetRandomSource(rand.NewSource(0))
 	res := make([]protoMessage, 0, numSamples)
-	for i := 0; i < numSamples; i++ {
+	for range numSamples {
 		pb := providerFn()
 		err := faker.FakeData(pb)
 		require.NoError(t, err, "unable to fake data")
@@ -76,7 +89,7 @@ func generateProtos(t testing.TB, providerFn providerFunc) []protoMessage {
 func generateBytes(t testing.TB, protos []protoMessage) [][]byte {
 	res := make([][]byte, 0, len(protos))
 	for _, pb := range protos {
-		buf, err := proto.MarshalOld(pb)
+		buf, err := gproto.Marshal(pb)
 		require.NoError(t, err, "unable to marshal")
 		res = append(res, buf)
 	}
@@ -86,28 +99,74 @@ func generateBytes(t testing.TB, protos []protoMessage) [][]byte {
 type marshalFunc func(v protoMessage) ([]byte, error)
 type unmarshalFunc func([]byte, protoMessage) error
 type cloneFunc func(v proto.Message) proto.Message
+type sizeFunc func(v proto.Message) int
 
 func TestMarshal(t *testing.T) {
-	md := &rfpb.FileMetadata{}
+	md := &sgpb.FileMetadata{}
 	err := faker.FakeData(md)
 	require.NoError(t, err, "unable to fake data")
 
 	actual, err := proto.Marshal(md)
 	require.NoError(t, err)
-	expected, err := proto.MarshalOld(md)
+	expected, err := gproto.Marshal(md)
 	require.NoError(t, err)
 	require.Equal(t, expected, actual)
 }
 
+func TestMarshalFallback(t *testing.T) {
+	msg := wrapperspb.String("fallback")
+	expected, err := gproto.Marshal(msg)
+	require.NoError(t, err)
+	actual, err := proto.Marshal(msg)
+	require.NoError(t, err)
+	require.Equal(t, expected, actual)
+}
+
+func TestMarshalWithExternalVTMessage(t *testing.T) {
+	detail := &anypb.Any{}
+	// Field 1 is type_url; field 100 is an unknown varint field.
+	require.NoError(t, gproto.Unmarshal([]byte{0x0a, 0x01, 'x', 0xa0, 0x06, 0x01}, detail))
+
+	status := &statuspb.Status{
+		Code:    13,
+		Message: "internal error",
+		Details: []*anypb.Any{detail},
+	}
+	scoreCard := &capb.ScoreCard{
+		Results: []*capb.ScoreCard_Result{{
+			ActionMnemonic: "CppCompile",
+			Status:         status,
+		}},
+	}
+	_, ok := any(scoreCard.Results[0].Status).(interface {
+		MarshalToSizedBufferVT([]byte) (int, error)
+	})
+	require.True(t, ok)
+
+	expected, err := gproto.Marshal(scoreCard)
+	require.NoError(t, err)
+	actual, err := proto.Marshal(scoreCard)
+	require.NoError(t, err)
+	require.Equal(t, expected, actual)
+
+	cloned := status.CloneVT()
+	require.True(t, gproto.Equal(status, cloned))
+	statusBytes, err := gproto.Marshal(status)
+	require.NoError(t, err)
+	decoded := &statuspb.Status{}
+	require.NoError(t, decoded.UnmarshalVT(statusBytes))
+	require.True(t, gproto.Equal(status, decoded))
+}
+
 func TestUnmarshal(t *testing.T) {
-	md := &rfpb.FileMetadata{}
+	md := &sgpb.FileMetadata{}
 	err := faker.FakeData(md)
 	require.NoError(t, err, "unable to fake data")
 
-	data, err := proto.MarshalOld(md)
+	data, err := gproto.Marshal(md)
 	require.NoError(t, err)
 
-	actual := &rfpb.FileMetadata{}
+	actual := &sgpb.FileMetadata{}
 	err = proto.Unmarshal(data, actual)
 	require.NoError(t, err)
 
@@ -115,7 +174,7 @@ func TestUnmarshal(t *testing.T) {
 }
 
 func TestClone(t *testing.T) {
-	md := &rfpb.FileMetadata{}
+	md := &sgpb.FileMetadata{}
 	err := faker.FakeData(md)
 	require.NoError(t, err, "unable to fake data")
 
@@ -124,17 +183,46 @@ func TestClone(t *testing.T) {
 	require.True(t, proto.Equal(md, actual))
 }
 
+func TestSizeVT(t *testing.T) {
+	for name, pbType := range testProtoTypes {
+		t.Run(name, func(t *testing.T) {
+			msg := pbType.providerFn()
+			require.Implements(t, (*proto.VTProtoMessage)(nil), msg)
+			require.NoError(t, faker.FakeData(msg), "unable to fake data")
+			require.Equal(t, gproto.Size(msg), proto.Size(msg))
+		})
+	}
+
+	t.Run("typed nil", func(t *testing.T) {
+		msg := (*sgpb.FileMetadata)(nil)
+		require.Implements(t, (*proto.VTProtoMessage)(nil), msg)
+		require.Equal(t, gproto.Size(msg), proto.Size(msg))
+	})
+
+	t.Run("unknown fields", func(t *testing.T) {
+		msg := &sgpb.FileMetadata{}
+		msg.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x01})
+		require.Implements(t, (*proto.VTProtoMessage)(nil), msg)
+		require.Equal(t, gproto.Size(msg), proto.Size(msg))
+	})
+}
+
 func benchmarkMarshal(b *testing.B, marshalFn marshalFunc, data []protoMessage) {
 	b.ReportAllocs()
+	var totalSize int
+	for _, pb := range data {
+		totalSize += pb.SizeVT()
+	}
+	b.SetBytes(int64((totalSize + len(data)/2) / len(data)))
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		pb := data[rand.Intn(len(data))]
-		b.SetBytes(int64(pb.SizeVT()))
-		_, err := marshalFn(pb)
+		pb := data[i%len(data)]
+		buf, err := marshalFn(pb)
 		if err != nil {
 			b.Fatal(err)
 		}
+		benchmarkMarshalResult = buf
 	}
 
 }
@@ -158,7 +246,7 @@ func benchmarkUnmarshal(b *testing.B, unmarshalFn unmarshalFunc, providerFn prov
 func BenchmarkMarshal(b *testing.B) {
 	marshalFns := map[string]marshalFunc{
 		"Old": func(v protoMessage) ([]byte, error) {
-			return proto.MarshalOld(v)
+			return gproto.Marshal(v)
 		},
 		"New": func(v protoMessage) ([]byte, error) {
 			return proto.Marshal(v)
@@ -242,6 +330,37 @@ func BenchmarkClone(b *testing.B) {
 		for name, fn := range cloneFns {
 			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
 				benchmarkClone(b, fn, protos)
+			})
+		}
+	}
+}
+
+func BenchmarkSize(b *testing.B) {
+	sizeFns := map[string]sizeFunc{
+		"New": func(v proto.Message) int {
+			return proto.Size(v)
+		},
+		"Old": func(v proto.Message) int {
+			return gproto.Size(v)
+		},
+	}
+
+	for pbName, pbType := range testProtoTypes {
+		protos := generateProtos(b, pbType.providerFn)
+		for name, fn := range sizeFns {
+			b.Run(fmt.Sprintf("name=%s/pbName=%s", name, pbName), func(b *testing.B) {
+				b.ReportAllocs()
+				var totalSize int
+				for _, pb := range protos {
+					totalSize += gproto.Size(pb)
+				}
+				b.SetBytes(int64(totalSize / len(protos)))
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					pb := protos[i%len(protos)]
+					_ = fn(pb)
+				}
 			})
 		}
 	}

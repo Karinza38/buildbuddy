@@ -23,6 +23,9 @@ const (
 	// Path where we expect to find the user's plugin configuration, relative
 	// to the user's home directory.
 	HomeRelativeUserConfigPath = "buildbuddy.yaml"
+
+	// Environment variable that is set to "1" if we are a sidecar.
+	BbIsSidecar = "_BB_IS_SIDECAR"
 )
 
 // File represents a decoded config file along with its metadata.
@@ -139,8 +142,8 @@ func ParseDiskCapacityBytes(size any, directory string) (int64, error) {
 	case int64:
 		return v, nil
 	case string:
-		if strings.HasSuffix(v, "%") {
-			percentage, err := strconv.Atoi(strings.TrimSuffix(v, "%"))
+		if before, ok := strings.CutSuffix(v, "%"); ok {
+			percentage, err := strconv.Atoi(before)
 			if err != nil {
 				return 0, fmt.Errorf("parse percentage as int: %w", err)
 			}

@@ -1,6 +1,19 @@
 load("@io_bazel_rules_docker//container:container.bzl", "container_image", "container_layer")
 load("@io_bazel_rules_docker//go:image.bzl", "go_image")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load(
+    "//rules:platform_transitions.bzl",
+    "linux_arm64_alias",
+    "linux_arm64_musl_alias",
+    "linux_x86_64_alias",
+    "linux_x86_64_musl_alias",
+    "macos_arm64_alias",
+    "macos_x86_64_alias",
+    "windows_386_alias",
+    "windows_amd64_alias",
+    "windows_arm64_alias",
+)
+load("//rules:utils.bzl", "runfiles_directory")
 
 package(default_visibility = ["//enterprise:__subpackages__"])
 
@@ -26,21 +39,29 @@ go_library(
         "//enterprise/server/remote_execution/commandutil",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/executor",
+        "//enterprise/server/remote_execution/executor/oomkiller",
+        "//enterprise/server/remote_execution/executorplatform",
         "//enterprise/server/remote_execution/filecache",
-        "//enterprise/server/remote_execution/platform",
+        "//enterprise/server/remote_execution/gpu",
         "//enterprise/server/remote_execution/runner",
         "//enterprise/server/remote_execution/snaputil",
         "//enterprise/server/scheduling/priority_task_scheduler",
         "//enterprise/server/scheduling/scheduler_client",
+        "//enterprise/server/scheduling/task_leaser",
         "//enterprise/server/tasksize",
+        "//enterprise/server/util/cpuset",
+        "//proto:oci_fetcher_go_proto",
         "//proto:remote_execution_go_proto",
         "//proto:scheduler_go_proto",
         "//server/config",
+        "//server/environment",
         "//server/hostid",
+        "//server/interfaces",
         "//server/metrics",
         "//server/real_environment",
         "//server/resources",
         "//server/ssl",
+        "//server/util/canary",
         "//server/util/disk",
         "//server/util/flag",
         "//server/util/grpc_client",
@@ -48,17 +69,24 @@ go_library(
         "//server/util/healthcheck",
         "//server/util/log",
         "//server/util/monitoring",
+        "//server/util/shlex",
         "//server/util/status",
+        "//server/util/statusz",
         "//server/util/tracing",
         "//server/util/usageutil",
-        "//server/util/vtprotocodec",
+        "//server/util/xds",
         "//server/version",
         "//server/xcode",
         "@com_github_google_uuid//:uuid",
+        "@com_github_prometheus_client_golang//prometheus",
         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
+        "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//encoding/gzip",
+        "@org_golang_google_grpc//xds",
+        "@org_golang_google_protobuf//types/known/timestamppb",
     ] + select({
         "@io_bazel_rules_go//go/platform:linux": [
+            "//enterprise/server/oci/ociconv",
             "//enterprise/server/remote_execution/cgroup",
             "//enterprise/server/remote_execution/vbd",
             "//server/util/networking",
@@ -82,18 +110,81 @@ go_binary(
     embed = [":executor_lib"],
 )
 
+linux_x86_64_alias(
+    name = "executor_linux_amd64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+linux_arm64_alias(
+    name = "executor_linux_arm64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+macos_arm64_alias(
+    name = "executor_macos_arm64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+macos_x86_64_alias(
+    name = "executor_macos_x86_64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+linux_x86_64_musl_alias(
+    name = "executor_linux_amd64_static",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+linux_arm64_musl_alias(
+    name = "executor_linux_arm64_static",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+windows_amd64_alias(
+    name = "executor_windows_amd64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+windows_386_alias(
+    name = "executor_windows_386",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+windows_arm64_alias(
+    name = "executor_windows_arm64",
+    actual = ":executor",
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "tini",
+    actual = select({
+        "@platforms//cpu:arm64": "@com_github_krallin_tini_tini-linux-arm64//file:tini",
+        "//conditions:default": "@com_github_krallin_tini_tini-linux-amd64//file:tini",
+    }),
+)
+
 container_layer(
     name = "tini_layer",
     directory = "/",
-    files = select({
-        "@platforms//cpu:x86_64": [
-            "@com_github_krallin_tini_tini-linux-amd64//file:tini",
-        ],
-        "@platforms//cpu:arm64": [
-            "@com_github_krallin_tini_tini-linux-arm64//file:tini",
-        ],
-        "//conditions:default": [],
-    }),
+    files = [":tini"],
     tags = ["manual"],
 )
 
@@ -122,18 +213,35 @@ container_layer(
 )
 
 container_layer(
+    name = "containerd_layer",
+    directory = "/usr/bin",
+    files = select({
+        "@platforms//cpu:x86_64": [
+            "@com_github_containerd_containerd-linux-amd64//:containerd.bin",
+            "@com_github_containerd_containerd-linux-amd64//:containerd-shim-runc-v2.bin",
+            "@com_github_containerd_containerd-linux-amd64//:ctr.bin",
+        ],
+        "@platforms//cpu:arm64": [
+            "@com_github_containerd_containerd-linux-arm64//:containerd.bin",
+            "@com_github_containerd_containerd-linux-arm64//:containerd-shim-runc-v2.bin",
+            "@com_github_containerd_containerd-linux-arm64//:ctr.bin",
+        ],
+        "//conditions:default": [],
+    }),
+    tags = ["manual"],
+)
+
+container_layer(
     name = "rootlesskit_layer",
     directory = "/usr/bin",
     files = select({
         "@platforms//cpu:x86_64": [
-            "@com_github_rootless_containers_rootlesskit-linux-amd64//:rootlessctl.bin",
+            # "@com_github_rootless_containers_rootlesskit-linux-amd64//:rootlessctl.bin",
             "@com_github_rootless_containers_rootlesskit-linux-amd64//:rootlesskit.bin",
-            "@com_github_rootless_containers_rootlesskit-linux-amd64//:rootlesskit-docker-proxy.bin",
         ],
         "@platforms//cpu:arm64": [
-            "@com_github_rootless_containers_rootlesskit-linux-arm64//:rootlessctl.bin",
+            # "@com_github_rootless_containers_rootlesskit-linux-arm64//:rootlessctl.bin",
             "@com_github_rootless_containers_rootlesskit-linux-arm64//:rootlesskit.bin",
-            "@com_github_rootless_containers_rootlesskit-linux-arm64//:rootlesskit-docker-proxy.bin",
         ],
         "//conditions:default": [],
     }),
@@ -187,8 +295,6 @@ container_layer(
         "@platforms//cpu:x86_64": [
             ":firecracker",
             ":jailer",
-            "@com_github_buildbuddy_io_soci_snapshotter-static-linux-amd64//:soci-store.bin",
-            "@com_github_buildbuddy_io_soci_snapshotter-static-linux-amd64//:soci-store-race.bin",
             "@com_github_containers_crun_crun-linux-amd64//file:crun",
         ],
         "@platforms//cpu:aarch64": [
@@ -210,18 +316,25 @@ container_layer(
 
 container_image(
     name = "base_image",
+    architecture = select({
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
     base = "@executor_image//image:dockerfile_image.tar",
     layers = [
         ":tini_layer",
         ":docker_credential_gcr_layer",
         ":docker_credential_gcr_docker_config_layer",
+        ":containerd_layer",
         ":runc_layer",
-        ":rootlesskit_layer",
+        # Updating these layers does not currently afford us any vulnerability
+        # fixes; leave them out for now.
+        # ":rootlesskit_layer",
         ":executor_tools_layer",
         ":podman_static_layer",
     ],
     symlinks = {
-        "config.yaml": "app/enterprise/server/cmd/executor/executor.runfiles/buildbuddy/enterprise/config/executor.release.yaml",
+        "config.yaml": "app/enterprise/server/cmd/executor/executor.runfiles/%s/enterprise/config/executor.release.yaml" % runfiles_directory(),
     },
     tags = ["manual"],
     visibility = ["//visibility:public"],
@@ -233,6 +346,10 @@ container_image(
 # This target can be run locally with enterprise/tools/run_executor_image.sh
 go_image(
     name = "executor_go_image",
+    architecture = select({
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
     base = ":base_image",
     binary = ":executor",
     tags = ["manual"],
@@ -240,6 +357,10 @@ go_image(
 
 container_image(
     name = "executor_image",
+    architecture = select({
+        "@platforms//cpu:arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
     base = ":executor_go_image",
     entrypoint = [
         "/tini",

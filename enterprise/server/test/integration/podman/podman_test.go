@@ -3,10 +3,7 @@ package podman_test
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -19,13 +16,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/podman"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/testpodman"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/disk"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
@@ -37,8 +35,6 @@ import (
 
 // Populated by x_defs in BUILD file.
 var (
-	// rlocationpath for podman-static.tar.gz.
-	podmanArchiveRlocationpath string
 	// rlocationpath for crun.
 	crunRlocationpath string
 )
@@ -60,79 +56,21 @@ func getTestEnv(t *testing.T) *testenv.TestEnv {
 	flags.Set(t, "executor.podman.runtime", runtimePath)
 
 	env := testenv.GetTestEnv(t)
-	env.SetAuthenticator(testauth.NewTestAuthenticator(testauth.TestUsers("US1", "GR1")))
+	env.SetAuthenticator(testauth.NewTestAuthenticator(t, testauth.TestUsers("US1", "GR1")))
 	env.SetCommandRunner(&commandutil.CommandRunner{})
 	return env
 }
 
-func installPodman() error {
-	// TODO: make this work even when not running inside a VM. We should be able
-	// to run podman-static directly from the runfiles directory and configure
-	// podman to only use the tools/configs from this directory rather than the
-	// system directories.
-
-	// Install the podman version at HEAD by extracting the podman-static
-	// distribution under /.
-	existenceFile := "/.podman_test.podman_installed"
-	if _, err := os.Stat(existenceFile); err == nil {
-		return nil // Podman is already installed
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	// We haven't installed podman. First check that the execution image we're
-	// using doesn't have podman installed already, otherwise it may conflict
-	// with the one we're trying to install.
-	if path, err := exec.LookPath("podman"); err == nil {
-		return fmt.Errorf("install podman: %s already installed in runner", path)
-	}
-
-	podmanArchiveAbspath, err := runfiles.Rlocation(podmanArchiveRlocationpath)
-	if err != nil {
-		return fmt.Errorf("locate podman in runfiles: %w", err)
-	}
-	cmd := exec.Command("tar", "--extract", "--file", podmanArchiveAbspath, "--directory=/")
-	b, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("extract podman-static: %w (output: %q)", err, string(b))
-	}
-	if err := os.WriteFile(existenceFile, nil, 0644); err != nil {
-		return fmt.Errorf("create %s: %w", existenceFile, err)
-	}
-	return nil
-}
-
 func TestMain(m *testing.M) {
-	// When running on arm64 github runners, execute the test using sudo.
-	// This is for two reasons:
-	// - Tests on amd64 (firecracker) run as root, and ideally we'd run as
-	//   root on both amd64 and arm64 for consistency.
-	// - We need root in order to install podman-static under /.
-	if runtime.GOARCH == "arm64" && os.Getuid() != 0 {
-		args := append([]string{"sudo", "--non-interactive", "--preserve-env"}, os.Args...)
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			if cmd.Process != nil && cmd.ProcessState.Exited() {
-				os.Exit(cmd.ProcessState.ExitCode())
-			}
-			log.Fatal(err)
+	testpodman.TestMain(m, func() error {
+		// Prevent podman from reading ~/.docker/config.json which causes the gcr
+		// credential helper to be used, which causes authentication to fail when
+		// pulling our custom test images.
+		if err := os.WriteFile("/tmp/auth.json", []byte("{}"), 0644); err != nil {
+			return err
 		}
-		os.Exit(0)
-	}
-
-	// Install podman-static in the test VM if it isn't installed already.
-	if err := installPodman(); err != nil {
-		log.Fatalf("Failed to install podman: %s", err)
-	}
-	// Prevent podman from reading ~/.docker/config.json which causes the gcr
-	// credential helper to be used, which causes authentication to fail when
-	// pulling our custom test images.
-	if err := os.WriteFile("/tmp/auth.json", []byte("{}"), 0644); err != nil {
-		log.Fatalf("Failed to write registry auth config: %s", err)
-	}
-	os.Setenv("REGISTRY_AUTH_FILE", "/tmp/auth.json")
-	os.Exit(m.Run())
+		return os.Setenv("REGISTRY_AUTH_FILE", "/tmp/auth.json")
+	})
 }
 
 func TestRunHelloWorld(t *testing.T) {
@@ -149,7 +87,7 @@ func TestRunHelloWorld(t *testing.T) {
 	}
 	// Need to give enough time to download the Docker image.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	env := getTestEnv(t)
 
@@ -161,6 +99,9 @@ func TestRunHelloWorld(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 	result := c.Run(ctx, cmd, workDir, oci.Credentials{})
 
 	require.NoError(t, result.Error)
@@ -266,6 +207,45 @@ func TestExecStdio(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestSlowRun tests that a simple command runs successfully and completes within a reasonable time.
+// This is used to check for any potential performance regressions in the container execution environment.
+func TestSlowRun(t *testing.T) {
+	rootDir := testfs.MakeTempDir(t)
+	workDir := testfs.MakeDirAll(t, rootDir, "work")
+	ctx := context.Background()
+	env := getTestEnv(t)
+
+	provider, err := podman.NewProvider(env, rootDir)
+	require.NoError(t, err)
+	props := &platform.Properties{
+		ContainerImage: busyboxImage,
+		DockerNetwork:  "off",
+	}
+	c, err := provider.New(ctx, &container.Init{Props: props})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
+
+	// Ensure the image is cached
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, busyboxImage, false)
+	require.NoError(t, err)
+
+	cmd := &repb.Command{Arguments: []string{
+		"sh", "-c", `echo 'Hello World'`,
+	}}
+
+	before := time.Now()
+	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+	duration := time.Since(before)
+	require.NoError(t, res.Error, "Run should not return an error")
+	assert.Equal(t, 0, res.ExitCode, "Run should exit with success")
+	assert.Equal(t, "Hello World\n", string(res.Stdout), "Run should return expected stdout")
+	assert.Empty(t, string(res.Stderr), "Run should not return any stderr")
+
+	assert.LessOrEqual(t, duration, 5*time.Second, "Run should complete within 5 seconds")
+}
+
 func TestRun_Timeout(t *testing.T) {
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
@@ -289,15 +269,18 @@ func TestRun_Timeout(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	// Ensure the image is cached
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage, false)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	t.Cleanup(cancel)
 
-	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+	res := c.Run(runCtx, cmd, workDir, oci.Credentials{})
 
 	assert.True(
 		t, status.IsDeadlineExceededError(res.Error),
@@ -340,15 +323,18 @@ func TestExec_Timeout(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	// Ensure the image is cached
-	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage)
+	err = container.PullImageIfNecessary(ctx, env, c, oci.Credentials{}, props.ContainerImage, false)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	t.Cleanup(cancel)
 
-	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
+	res := c.Run(runCtx, cmd, workDir, oci.Credentials{})
 
 	assert.True(
 		t, status.IsDeadlineExceededError(res.Error),
@@ -465,6 +451,9 @@ func TestForceRoot(t *testing.T) {
 			}
 			c, err := provider.New(ctx, &container.Init{Props: props})
 			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Remove(ctx))
+			})
 			result := c.Run(ctx, cmd, workDir, oci.Credentials{})
 			require.NoError(t, result.Error)
 			assert.Equal(t, tc.wantUID, strings.TrimSpace(string(result.Stdout)))
@@ -478,7 +467,7 @@ func TestUser(t *testing.T) {
 	rootDir := testfs.MakeTempDir(t)
 	workDir := testfs.MakeDirAll(t, rootDir, "work")
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	env := getTestEnv(t)
 	image := busyboxImage
@@ -513,6 +502,9 @@ func TestUser(t *testing.T) {
 			}
 			c, err := provider.New(ctx, &container.Init{Props: props})
 			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Remove(ctx))
+			})
 			result := c.Run(ctx, &repb.Command{
 				Arguments: []string{"id", "-u", "-n"},
 			}, workDir, oci.Credentials{})
@@ -526,6 +518,11 @@ func TestUser(t *testing.T) {
 				assert.Equal(t, 1, result.ExitCode, "should exit with error")
 			}
 
+			c, err = provider.New(ctx, &container.Init{Props: props})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Remove(ctx))
+			})
 			result = c.Run(ctx, &repb.Command{
 				Arguments: []string{"id", "-g", "-n"},
 			}, workDir, oci.Credentials{})
@@ -563,6 +560,9 @@ func TestPodmanRun_LongRunningProcess_CanGetAllLogs(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
 
@@ -589,6 +589,9 @@ func TestPodmanRun_CommandNotExecuted_RecordsStats(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
 
@@ -632,6 +635,9 @@ func TestPodmanRun_RecordsStats(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	res := c.Run(ctx, cmd, workDir, oci.Credentials{})
 	require.NoError(t, res.Error)
@@ -658,6 +664,9 @@ func TestSignal(t *testing.T) {
 	}
 	c, err := provider.New(ctx, &container.Init{Props: props})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Remove(ctx))
+	})
 
 	cmd := &repb.Command{Arguments: []string{"sh", "-c", `
 		trap 'echo "Got SIGTERM" && exit 1' TERM

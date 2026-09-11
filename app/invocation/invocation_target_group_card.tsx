@@ -1,6 +1,3 @@
-import React from "react";
-import { target } from "../../proto/target_ts_proto";
-import { api as api_common } from "../../proto/api/v1/common_ts_proto";
 import {
   ArrowDownCircle,
   Check,
@@ -15,17 +12,20 @@ import {
   SkipForward,
   XCircle,
 } from "lucide-react";
+import React from "react";
+import { api as api_common } from "../../proto/api/v1/common_ts_proto";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
+import { target } from "../../proto/target_ts_proto";
+import capabilities from "../capabilities/capabilities";
+import DigestComponent from "../components/digest/digest";
+import Link, { TextLink } from "../components/link/link";
+import Spinner from "../components/spinner/spinner";
+import error_service from "../errors/error_service";
+import format from "../format/format";
+import rpcService, { CancelablePromise } from "../service/rpc_service";
+import FlakyTargetChipComponent from "../target/flaky_target_chip";
 import { copyToClipboard } from "../util/clipboard";
 import { renderDuration, renderTestSize } from "./target_util";
-import Link from "../components/link/link";
-import rpc_service, { CancelablePromise } from "../service/rpc_service";
-import error_service from "../errors/error_service";
-import Spinner from "../components/spinner/spinner";
-import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
-import format from "../format/format";
-import DigestComponent from "../components/digest/digest";
-import FlakyTargetChipComponent from "../target/flaky_target_chip";
-import capabilities from "../capabilities/capabilities";
 
 export interface TargetGroupCardProps {
   invocationId: string;
@@ -75,7 +75,7 @@ export default class TargetGroupCard extends React.Component<TargetGroupCardProp
   private loadMore(all?: boolean, callback?: () => void) {
     this.fetchRPC?.cancel();
     this.setState({ loading: true });
-    rpc_service.service
+    rpcService.service
       .getTarget({
         invocationId: this.props.invocationId,
         status: this.props.group.status,
@@ -108,7 +108,7 @@ export default class TargetGroupCard extends React.Component<TargetGroupCardProp
     if (file.uri.startsWith("file://")) {
       window.prompt("Copy artifact path to clipboard: Cmd+C, Enter", file.uri);
     } else if (file.uri.startsWith("bytestream://")) {
-      rpc_service.downloadBytestreamFile(file.name, file.uri, this.props.invocationId);
+      rpcService.downloadBytestreamFile(file.name, file.uri, this.props.invocationId);
     }
   }
 
@@ -146,52 +146,52 @@ export default class TargetGroupCard extends React.Component<TargetGroupCardProp
       case 0:
         // Showing the target listing only.
         className = "artifacts";
-        icon = <ArrowDownCircle className="icon brown" />;
+        icon = <ArrowDownCircle className="brown" />;
         presentVerb = `${targets.length === 1 ? "target" : "targets"} with artifacts`;
         pastVerb = presentVerb;
         break;
       case Status.FAILED:
         className = "card-failure";
-        icon = <XCircle className="icon red" />;
+        icon = <XCircle className="red" />;
         presentVerb = `failing ${targets.length === 1 ? "test" : "tests"}`;
         pastVerb = `${targets.length === 1 ? "test" : "tests"} failed`;
         renderFlakyChip = true;
         break;
       case Status.FAILED_TO_BUILD:
         className = "card-failure";
-        icon = <XCircle className="icon red" />;
+        icon = <XCircle className="red" />;
         presentVerb = `${targets.length === 1 ? "target" : "targets"} failed to build`;
         pastVerb = `${targets.length === 1 ? "target" : "targets"} failed to build`;
         break;
       case Status.TIMED_OUT:
         className = "card-timeout";
-        icon = <Clock className="icon" />;
+        icon = <Clock />;
         presentVerb = `timed out ${targets.length == 1 ? "test" : "tests"}`;
         pastVerb = `${targets.length == 1 ? "test" : "tests"} timed out`;
         renderFlakyChip = true;
         break;
       case Status.FLAKY:
         className = "card-flaky";
-        icon = <HelpCircle className="icon orange" />;
+        icon = <HelpCircle className="orange" />;
         presentVerb = `flaky ${targets.length == 1 ? "test" : "tests"}`;
         pastVerb = `flaky ${targets.length == 1 ? "test" : "tests"}`;
         renderFlakyChip = true;
         break;
       case Status.PASSED:
         className = "card-success";
-        icon = <CheckCircle className="icon green" />;
+        icon = <CheckCircle className="green" />;
         presentVerb = `passing ${targets.length == 1 ? "test" : "tests"}`;
         pastVerb = `${targets.length == 1 ? "test" : "tests"} passed`;
         break;
       case Status.BUILT:
         className = "card-success";
-        icon = <CheckCircle className="icon green" />;
+        icon = <CheckCircle className="green" />;
         presentVerb = `${targets.length == 1 ? "target" : "targets"}`;
         pastVerb = `${targets.length == 1 ? "target" : "targets"} built successfully`;
         break;
       case Status.SKIPPED:
         className = "card-skipped";
-        icon = <SkipForward className="icon purple" />;
+        icon = <SkipForward className="purple" />;
         presentVerb = `${targets.length == 1 ? "target" : "targets"}`;
         pastVerb = `${targets.length == 1 ? "target" : "targets"} skipped`;
         break;
@@ -226,9 +226,12 @@ export default class TargetGroupCard extends React.Component<TargetGroupCardProp
                     <div title={targetTitleAttr(target)} className="target">
                       <span className="target-status-icon">{icon}</span>{" "}
                       <span className="chevron-icon">
-                        <ChevronRight className="icon" />
+                        <ChevronRight />
                       </span>
                       <span className="target-label">{target.metadata?.label}</span>{" "}
+                      {target.testSummary && target.testSummary.totalNumCached === target.testSummary.totalRunCount && (
+                        <span className="target-cache-status">Cached</span>
+                      )}
                       {target.rootCause && <span className="root-cause-badge">Root cause</span>}
                     </div>
                     <div className="target-duration">{!!target.timing?.duration && renderDuration(target.timing)}</div>
@@ -243,17 +246,18 @@ export default class TargetGroupCard extends React.Component<TargetGroupCardProp
                   <div className="artifact-list">
                     {target.files.map((output) => (
                       <div className="artifact-line">
-                        <a
-                          href={rpc_service.getBytestreamUrl(output.uri, this.props.invocationId, {
+                        <TextLink
+                          plain
+                          href={rpcService.getBytestreamUrl(output.uri, this.props.invocationId, {
                             filename: output.name,
                           })}
                           className="artifact-name"
                           onClick={(event) => this.onClickFile(event, output)}>
                           {output.name}
-                        </a>
+                        </TextLink>
                         {output.uri?.startsWith("bytestream://") && (
                           <a className="artifact-view" href={this.getCodeURL(output)}>
-                            <FileCode className="icon" /> View
+                            <FileCode /> View
                           </a>
                         )}
                         <DigestComponent digest={{ hash: output.digest, sizeBytes: output.length }} />

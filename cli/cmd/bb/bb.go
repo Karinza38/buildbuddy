@@ -1,36 +1,39 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/cli/arg"
-	"github.com/buildbuddy-io/buildbuddy/cli/ask"
 	"github.com/buildbuddy-io/buildbuddy/cli/bazelisk"
 	"github.com/buildbuddy-io/buildbuddy/cli/cli_command"
 	"github.com/buildbuddy-io/buildbuddy/cli/help"
 	"github.com/buildbuddy-io/buildbuddy/cli/log"
 	"github.com/buildbuddy-io/buildbuddy/cli/metadata"
 	"github.com/buildbuddy-io/buildbuddy/cli/parser"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/arguments"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/bbrc"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/options"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/parsed"
 	"github.com/buildbuddy-io/buildbuddy/cli/picker"
 	"github.com/buildbuddy-io/buildbuddy/cli/plugin"
+	"github.com/buildbuddy-io/buildbuddy/cli/runscript"
 	"github.com/buildbuddy-io/buildbuddy/cli/setup"
-	"github.com/buildbuddy-io/buildbuddy/cli/shortcuts"
+	"github.com/buildbuddy-io/buildbuddy/cli/stream_run_logs"
 	"github.com/buildbuddy-io/buildbuddy/cli/watcher"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lib/seq"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rlimit"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 
+	register_cli_commands "github.com/buildbuddy-io/buildbuddy/cli/cli_command/register"
 	sidecarmain "github.com/buildbuddy-io/buildbuddy/cli/cmd/sidecar"
-)
-
-var (
-	// These flags configure the cli at large, and don't apply to any specific
-	// cli command
-	globalCliFlags = map[string]struct{}{
-		// Set to print verbose cli logs
-		"verbose": {},
-	}
+	helpoptdef "github.com/buildbuddy-io/buildbuddy/cli/help/option_definitions"
+	logoptdef "github.com/buildbuddy-io/buildbuddy/cli/log/option_definitions"
+	streamoptdef "github.com/buildbuddy-io/buildbuddy/cli/stream_run_logs/option_definitions"
+	watchoptdef "github.com/buildbuddy-io/buildbuddy/cli/watcher/option_definitions"
 )
 
 const (
@@ -51,86 +54,253 @@ func main() {
 	os.Exit(exitCode)
 }
 
-func run() (exitCode int, err error) {
-	start := time.Now()
-	// Record original arguments so we can show them in the UI.
-	originalArgs := append([]string{}, os.Args...)
-
-	args := handleGlobalCliFlags(os.Args[1:])
-
+// StartDebug prints relevant debug information related to CLI startup. It is
+// intended to be called after Configure, as Configure sets log levels.
+func StartupDebug(start time.Time) {
 	log.Debugf("CLI started at %s", start)
 	log.Debugf("args[0]: %s", os.Args[0])
 	log.Debugf("env: BAZEL_REAL=%s", os.Getenv("BAZEL_REAL"))
 	log.Debugf("env: BAZELISK_SKIP_WRAPPER=%s", os.Getenv("BAZELISK_SKIP_WRAPPER"))
 	log.Debugf("env: USE_BAZEL_VERSION=%s", os.Getenv("USE_BAZEL_VERSION"))
 	log.Debugf("env: BB_USE_BAZEL_VERSION=%s", os.Getenv("BB_USE_BAZEL_VERSION"))
+}
+
+// Configure takes a slice of options and filters them for the global options
+// needed to configure logging and the watcher, accumulates those options to get
+// the necessary values, and then configures logging and the watcher.
+//
+// We template this top support different types of Option slices; for example,
+// []*parsed.IndexedOption
+func Configure[T options.Option](bbOpts []T) {
+	verbose, err := options.AccumulateValues[T](
+		*options.NewBoolOrEnum(false),
+		seq.Filter(bbOpts, options.NameFilter[T](logoptdef.Verbose.Name())),
+	)
+	if err != nil {
+		log.Configure("")
+		log.Warnf("Error encountered reading '%s' flag: %s", logoptdef.Verbose.Name(), err)
+	} else if e, ok := verbose.GetEnum(); ok {
+		log.Configure(e)
+	} else if b, ok := verbose.GetBool(); ok {
+		if b {
+			log.Configure("1")
+		} else {
+			log.Configure("0")
+		}
+	} else {
+		// This shouldn't happen
+		log.Configure("")
+		log.Warnf("Failed to interpret '%s' flag", logoptdef.Verbose.Name())
+	}
+
+	watch, err := options.AccumulateValues[T](
+		false,
+		seq.Filter(bbOpts, options.NameFilter[T](watchoptdef.Watch.Name())),
+	)
+	if err != nil {
+		log.Warnf("Error encountered reading '%s' flag: %s", watchoptdef.Watch.Name(), err)
+	}
+	if watch {
+		watcherFlags, err := options.AccumulateValues[T](
+			[]string{},
+			seq.Filter(bbOpts, options.NameFilter[T](watchoptdef.WatcherFlags.Name())),
+		)
+		if err != nil {
+			log.Warnf("Error encountered reading '%s' flag: %s", watchoptdef.WatcherFlags.Name(), err)
+		}
+		watcher.Configure(true, watcherFlags)
+	}
+}
+
+func run() (exitCode int, err error) {
+	start := time.Now()
+	// Record original arguments so we can show them in the UI.
+	originalArgs := slices.Clone(os.Args)
+
+	if err := rlimit.MaxRLimit(); err != nil {
+		log.Printf("Failed to bump open file limits: %s", err)
+	}
+
+	// special case if the only argument is `--version`: this is not a proper
+	// startup option, but rather a special case in bazel that skips starting a
+	// bazel server while still allowing access to version information.
+	if len(os.Args[1:]) == 1 && os.Args[1] == "--version" {
+		return bazelisk.Run(os.Args[1:], &bazelisk.RunOpts{Stdout: os.Stdout, Stderr: os.Stderr})
+	}
+
+	// Register all known cli commands so that we can query or iterate them later.
+	register_cli_commands.Register()
+
+	// If this is a bb command, parse any global flags that precede it and handle
+	// the command.
+	// This is to shortcut the startup-time of the bazel client / server if they
+	// do not need to be run.
+	if command := interpretAsBBCliCommand(os.Args[1:]); command != nil && command.Name != "help" {
+		opts, args, err := resolveBBCliCommandArgs(os.Args[1:], command)
+		if err != nil {
+			return -1, err
+		}
+		Configure(opts)
+		StartupDebug(start)
+		return command.Handler(args)
+	}
+
+	// Since we do overly-permissive parsing for help commands to try to reduce
+	// frustration when learning how to use the CLI, we should attempt to parse
+	// this as a help command.
+	if helpArgs, err := interpretAsHelpCommand(os.Args[1:]); err != nil {
+		return -1, err
+	} else if helpArgs.GetCommand() == "help" {
+		// Handle help command if applicable.
+		Configure(helpArgs.RemoveStartupOptions(logoptdef.Verbose.Name(), watchoptdef.Watch.Name(), watchoptdef.WatcherFlags.Name()))
+		StartupDebug(start)
+		helpArgs.RemoveCommandOptions(streamoptdef.StreamRunLogs.Name(), streamoptdef.OnStreamRunLogsFailure.Name())
+		// Help does not use .bbrc settings, and Bazel does not understand the
+		// flags that control them.
+		bbrc.RemoveOptions(helpArgs)
+		return runHelp(helpArgs)
+	}
 
 	if _, err := bazelisk.ResolveVersion(); err != nil {
 		log.Printf("Failed to resolve bazel version: %s", err)
 	}
 
-	err = rlimit.MaxRLimit()
-	if err != nil {
-		log.Printf("Failed to bump open file limits: %s", err)
-	}
-
-	// Expand command shortcuts like b=>build, t=>test, etc.
-	args = shortcuts.HandleShortcuts(args)
-
-	// Make sure startup args are always in the format --foo=bar.
-	args, err = parser.CanonicalizeStartupArgs(args)
+	// This was neither a bb CLI command nor a help command; interpret it as a
+	// bazel command.
+	bazelArgsStr, execArgs := arg.SplitExecutableArgs(os.Args[1:])
+	bazelArgs, err := arg.NewBazelArgs(bazelArgsStr)
 	if err != nil {
 		return -1, err
 	}
-
-	// Handle help command if applicable.
-	exitCode, err = help.HandleHelp(args)
-	if err != nil || exitCode >= 0 {
-		return exitCode, err
-	}
-
-	cliCmd := args[0]
-	for _, c := range cli_command.Commands {
-		isAlias := false
-		for _, alias := range c.Aliases {
-			if cliCmd == alias {
-				isAlias = true
-			}
-		}
-
-		if isAlias || cliCmd == c.Name {
-			// If the first argument is a cli command, trim it from `args`
-			args = args[1:]
-			return c.Handler(args)
-		}
-	}
+	Configure(bazelArgs.StripBBStartupOptions(logoptdef.Verbose.Name(), watchoptdef.Watch.Name(), watchoptdef.WatcherFlags.Name()))
+	StartupDebug(start)
 
 	// If none of the CLI subcommand handlers were triggered, assume we should
 	// handle it as a bazel command.
-	return handleBazelCommand(start, args, originalArgs)
+	return handleBazelCommand(start, bazelArgs, execArgs, originalArgs)
 }
 
-// handleGlobalCliFlags processes global cli args that don't apply to any specific subcommand
-// (--verbose, etc.).
-// Returns args with all global cli flags removed
-func handleGlobalCliFlags(args []string) []string {
-	args, residual := arg.SplitExecutableArgs(args)
-	for flag := range globalCliFlags {
-		var flagVal string
-		flagVal, args = arg.Pop(args, flag)
+// interpretAsBBCliCommand returns the BB command being invoked, or nil if the
+// first positional argument is not a registered CLI command. Unknown startup
+// options also return nil so the invocation can be handled as a Bazel command.
+func interpretAsBBCliCommand(args []string) *cli_command.Command {
+	p := parser.GetNativeParser().StartupOptionParser
+	p.Permissive = true
 
-		// Even if flag is not set and flagVal is "", pass to handlers in case
-		// they need to configure a default value
-		switch flag {
-		case "verbose":
-			log.Configure(flagVal)
+	// Parse the startup options to get the index of the first positional argument,
+	// which is presumed to be the command.
+	opts, argIndex, err := p.ParseOptions(args, "startup")
+	if err != nil {
+		log.Warnf("Error parsing global options: %s", err)
+		return nil
+	}
+	for _, opt := range opts {
+		if opt.PluginID() == options.UnknownBuiltinPluginID {
+			return nil
 		}
 	}
-	if len(residual) > 0 {
-		args = append(args, "--")
-		args = append(args, residual...)
+
+	if argIndex == len(args) {
+		// No positional arguments, so this is not a CLI command.
+		return nil
 	}
-	return args
+	return cli_command.GetCommand(args[argIndex])
+}
+
+// resolveBBCliCommandArgs expands bbrc settings for bb CLI specific commands.
+// These commands skip the BazelArgs resolution step, so we need to expand the bbrc settings here.
+func resolveBBCliCommandArgs(args []string, command *cli_command.Command) ([]options.Option, []string, error) {
+	p, err := parser.GetBBParserForCommand(command.Name)
+	if err != nil {
+		return nil, nil, err
+	}
+	parsedArgs, err := p.ParseArgs(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	resolvedArgs, err := p.ResolveBBArgs(parsedArgs)
+	if err != nil {
+		return nil, nil, err
+	}
+	commandIndex, _ := parsed.Find[*parsed.Command](resolvedArgs.Args)
+	if commandIndex == -1 {
+		return nil, nil, status.InvalidArgumentError("missing bb command")
+	}
+	return resolvedArgs.GetStartupOptions(), arguments.FormatAll(resolvedArgs.Args[commandIndex+1:]), nil
+}
+
+func interpretAsHelpCommand(args []string) (*parsed.OrderedArgs, error) {
+	helpParser, err := parser.GetHelpParser()
+	if err != nil {
+		return nil, err
+	}
+	helpParser.CommandOptionParser.Permissive = true
+	helpArgs, err := helpParser.ParseArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	helpOptionValue, err := options.AccumulateValues[*parsed.IndexedOption](
+		false,
+		slices.Concat(
+			helpArgs.RemoveStartupOptions(helpoptdef.Help.Name()),
+			helpArgs.RemoveCommandOptions(helpoptdef.Help.Name()),
+		),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if helpOptionValue {
+		i, _ := parsed.Find[*parsed.Command](helpArgs.Args)
+		if i == -1 {
+			i = len(helpArgs.Args)
+		}
+		helpParser.CommandOptionParser.Permissive = false
+		reparsed, err := helpParser.ParseArgs(
+			(&parsed.OrderedArgs{
+				Args: append(
+					[]arguments.Argument{&arguments.PositionalArgument{Value: "help"}},
+					helpArgs.Args[i:]...,
+				),
+			}).Format(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		helpArgs.Args = append(arguments.FromConcrete(helpArgs.Args[:i]), reparsed.Args...)
+	}
+	return helpArgs, nil
+}
+
+func runHelp(args *parsed.OrderedArgs) (int, error) {
+	// Let's extract any command options from the startup options
+	helpParser, err := parser.GetHelpParser()
+	if err != nil {
+		return -1, err
+	}
+	startupCommandOptions := args.RemoveStartupOptions(slices.Collect(maps.Keys(helpParser.CommandOptionParser.ByName))...)
+	var toPrepend []arguments.Argument
+	for _, indexed := range startupCommandOptions {
+		o := indexed.Option
+		o.SetDefinition(helpParser.CommandOptionParser.ByName[o.Name()])
+		toPrepend = append(toPrepend, o)
+	}
+	// Now prepend any command options extracted from the startup options to the
+	// command options.
+	if len(toPrepend) != 0 {
+		startupOpts := args.GetStartupOptions()
+		if len(startupOpts) == len(args.Args) {
+			// we need a command if we want command options
+			args.Append(&arguments.PositionalArgument{Value: "help"})
+		}
+		args.Args = slices.Concat(
+			arguments.FromConcrete(startupOpts),
+			args.Args[len(startupOpts):len(startupOpts)+1],
+			toPrepend,
+			args.Args[len(startupOpts)+1:],
+		)
+	}
+	return help.HandleHelp(args)
 }
 
 // handleBazelCommand handles a native bazel command (i.e. commands that are
@@ -138,9 +308,11 @@ func handleGlobalCliFlags(args []string) []string {
 //
 // originalArgs contains the command as originally typed. We pass it as
 // EXPLICIT_COMMAND_LINE metadata to the bazel invocation.
-func handleBazelCommand(start time.Time, args []string, originalArgs []string) (int, error) {
+func handleBazelCommand(start time.Time, bazelArgs *arg.BazelArgs, execArgs []string, originalArgs []string) (exitCode int, err error) {
 	// Maybe run interactively (watching for changes to files).
-	if exitCode, err := watcher.Watch(); exitCode >= 0 || err != nil {
+	// The watcher starts another bb process, so retain the complete set of original arguments.
+	// They'll be reparsed by the new process.
+	if exitCode, err := watcher.Watch(append([]string{os.Args[0]}, arg.JoinExecutableArgs(bazelArgs.Unresolved(), execArgs)...)); exitCode >= 0 || err != nil {
 		return exitCode, err
 	}
 
@@ -151,7 +323,7 @@ func handleBazelCommand(start time.Time, args []string, originalArgs []string) (
 	}
 
 	var scriptPath string
-	var exitCode int
+	var streamRunLogsOpts *stream_run_logs.Opts
 	defer func() {
 		// Remove tempdir. Need to do this before invoking the run script
 		// (if applicable), since the run script will replace this process.
@@ -159,14 +331,22 @@ func handleBazelCommand(start time.Time, args []string, originalArgs []string) (
 
 		// Invoke the run script only if the build succeeded.
 		if exitCode == 0 && scriptPath != "" {
-			exitCode, err = bazelisk.InvokeRunScript(scriptPath)
+			if streamRunLogsOpts != nil {
+				exitCode, err = runscript.InvokeWithLogStreaming(scriptPath, *streamRunLogsOpts)
+			} else {
+				exitCode, err = runscript.Invoke(scriptPath)
+			}
 		}
 	}()
 
-	plugins, bazelArgs, execArgs, sidecar, err := setup.Setup(args, tempDir)
+	setupResult, err := setup.Setup(bazelArgs, execArgs, tempDir)
 	if err != nil {
 		return 1, err
 	}
+	plugins := setupResult.Plugins
+	bazelArgs = setupResult.BazelArgs
+	execArgs = setupResult.ExecArgs
+	sidecar := setupResult.Sidecar
 
 	// Show a picker if the target is omitted. Note: we do this after expanding
 	// args, in case a bazelrc specifies the target patterns (e.g. via
@@ -177,19 +357,24 @@ func handleBazelCommand(start time.Time, args []string, originalArgs []string) (
 	// - For "run" commands, if there is no target pattern, then the first arg
 	//   after "--" is treated as the pattern.
 	if len(execArgs) == 0 {
-		bazelArgs = picker.HandlePicker(bazelArgs)
+		bazelArgs, err = picker.HandlePicker(bazelArgs)
+		if err != nil {
+			return 1, err
+		}
 	}
 
-	// Save some flags from the current invocation, in case the `ask` command
-	// is invoked in the future.
-	bazelArgs = ask.SaveFlags(bazelArgs)
+	bazelArgs, streamRunLogsOpts, err = stream_run_logs.Configure(bazelArgs, setupResult.OriginalBESBackend)
+	if err != nil {
+		return 1, status.WrapErrorf(err, "error configuring run log streaming")
+	}
 
 	// If this is a `bazel run` command, add a --run_script arg so that
 	// we can execute post-bazel plugins between the build and the run step.
-	bazelArgs, scriptPath, err = bazelisk.ConfigureRunScript(bazelArgs)
+	bazelArgs, scriptPath, err = runscript.Configure(bazelArgs)
 	if err != nil {
 		return 1, err
 	}
+
 	// Append metadata just before running bazelisk.
 	// Note, this means plugins cannot modify this metadata.
 	bazelArgs, err = metadata.AppendBuildMetadata(bazelArgs, originalArgs)
@@ -202,7 +387,7 @@ func handleBazelCommand(start time.Time, args []string, originalArgs []string) (
 	log.Debugf("bb initialized in %s", time.Since(start))
 	outputPath := filepath.Join(tempDir, "bazel.log")
 	exitCode, err = plugin.RunBazeliskWithPlugins(
-		arg.JoinExecutableArgs(bazelArgs, execArgs),
+		arg.JoinExecutableArgs(bazelArgs.Forwarded(), execArgs),
 		outputPath, plugins)
 	if err != nil {
 		return 1, err
@@ -220,7 +405,7 @@ func handleBazelCommand(start time.Time, args []string, originalArgs []string) (
 	watcher.Pause()
 	defer watcher.Unpause()
 	for _, p := range plugins {
-		if err := p.PostBazel(outputPath); err != nil {
+		if err := p.PostBazel(outputPath, exitCode); err != nil {
 			return 1, err
 		}
 	}

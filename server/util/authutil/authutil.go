@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/blocklist"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
+	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 
-	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
+	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
 	gstatus "google.golang.org/grpc/status"
 )
 
@@ -35,15 +39,43 @@ const (
 	// to/from the outgoing/incoming request contexts.
 	ContextTokenStringKey = "x-buildbuddy-jwt"
 
+	// The context key under which client-identity information is stored.
+	ClientIdentityHeaderName = "x-buildbuddy-client-identity"
+
+	// InternalHeaderPrefix marks gRPC metadata headers that carry internal
+	// trust signals (e.g. the resolved client IP) which only trusted internal
+	// clients may set. The gRPC server strips any incoming header with this
+	// prefix from callers that don't present a trusted client identity, so
+	// external callers can't spoof them. Headers signed/verified on their own
+	// (like the client identity header) don't use this prefix.
+	InternalHeaderPrefix = "x-buildbuddy-internal-"
+
+	// The context key under which auth headers are stored.
+	authHeadersKey = "auth-headers"
+
 	// WARNING: app/auth/auth_service.ts depends on these messages matching.
 	UserNotFoundMsg   = "User not found"
 	LoggedOutMsg      = "User logged out"
 	ExpiredSessionMsg = "User session expired"
+
+	// AdminDisplayName is the name of a "server administrator" shown to users
+	AdminDisplayName = "Buildbuddy Admin"
+	adminEmailSuffix = "@buildbuddy.io"
 )
 
 var (
 	apiKeyRegex = regexp.MustCompile(APIKeyHeader + "=([a-zA-Z0-9]*)")
+
+	enableUserLists = flag.Bool("auth.enable_user_lists", false, "If enabled, check indirect group membership via user lists.", flag.Internal)
 )
+
+func UserListsEnabled() bool {
+	return *enableUserLists
+}
+
+func IsAdminEmail(email string) bool {
+	return strings.HasSuffix(email, adminEmailSuffix)
+}
 
 // AuthorizeOrgAdmin checks whether the given user has ORG_ADMIN capability
 // within the given group ID. This is required for any org-level administrative
@@ -53,7 +85,7 @@ func AuthorizeOrgAdmin(u interfaces.UserInfo, groupID string) error {
 		if m.GroupID != groupID {
 			continue
 		}
-		if slices.Contains(m.Capabilities, akpb.ApiKey_ORG_ADMIN_CAPABILITY) {
+		if slices.Contains(m.Capabilities, cappb.Capability_ORG_ADMIN) {
 			return nil
 		} else {
 			return status.PermissionDeniedError("missing required capabilities")
@@ -157,10 +189,120 @@ func AuthErrorFromContext(ctx context.Context) (error, bool) {
 	return err, ok
 }
 
+// ValidateRestrictedACAccess returns an error if instanceName has a restricted
+// prefix and the caller identity stored in ctx is not a trusted internal service.
+// This MUST be checked in action cache server implementations.
+func ValidateRestrictedACAccess(ctx context.Context, env environment.Env, instanceName string) error {
+	if !strings.HasPrefix(instanceName, interfaces.OCIImageInstanceNamePrefix) {
+		return nil
+	}
+	cis := env.GetClientIdentityService()
+	if cis == nil {
+		return status.UnauthenticatedError("No client ID service available to check restricted instance name prefix")
+	}
+	identity, err := cis.IdentityFromContext(ctx)
+	if err != nil {
+		return status.UnauthenticatedErrorf("Could not check identity for restricted instance name prefix: %s", err)
+	}
+	if slices.Contains([]string{
+		interfaces.ClientIdentityApp,
+		interfaces.ClientIdentityExecutor,
+		interfaces.ClientIdentityCacheProxy,
+	}, identity.Client) {
+		return nil
+	}
+	return status.UnauthenticatedError("Cannot access restricted ActionResult from untrusted client")
+}
+
 func EncryptionEnabled(ctx context.Context, authenticator interfaces.Authenticator) bool {
 	u, err := authenticator.AuthenticatedUser(ctx)
 	if err != nil {
 		return false
 	}
 	return u.GetCacheEncryptionEnabled()
+}
+
+// Returns a context derived from the provided context that has the
+// client-supplied parsed and cached for retrieval using GetAuthHeaders.
+func ContextWithCachedAuthHeaders(ctx context.Context, authenticator interfaces.Authenticator) context.Context {
+	headers := map[string][]string{}
+
+	keys := metadata.ValueFromIncomingContext(ctx, ClientIdentityHeaderName)
+	if len(keys) > 0 {
+		if len(keys) > 1 {
+			log.Warningf("Expected at most 1 client-identity header (found %d)", len(keys))
+		}
+		headers[ClientIdentityHeaderName] = keys
+	}
+
+	if jwt := authenticator.TrustedJWTFromAuthContext(ctx); jwt != "" {
+		headers[ContextTokenStringKey] = []string{jwt}
+	}
+
+	return context.WithValue(ctx, authHeadersKey, headers)
+}
+
+// Retrieves a multi-map of the auth headers cached in the provided context.
+func GetAuthHeaders(ctx context.Context) map[string][]string {
+	rawHeaders := ctx.Value(authHeadersKey)
+	if rawHeaders == nil {
+		// The cache proxy directly calls internal grpc servers, instead of going
+		// through a grpc client. Values from the outgoing context are therefore never
+		// translated to the incoming context, where this function expects to find
+		// them.
+		rawHeaders = getAuthHeadersFromOutgoingContext(ctx)
+	}
+	if rawHeaders == nil {
+		alert.UnexpectedEvent("No auth headers found in context, did you remember to call authutil.StoreAuthHeadersInContext?")
+		return map[string][]string{}
+	}
+
+	headers, ok := rawHeaders.(map[string][]string)
+	if !ok {
+		alert.UnexpectedEvent("Auth headers in context have the wrong type")
+		return map[string][]string{}
+	}
+	return headers
+}
+
+func getAuthHeadersFromOutgoingContext(ctx context.Context) map[string][]string {
+	outgoing, _ := metadata.FromOutgoingContext(ctx)
+	if outgoing == nil {
+		return nil
+	}
+	headers := map[string][]string{}
+	if h, ok := outgoing[ClientIdentityHeaderName]; ok {
+		headers[ClientIdentityHeaderName] = h
+	}
+	if h, ok := outgoing[ContextTokenStringKey]; ok {
+		headers[ContextTokenStringKey] = h
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
+}
+
+// Adds the provided auth headers into the provided context and returns a new
+// context containing them. This function is intended for use along with
+// GetAuthHeaders when auth headers must be copied between contexts.
+func AddAuthHeadersToContext(ctx context.Context, headers map[string][]string, authenticator interfaces.Authenticator) context.Context {
+	for key, values := range headers {
+		for _, value := range values {
+			if key == ClientIdentityHeaderName {
+				ctx = metadata.AppendToOutgoingContext(ctx, ClientIdentityHeaderName, value)
+			} else if key == ContextTokenStringKey {
+				ctx = authenticator.AuthContextFromTrustedJWT(ctx, value)
+			} else {
+				log.Warningf("Ignoring unrecognized auth header: %s", key)
+			}
+		}
+	}
+
+	// Cache the headers so that GetAuthHeaders can retrieve them from this
+	// context. Without this, GetAuthHeaders falls back to reading outgoing
+	// gRPC metadata, which does not contain the JWT (it's stored as a
+	// context value by AuthContextFromTrustedJWT, not as gRPC metadata).
+	ctx = context.WithValue(ctx, authHeadersKey, headers)
+	return ctx
 }

@@ -2,9 +2,12 @@ package searcher_test
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/codesearch/index"
+	"github.com/buildbuddy-io/buildbuddy/codesearch/schema"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/searcher"
 	"github.com/buildbuddy-io/buildbuddy/codesearch/types"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
@@ -13,13 +16,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var testSchema = schema.NewDocumentSchema(
+	[]types.FieldSchema{
+		schema.MustFieldSchema(types.KeywordField, "ident", true),
+		schema.MustFieldSchema(types.SparseNgramField, "content", true),
+	})
+
 func makeTestDoc(ident, content string) types.Document {
-	doc := types.NewMapDocument(
-		map[string]types.NamedField{
-			"ident":   types.NewNamedField(types.KeywordField, "ident", []byte(ident), true /*=stored*/),
-			"content": types.NewNamedField(types.SparseNgramField, "content", []byte(content), true /*=stored*/),
-		},
-	)
+	doc, err := testSchema.MakeDocument(map[string][]byte{
+		"ident":   []byte(ident),
+		"content": []byte(content),
+	})
+	if err != nil {
+		panic(err)
+	}
 	return doc
 }
 
@@ -32,7 +42,7 @@ var sampleData = []struct {
 	{"three", "three body problem"},
 	{"four", "four score and"},
 	{"five", "hawaii five-o"},
-	{"six", "pick up sticks"},
+	{"six", "pick up sticks is great"},
 	{"seven", "lucky number seven"},
 	{"eight", "pieces of eight"},
 	{"nine", "nine lives"},
@@ -40,10 +50,29 @@ var sampleData = []struct {
 	{"eleven", "turn it up to 11"},
 }
 
-type zeroScorer struct{}
+type constantScorer struct{}
 
-func (s zeroScorer) Skip() bool                                                     { return false }
-func (s zeroScorer) Score(docMatch types.DocumentMatch, doc types.Document) float64 { return 0.0 }
+func (s constantScorer) Skip() bool                            { return false }
+func (s constantScorer) Prepare(matches []types.DocumentMatch) {}
+func (s constantScorer) Score(docMatch types.DocumentMatch) float64 {
+	return 0.1
+}
+func (s constantScorer) Rescore(docMatch types.DocumentMatch, doc types.Document) float64 {
+	return 0.1
+}
+
+type explicitScorer struct {
+	scores map[uint64]float64
+}
+
+func (s *explicitScorer) Skip() bool                            { return false }
+func (s *explicitScorer) Prepare(matches []types.DocumentMatch) {}
+func (s *explicitScorer) Score(docMatch types.DocumentMatch) float64 {
+	return s.scores[docMatch.Docid()]
+}
+func (s *explicitScorer) Rescore(docMatch types.DocumentMatch, doc types.Document) float64 {
+	return s.scores[docMatch.Docid()]
+}
 
 type sQuery struct {
 	s      string
@@ -57,10 +86,8 @@ func createSampleIndex(t testing.TB) *pebble.DB {
 	t.Helper()
 
 	indexDir := testfs.MakeTempDir(t)
-	db, err := pebble.Open(indexDir, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db, err := index.OpenPebbleDB(indexDir)
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		db.Close()
 	})
@@ -79,8 +106,8 @@ func createSampleIndex(t testing.TB) *pebble.DB {
 func TestBasicSearcher(t *testing.T) {
 	ctx := context.Background()
 	db := createSampleIndex(t)
-	s := searcher.New(ctx, index.NewReader(ctx, db, "testns"))
-	docs, err := s.Search(sQuery{"(:all)", zeroScorer{}}, 100, 0)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+	docs, err := s.Search(sQuery{"(:all)", constantScorer{}}, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, len(sampleData), len(docs))
 }
@@ -88,12 +115,190 @@ func TestBasicSearcher(t *testing.T) {
 func TestSearcherOffsetAndLimit(t *testing.T) {
 	ctx := context.Background()
 	db := createSampleIndex(t)
-	s := searcher.New(ctx, index.NewReader(ctx, db, "testns"))
-	docs, err := s.Search(sQuery{"(:all)", zeroScorer{}}, 11, 8)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+	docs, err := s.Search(sQuery{"(:all)", constantScorer{}}, 11, 8)
 	require.NoError(t, err)
 	require.Equal(t, 3, len(docs))
 
 	assert.Equal(t, "nine", string(docs[0].Field("ident").Contents()))
 	assert.Equal(t, "ten", string(docs[1].Field("ident").Contents()))
 	assert.Equal(t, "eleven", string(docs[2].Field("ident").Contents()))
+}
+
+func TestSearcherZeroScoresDropped(t *testing.T) {
+	ctx := context.Background()
+	db := createSampleIndex(t)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+
+	scorer := &explicitScorer{
+		scores: map[uint64]float64{
+			1: 1.0,
+			4: 0.5,
+			8: 0.00001,
+		},
+	}
+	docs, err := s.Search(sQuery{"(:all)", scorer}, 100, 0)
+	require.NoError(t, err)
+	require.Equal(t, 3, len(docs))
+
+	assert.Equal(t, "one", string(docs[0].Field("ident").Contents()))
+	assert.Equal(t, "four", string(docs[1].Field("ident").Contents()))
+	assert.Equal(t, "eight", string(docs[2].Field("ident").Contents()))
+}
+
+func TestSearcherTopKMatchesExhaustiveScan(t *testing.T) {
+	ctx := context.Background()
+	db := createSampleIndex(t)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+
+	scorer := &explicitScorer{
+		scores: map[uint64]float64{
+			1:  1.0,
+			2:  80.0,
+			3:  2.0,
+			4:  85.0,
+			5:  3.0,
+			6:  4.0,
+			7:  5.0,
+			8:  81.0,
+			9:  9.0,
+			10: 8.0,
+			11: 7.0,
+		},
+	}
+	docs, err := s.Search(sQuery{"(:all)", scorer}, 3, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, exhaustiveTopIdents(scorer.scores, 3, 0), docIdents(docs))
+}
+
+func TestSearcherTopKWithOffsetMatchesExhaustiveScan(t *testing.T) {
+	ctx := context.Background()
+	db := createSampleIndex(t)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+
+	scorer := &explicitScorer{
+		scores: map[uint64]float64{
+			1:  1.0,
+			2:  80.0,
+			3:  2.0,
+			4:  85.0,
+			5:  3.0,
+			6:  4.0,
+			7:  5.0,
+			8:  81.0,
+			9:  9.0,
+			10: 8.0,
+			11: 7.0,
+		},
+	}
+	docs, err := s.Search(sQuery{"(:all)", scorer}, 3, 2)
+	require.NoError(t, err)
+
+	assert.Equal(t, exhaustiveTopIdents(scorer.scores, 3, 2), docIdents(docs))
+}
+
+func TestSearcherEvictsLargerDocIDOnScoreTie(t *testing.T) {
+	ctx := context.Background()
+	db := createSampleIndex(t)
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", testSchema))
+
+	scorer := &explicitScorer{
+		scores: map[uint64]float64{
+			1: 1.0,
+			2: 1.0,
+			3: 1.0,
+		},
+	}
+	docs, err := s.Search(sQuery{"(:all)", scorer}, 2, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"one", "two"}, docIdents(docs))
+}
+
+func docIdents(docs []types.Document) []string {
+	idents := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		idents = append(idents, string(doc.Field("ident").Contents()))
+	}
+	return idents
+}
+
+func exhaustiveTopIdents(scores map[uint64]float64, numResults, offset int) []string {
+	docIDs := make([]uint64, 0, len(scores))
+	for docID, score := range scores {
+		if score > 0 {
+			docIDs = append(docIDs, docID)
+		}
+	}
+	sort.Slice(docIDs, func(i, j int) bool {
+		if scores[docIDs[i]] == scores[docIDs[j]] {
+			return docIDs[i] < docIDs[j]
+		}
+		return scores[docIDs[i]] > scores[docIDs[j]]
+	})
+
+	start := min(offset, len(docIDs))
+	end := min(offset+numResults, len(docIDs))
+	idents := make([]string, 0, end-start)
+	for _, docID := range docIDs[start:end] {
+		idents = append(idents, sampleData[docID-1].id)
+	}
+	return idents
+}
+
+var importSchema = schema.NewDocumentSchema(
+	[]types.FieldSchema{
+		schema.MustFieldSchema(types.KeywordField, "ident", true),
+		schema.MustFieldSchema(types.KeywordField, types.ImportsField, true),
+		schema.MustFieldSchema(types.KeywordField, types.ImportIDField, true),
+	})
+
+func makeImportDoc(t *testing.T, ident, imports, importID string) types.Document {
+	fields := map[string][]byte{"ident": []byte(ident)}
+	if imports != "" {
+		fields[types.ImportsField] = []byte(imports)
+	}
+	if importID != "" {
+		fields[types.ImportIDField] = []byte(importID)
+	}
+	doc, err := importSchema.MakeDocument(fields)
+	require.NoError(t, err)
+	return doc
+}
+
+// createImportRankIndex indexes: three files importing pkg/popular, then
+// "unpopular" (docid 4) and "popular" (docid 5). With no boost, equal scores
+// surface in ascending docid order; with boost, popular must win.
+func createImportRankIndex(t *testing.T) *pebble.DB {
+	t.Helper()
+	indexDir := testfs.MakeTempDir(t)
+	db, err := index.OpenPebbleDB(indexDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	w, err := index.NewWriter(db, "testns")
+	require.NoError(t, err)
+	for i := range 3 {
+		require.NoError(t, w.AddDocument(makeImportDoc(t, fmt.Sprintf("importer%d", i), "go:mod/popular", fmt.Sprintf("go:mod/importer%d", i))))
+	}
+	require.NoError(t, w.AddDocument(makeImportDoc(t, "unpopular", "", "go:mod/unpopular")))
+	require.NoError(t, w.AddDocument(makeImportDoc(t, "popular", "", "go:mod/popular")))
+	require.NoError(t, w.Flush())
+	return db
+}
+
+func TestImportRankBoostOrdersResults(t *testing.T) {
+	ctx := context.Background()
+	db := createImportRankIndex(t)
+
+	// Every doc has the same (constant) text score, so without the always-on
+	// import-rank boost they would surface in ascending docid order, leaving
+	// "popular" (docid 5) last. The boost lifts the doc whose package is
+	// imported by three files to the top, which is the only way it can lead.
+	s := searcher.New(ctx, index.NewReader(ctx, db, "testns", importSchema))
+	docs, err := s.Search(sQuery{"(:all)", constantScorer{}}, 100, 0)
+	require.NoError(t, err)
+	require.Equal(t, 5, len(docs))
+	assert.Equal(t, "popular", string(docs[0].Field("ident").Contents()))
 }

@@ -3,6 +3,7 @@ package composable_cache
 import (
 	"context"
 	"io"
+	"maps"
 
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
@@ -84,6 +85,18 @@ func (c *ComposableCache) Get(ctx context.Context, r *rspb.ResourceName) ([]byte
 	return innerRsp, nil
 }
 
+func (c *ComposableCache) GetWithMetadata(ctx context.Context, r *rspb.ResourceName) ([]byte, *interfaces.CacheMetadata, error) {
+	data, err := c.Get(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	md, err := c.Metadata(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, md, nil
+}
+
 func (c *ComposableCache) GetMulti(ctx context.Context, resources []*rspb.ResourceName) (map[*repb.Digest][]byte, error) {
 	if len(resources) == 0 {
 		return nil, nil
@@ -93,9 +106,7 @@ func (c *ComposableCache) GetMulti(ctx context.Context, resources []*rspb.Resour
 
 	foundMap := make(map[*repb.Digest][]byte, len(resources))
 	if outerFoundMap, err := c.outer.GetMulti(ctx, resources); err == nil {
-		for d, data := range outerFoundMap {
-			foundMap[d] = data
-		}
+		maps.Copy(foundMap, outerFoundMap)
 	}
 	stillMissing := make([]*rspb.ResourceName, 0)
 	for _, r := range resources {
@@ -116,9 +127,7 @@ func (c *ComposableCache) GetMulti(ctx context.Context, resources []*rspb.Resour
 	if err != nil {
 		return nil, err
 	}
-	for d, data := range innerFoundMap {
-		foundMap[d] = data
-	}
+	maps.Copy(foundMap, innerFoundMap)
 	return foundMap, nil
 }
 
@@ -274,10 +283,31 @@ func (c *ComposableCache) Writer(ctx context.Context, r *rspb.ResourceName) (int
 	return innerWriter, nil
 }
 
+func (c *ComposableCache) Partition(ctx context.Context, remoteInstanceName string) (string, error) {
+	innerPartition, err := c.inner.Partition(ctx, remoteInstanceName)
+	if err != nil {
+		return "", err
+	}
+	outerPartition, err := c.outer.Partition(ctx, remoteInstanceName)
+	if err != nil {
+		return "", err
+	}
+	if innerPartition == "" {
+		return outerPartition, nil
+	}
+	if outerPartition == "" {
+		return innerPartition, nil
+	}
+	return outerPartition + "/" + innerPartition, nil
+}
+
 func (c *ComposableCache) SupportsCompressor(compressor repb.Compressor_Value) bool {
 	return compressor == repb.Compressor_IDENTITY
 }
 
-func (c *ComposableCache) SupportsEncryption(ctx context.Context) bool {
-	return false
+func (c *ComposableCache) RegisterAtimeUpdater(updater interfaces.DigestOperator) error {
+	if err := c.inner.RegisterAtimeUpdater(updater); err != nil {
+		return err
+	}
+	return c.outer.RegisterAtimeUpdater(updater)
 }

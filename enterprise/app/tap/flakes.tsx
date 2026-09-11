@@ -1,23 +1,22 @@
-import React from "react";
-import { CancelablePromise } from "../../../app/util/async";
-import { target } from "../../../proto/target_ts_proto";
-import rpc_service from "../../../app/service/rpc_service";
-import TrendsChartComponent from "../trends/trends_chart";
+import { Check, Copy, Target } from "lucide-react";
 import moment from "moment";
-import { ChartColor } from "../trends/trends_chart";
-import format, { count } from "../../../app/format/format";
+import React from "react";
+import Banner from "../../../app/components/banner/banner";
 import { FilterInput } from "../../../app/components/filter_input/filter_input";
 import Link from "../../../app/components/link/link";
-import { Check, Copy, Target } from "lucide-react";
-import router from "../../../app/router/router";
 import Select, { Option } from "../../../app/components/select/select";
-import TapEmptyStateComponent from "./tap_empty_state";
-import Banner from "../../../app/components/banner/banner";
+import format, { count } from "../../../app/format/format";
+import router from "../../../app/router/router";
+import rpc_service from "../../../app/service/rpc_service";
 import TargetFlakyTestCardComponent from "../../../app/target/target_flaky_test_card";
-import { getProtoFilterParams } from "../filter/filter_util";
-import { timestampToDateWithFallback } from "../../../app/util/proto";
-import { copyToClipboard } from "../../../app/util/clipboard";
 import { FlakyTargetSampleLogCardComponent } from "../../../app/target/target_test_log_card";
+import { CancelablePromise } from "../../../app/util/async";
+import { copyToClipboard } from "../../../app/util/clipboard";
+import { timestampToDateWithFallback } from "../../../app/util/proto";
+import { target } from "../../../proto/target_ts_proto";
+import { getProtoFilterParams } from "../filter/filter_util";
+import TrendsChartComponent, { ChartColor } from "../trends/trends_chart";
+import TapEmptyStateComponent from "./tap_empty_state";
 
 interface Props {
   search: URLSearchParams;
@@ -38,22 +37,27 @@ const TableSortValues: TableSort[] = ["Flaky %", "Flakes + Likely Flakes", "Flak
 const TABLE_TRUNCATION_LENGTH = 25;
 
 interface State {
-  pendingChartRequest?: CancelablePromise<target.GetDailyTargetStatsResponse>;
   chartData?: target.GetDailyTargetStatsResponse;
-  pendingTableRequest?: CancelablePromise<target.GetTargetStatsResponse>;
   tableData?: target.GetTargetStatsResponse;
+  chartAndTableLoading: boolean;
+  flakeSamplesLoading: boolean;
   tableSort: TableSort;
   showAllTableEntries: boolean;
-  pendingFlakeSamplesRequest?: CancelablePromise<target.GetTargetFlakeSamplesResponse>;
   flakeSamples?: target.GetTargetFlakeSamplesResponse;
   flakeTestLogs: Map<string, TestLogDataOrError>;
   error?: string;
 }
 
 export default class FlakesComponent extends React.Component<Props, State> {
+  pendingTableRequest?: CancelablePromise<target.GetTargetStatsResponse>;
+  pendingChartRequest?: CancelablePromise<target.GetDailyTargetStatsResponse>;
+  pendingFlakeSamplesRequest?: CancelablePromise<target.GetTargetFlakeSamplesResponse>;
+
   state: State = {
     flakeTestLogs: new Map(),
     tableSort: "Flaky %",
+    chartAndTableLoading: false,
+    flakeSamplesLoading: false,
     showAllTableEntries: false,
   };
 
@@ -73,9 +77,21 @@ export default class FlakesComponent extends React.Component<Props, State> {
     const prevEnd = timestampToDateWithFallback(prevProtoParams.updatedBefore, 0).getTime();
 
     const dateChanged = currentStart != prevStart || currentEnd != prevEnd;
-    if (currentTarget !== prevTarget || this.props.repo !== prevProps.repo || dateChanged) {
+    if (
+      currentTarget !== prevTarget ||
+      this.props.repo !== prevProps.repo ||
+      this.props.search.get("branch") !== prevProps.search.get("branch") ||
+      dateChanged
+    ) {
       this.fetch();
     }
+  }
+
+  updateLoadingState() {
+    this.setState({
+      chartAndTableLoading: Boolean(this.pendingChartRequest || this.pendingTableRequest),
+      flakeSamplesLoading: Boolean(this.pendingFlakeSamplesRequest),
+    });
   }
 
   fetch() {
@@ -83,66 +99,96 @@ export default class FlakesComponent extends React.Component<Props, State> {
     const labels = label ? [label] : [];
     const params = getProtoFilterParams(this.props.search);
 
-    this.state.pendingChartRequest?.cancel();
-    this.state.pendingTableRequest?.cancel();
-    this.state.pendingFlakeSamplesRequest?.cancel();
+    this.pendingChartRequest?.cancel();
+    this.pendingTableRequest?.cancel();
+    this.pendingFlakeSamplesRequest?.cancel();
+    this.pendingChartRequest = undefined;
+    this.pendingTableRequest = undefined;
+    this.pendingFlakeSamplesRequest = undefined;
 
     this.setState({
-      pendingChartRequest: undefined,
-      pendingTableRequest: undefined,
-      pendingFlakeSamplesRequest: undefined,
+      flakeSamples: undefined,
       error: undefined,
     });
 
     const chartRequest = rpc_service.service.getDailyTargetStats({
       labels,
       repo: this.props.repo,
+      branchName: this.props.search.get("branch") || "",
       startedAfter: params.updatedAfter,
       startedBefore: params.updatedBefore,
     });
     const tableRequest = rpc_service.service.getTargetStats({
       labels,
       repo: this.props.repo,
+      branchName: this.props.search.get("branch") || "",
       startedAfter: params.updatedAfter,
       startedBefore: params.updatedBefore,
     });
-    this.setState({ pendingChartRequest: chartRequest, pendingTableRequest: tableRequest });
+    this.pendingChartRequest = chartRequest;
+    this.pendingTableRequest = tableRequest;
+    this.updateLoadingState();
 
     chartRequest
       .then((r) => {
+        if (this.pendingChartRequest !== chartRequest) {
+          return;
+        }
         console.log(r);
-        this.setState({ pendingChartRequest: undefined, chartData: r });
+        this.pendingChartRequest = undefined;
+        this.setState({ chartData: r });
+        this.updateLoadingState();
       })
       .catch(() => {
+        if (this.pendingChartRequest !== chartRequest) {
+          return;
+        }
         this.setState({
-          pendingChartRequest: undefined,
           error: "Failed to load flakes data.  Please try again later.",
         });
+        this.pendingChartRequest = undefined;
+        this.updateLoadingState();
       });
     tableRequest
       .then((r) => {
+        if (this.pendingTableRequest !== tableRequest) {
+          return;
+        }
         console.log(r);
-        this.setState({ pendingTableRequest: undefined, tableData: r });
+        this.pendingTableRequest = undefined;
+        this.setState({ tableData: r });
+        this.updateLoadingState();
       })
       .catch(() => {
+        if (this.pendingTableRequest !== tableRequest) {
+          return;
+        }
+        this.pendingTableRequest = undefined;
         this.setState({
-          pendingTableRequest: undefined,
           error: "Failed to load flakes data.  Please try again later.",
         });
+        this.updateLoadingState();
       });
 
     if (label) {
       const flakeSamplesRequest = rpc_service.service.getTargetFlakeSamples({
         label,
         repo: this.props.repo,
+        branchName: this.props.search.get("branch") || "",
         startedAfter: params.updatedAfter,
         startedBefore: params.updatedBefore,
       });
-      this.setState({ pendingFlakeSamplesRequest: flakeSamplesRequest });
+      this.pendingFlakeSamplesRequest = flakeSamplesRequest;
+      this.updateLoadingState();
 
       flakeSamplesRequest.then((r) => {
+        if (this.pendingFlakeSamplesRequest !== flakeSamplesRequest) {
+          return;
+        }
         console.log(r);
-        this.setState({ pendingFlakeSamplesRequest: undefined, flakeSamples: r });
+        this.pendingFlakeSamplesRequest = undefined;
+        this.setState({ flakeSamples: r });
+        this.updateLoadingState();
         r.samples.forEach((s) => {
           this.fetchTestLogs(s);
         });
@@ -225,21 +271,28 @@ export default class FlakesComponent extends React.Component<Props, State> {
     const flakeSamplesRequest = rpc_service.service.getTargetFlakeSamples({
       label,
       repo: this.props.repo,
+      branchName: this.props.search.get("branch") || "",
       pageToken: this.state.flakeSamples.nextPageToken,
     });
 
-    this.setState({ pendingFlakeSamplesRequest: flakeSamplesRequest });
+    this.pendingFlakeSamplesRequest = flakeSamplesRequest;
+    this.updateLoadingState();
 
     const previousSamples = this.state.flakeSamples.samples;
 
     flakeSamplesRequest.then((r) => {
+      if (this.pendingFlakeSamplesRequest !== flakeSamplesRequest) {
+        return;
+      }
       console.log(r);
       r.samples.forEach((s) => {
         this.fetchTestLogs(s);
       });
 
       r.samples = previousSamples.concat(r.samples);
-      this.setState({ pendingFlakeSamplesRequest: undefined, flakeSamples: r });
+      this.pendingFlakeSamplesRequest = undefined;
+      this.updateLoadingState();
+      this.setState({ flakeSamples: r });
     });
   }
 
@@ -287,7 +340,7 @@ export default class FlakesComponent extends React.Component<Props, State> {
     return (
       <div className="container flakes-list">
         <h3 className="flakes-list-header">Sample flakes for {targetLabel}</h3>
-        {!this.state.pendingFlakeSamplesRequest && !(this.state.flakeSamples?.samples.length ?? 0) && (
+        {!this.state.flakeSamplesLoading && !(this.state.flakeSamples?.samples.length ?? 0) && (
           <div>No samples found. Their logs may have expired from the remote cache.</div>
         )}
         {this.state.flakeSamples?.samples.map((s) => {
@@ -336,8 +389,8 @@ export default class FlakesComponent extends React.Component<Props, State> {
             );
           }
         })}
-        {Boolean(this.state.pendingFlakeSamplesRequest) && <div className="loading"></div>}
-        {!this.state.pendingFlakeSamplesRequest && this.state.flakeSamples?.nextPageToken && (
+        {this.state.flakeSamplesLoading && <div className="loading"></div>}
+        {!this.state.flakeSamplesLoading && this.state.flakeSamples?.nextPageToken && (
           <button className="load-more" onClick={() => this.loadMoreSamples()}>
             Look for more samples
           </button>
@@ -353,7 +406,7 @@ export default class FlakesComponent extends React.Component<Props, State> {
       <h3 className="flakes-chart-header">{`Daily flakes ${singleTarget ? `for ${singleTarget} ` : ""}`}</h3>
     );
 
-    if (this.state.pendingChartRequest || this.state.pendingTableRequest) {
+    if (this.state.chartAndTableLoading) {
       return (
         <div className="container">
           {dailyFlakesHeader}
@@ -490,7 +543,7 @@ export default class FlakesComponent extends React.Component<Props, State> {
                   {!singleTarget && (
                     <div className="flake-table-row flake-table-summary-row">
                       <div className="flake-table-row-image">
-                        <Target className="icon"></Target>
+                        <Target></Target>
                       </div>
                       <div className="flake-table-row-content">
                         <div className="flake-table-row-header">Totals</div>
@@ -528,7 +581,7 @@ export default class FlakesComponent extends React.Component<Props, State> {
                     return (
                       <Link key={index} className="flake-table-row" href={`/tests/?target=${s.label}#flakes`}>
                         <div className="flake-table-row-image">
-                          <Target className="icon"></Target>
+                          <Target></Target>
                         </div>
                         <div className="flake-table-row-content">
                           <div className="flake-table-row-header">
@@ -548,16 +601,6 @@ export default class FlakesComponent extends React.Component<Props, State> {
                             </div>
                             <div className="flake-stat">
                               <span className="flake-stat-value">{s.data?.totalRuns ?? 0}</span> total runs
-                            </div>
-                            <div className="flake-stat">
-                              <span className="flake-stat-value">
-                                {format.compactDurationSec(
-                                  +(s.data?.totalFlakeRuntimeUsec ?? 0) /
-                                    1e6 /
-                                    (+(s.data?.flakyRuns ?? 0) + +(s.data?.flakyRuns ?? 0) || 1)
-                                )}
-                              </span>{" "}
-                              per flake
                             </div>
                           </div>
                         </div>

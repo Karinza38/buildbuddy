@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tebeka/selenium"
 	"github.com/tebeka/selenium/chrome"
+
+	selenium_log "github.com/tebeka/selenium/log"
 )
 
 var (
@@ -68,6 +70,11 @@ func New(t *testing.T) *WebTester {
 		// `SetWindowSize` returning an error in headless mode
 		// https://github.com/yukinying/chrome-headless-browser-docker/issues/11
 		"--window-size=1920,1000",
+		// When these tests are run inside containers on RBE, the size of
+		// /dev/shm is limited to 64MB, which is not enough for chrome, and can
+		// cause page crashes. Disable /dev/shm usage to fix this.
+		// See https://stackoverflow.com/questions/53902507/unknown-error-session-deleted-because-of-page-crash-from-unknown-error-cannot/53970825#53970825
+		"--disable-dev-shm-usage",
 	}
 	chromedriverArgs := []string{}
 	if !*headless {
@@ -88,6 +95,10 @@ func New(t *testing.T) *WebTester {
 		chrome.CapabilitiesKey: chrome.Capabilities{Args: chromeArgs},
 		"google:wslConfig":     map[string]any{"args": chromedriverArgs},
 	}
+	// Set the log level so that we can retrieve everything that was printed
+	// to the console.
+	capabilities.SetLogLevel(selenium_log.Browser, selenium_log.All)
+
 	driver, err := webtest.NewWebDriverSession(capabilities)
 	require.NoError(t, err, "failed to create webdriver session")
 	// Allow webdriver to wait a short period before giving up on finding an
@@ -102,18 +113,34 @@ func New(t *testing.T) *WebTester {
 	driver.SetImplicitWaitTimeout(*implicitWaitTimeout)
 	wt := &WebTester{t, driver}
 	t.Cleanup(func() {
+		assertErrorBannerNeverShown(wt)
+
 		err := wt.screenshot("END_OF_TEST")
 		// NOTE: `assert` here instead of `require` so that we still close down
 		// the webdriver if the screenshot fails.
 		assert.NoError(t, err, "failed to take end-of-test screenshot")
 
-		if t.Failed() {
+		if *endOfTestDelay > 0 {
+			t.Logf("Sleeping for %s (-webdriver_end_of_test_delay)", *endOfTestDelay)
 			time.Sleep(*endOfTestDelay)
 		}
 		err = driver.Quit()
 		require.NoError(t, err)
 	})
 	return wt
+}
+
+// LogString returns the browser's console logs as a flat string.
+// This can be useful for checking that certain events did not occur, which
+// may otherwise be difficult to test using only the UI.
+func (wt *WebTester) LogString() string {
+	var builder strings.Builder
+	logs, err := wt.driver.Log(selenium_log.Browser)
+	require.NoError(wt.t, err)
+	for _, log := range logs {
+		builder.WriteString(fmt.Sprintf("[%s] %s\n", log.Level, log.Message))
+	}
+	return builder.String()
 }
 
 // Get navigates to the given URL.
@@ -129,12 +156,9 @@ func (wt *WebTester) CurrentURL() string {
 	return url
 }
 
-// Returns the <body> element of the current page. Exactly one body element
-// must exist, otherwise the test fails.
-func (wt *WebTester) FindBody() *Element {
-	el, err := wt.driver.FindElement(selenium.ByTagName, "body")
-	require.NoError(wt.t, err)
-	return &Element{wt.t, el}
+// Refresh reloads the page.
+func (wt *WebTester) Refresh() {
+	wt.Get(wt.CurrentURL())
 }
 
 // Find returns the element matching the given CSS selector. Exactly one
@@ -143,6 +167,19 @@ func (wt *WebTester) Find(cssSelector string) *Element {
 	el, err := wt.driver.FindElement(selenium.ByCSSSelector, cssSelector)
 	require.NoError(wt.t, err)
 	return &Element{wt.t, el}
+}
+
+// FindWithTimeout is like Find but polls for the element with the given
+// timeout. Use this in cases where the page may still be transitioning and
+// the default --webdriver_implicit_wait_timeout may not be long enough.
+func (wt *WebTester) FindWithTimeout(cssSelector string, timeout time.Duration) *Element {
+	var els []*Element
+	require.Eventually(wt.t, func() bool {
+		els = wt.FindAll(cssSelector)
+		return len(els) > 0
+	}, timeout, 50*time.Millisecond)
+	require.Len(wt.t, els, 1, "selector %q matched more than one element", cssSelector)
+	return els[0]
 }
 
 // FindAll returns all elements matching the given CSS selector.
@@ -322,8 +359,8 @@ func (el *Element) FirstSelectedOption() *Element {
 
 // HasClass returns whether an element has the given class name.
 func HasClass(el *Element, class string) bool {
-	classes := strings.Split(el.GetAttribute("class"), " ")
-	for _, c := range classes {
+	classes := strings.SplitSeq(el.GetAttribute("class"), " ")
+	for c := range classes {
 		if c == class {
 			return true
 		}
@@ -369,6 +406,14 @@ func Login(wt *WebTester, target Target) {
 func Logout(wt *WebTester) {
 	ExpandSidebarOptions(wt)
 	wt.FindByDebugID("logout-button").Click()
+}
+
+// Fails the test if the error banner was shown at any point during the test.
+func assertErrorBannerNeverShown(wt *WebTester) {
+	logs := wt.LogString()
+	if strings.Contains(logs, "Displaying error banner") {
+		assert.Fail(wt.t, "Error banner was displayed during test", "%s", logs)
+	}
 }
 
 // ExpandSidebarOptions expands the sidebar options, exposing the section
@@ -451,8 +496,10 @@ func GetBazelBuildFlags(wt *WebTester, appBaseURL string, opts ...SetupPageOptio
 			line = parts[0]
 		}
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "build ") {
-			buildFlags = append(buildFlags, strings.TrimPrefix(line, "build "))
+		if after, ok := strings.CutPrefix(line, "build "); ok {
+			buildFlags = append(buildFlags, after)
+		} else if after, ok := strings.CutPrefix(line, "common "); ok {
+			buildFlags = append(buildFlags, after)
 		}
 	}
 	return buildFlags
@@ -506,4 +553,27 @@ func LeaveSelectedOrg(wt *WebTester, appBaseURL string) {
 		}
 	}
 	require.FailNow(wt.t, "could not find org member list item labeled with '(You)'")
+}
+
+func GetOrCreatePersonalAPIKey(wt *WebTester, appBaseURL string) string {
+	wt.Get(appBaseURL + "/settings/personal/api-keys")
+	existingKeys := wt.FindAll(`.api-key-value`)
+	if len(existingKeys) == 0 {
+		wt.FindByDebugID("create-new-api-key").Click()
+		wt.Find(`.dialog-wrapper [name="label"]`).SendKeys("test-personal-key")
+		wt.FindByDebugID("cas-only-radio-button").Click()
+		wt.Find(`.dialog-wrapper button[type="submit"]`).Click()
+	}
+	wt.Find(`.api-key-value-hide`).Click()
+	apiKey := ""
+	for range 5 {
+		apiKey = wt.Find(".api-key-value").Text()
+		// Wait for the API key value to load
+		if !strings.Contains(apiKey, "••••") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NotContains(wt.t, apiKey, "••••")
+	return apiKey
 }

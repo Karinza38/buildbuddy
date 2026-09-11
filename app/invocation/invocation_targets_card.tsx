@@ -1,11 +1,11 @@
-import React from "react";
-import InvocationModel from "./invocation_model";
-import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import { ChevronRight, Copy } from "lucide-react";
-import { copyToClipboard } from "../util/clipboard";
+import React from "react";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import alert_service from "../alert/alert_service";
 import Link from "../components/link/link";
 import format from "../format/format";
+import { copyToClipboard } from "../util/clipboard";
+import InvocationModel from "./invocation_model";
 
 interface Props {
   model: InvocationModel;
@@ -83,7 +83,7 @@ export default class TargetsCardComponent extends React.Component<Props, State> 
                       className="target">
                       <span className="target-status-icon">{this.props.icon}</span>{" "}
                       <span className="chevron-icon">
-                        <ChevronRight className="icon" />
+                        <ChevronRight />
                       </span>
                       <span className="target-label">{target.id?.targetCompleted?.label}</span>{" "}
                       {this.props.model.rootCauseTargetLabels.has(target.id?.targetCompleted?.label ?? "") && (

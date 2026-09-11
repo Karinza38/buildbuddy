@@ -3,19 +3,21 @@ package compactgraph
 import (
 	"bufio"
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/buildbuddy-io/buildbuddy/cli/log"
 	"github.com/buildbuddy-io/buildbuddy/proto/spawn_diff"
 	"github.com/klauspost/compress/zstd"
-	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/encoding/protodelim"
 
@@ -37,19 +39,20 @@ type CompactGraph struct {
 type globalSettings struct {
 	hashFunction               string
 	workspaceRunfilesDirectory string
-	legacyExternalRunfiles     bool
-	hasEmptyFiles              bool
+	legacyExternalRunfiles     *bool
+	invocationId               string
 }
 
 // ReadCompactLog reads a compact execution log from the given reader and returns the graph of spawns, the hash function
 // used to compute the file digests, and an error if any.
 func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
-	diffEG := errgroup.Group{}
+	diffEG, ctx := errgroup.WithContext(context.Background())
 
 	// A size > 1 shows noticeable performance improvements in benchmarks. Larger sizes don't show relevant further
 	// improvements.
 	entries := make(chan *spawnproto.ExecLogEntry, 100)
 	diffEG.Go(func() error {
+		defer close(entries)
 		d, err := zstd.NewReader(in)
 		if err != nil {
 			return err
@@ -67,15 +70,19 @@ func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
 			if err != nil {
 				return err
 			}
-			entries <- &entry
+			select {
+			case entries <- &entry:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-		close(entries)
 		return nil
 	})
 
 	cg := &CompactGraph{}
 	diffEG.Go(func() error {
 		cg.spawns = make(map[string]*Spawn)
+		interner := newInterner()
 		previousInputs := make(map[uint32]Input)
 		previousInputs[0] = emptyInputSet
 		for entry := range entries {
@@ -86,6 +93,7 @@ func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
 				}
 				cg.settings.hashFunction = entry.GetInvocation().HashFunctionName
 				cg.settings.workspaceRunfilesDirectory = entry.GetInvocation().WorkspaceRunfilesDirectory
+				cg.settings.invocationId = entry.GetInvocation().GetId()
 			case *spawnproto.ExecLogEntry_File_:
 				file := protoToFile(entry.GetFile(), cg.settings.hashFunction)
 				previousInputs[entry.Id] = file
@@ -99,7 +107,7 @@ func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
 				inputSet := protoToInputSet(entry.GetInputSet(), previousInputs)
 				previousInputs[entry.Id] = inputSet
 			case *spawnproto.ExecLogEntry_Spawn_:
-				spawn, outputPaths := protoToSpawn(entry.GetSpawn(), previousInputs)
+				spawn, outputPaths := protoToSpawn(entry.GetSpawn(), previousInputs, interner)
 				if spawn != nil {
 					for _, p := range outputPaths {
 						cg.spawns[p] = spawn
@@ -120,9 +128,12 @@ func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
 				previousInputs[entry.Id] = symlinkEntrySet
 			case *spawnproto.ExecLogEntry_RunfilesTree_:
 				runfilesTreeProto := entry.GetRunfilesTree()
-				cg.settings.legacyExternalRunfiles = cg.settings.legacyExternalRunfiles || runfilesTreeProto.LegacyExternalRunfiles
-				cg.settings.hasEmptyFiles = cg.settings.hasEmptyFiles || len(runfilesTreeProto.EmptyFiles) > 0
-				runfilesTree := protoToRunfilesTree(runfilesTreeProto, previousInputs, cg.settings.hashFunction)
+				if cg.settings.legacyExternalRunfiles == nil {
+					// The value of the legacy_external_runfiles flag is the same for all runfiles trees in a single
+					// build.
+					cg.settings.legacyExternalRunfiles = &runfilesTreeProto.LegacyExternalRunfiles
+				}
+				runfilesTree := protoToRunfilesTree(runfilesTreeProto, previousInputs, cg.settings.hashFunction, interner)
 				previousInputs[entry.Id] = addRunfilesTreeSpawn(cg, runfilesTree)
 			default:
 				log.Fatalf("unexpected entry type: %T", entry.Type)
@@ -136,6 +147,17 @@ func ReadCompactLog(in io.Reader) (*CompactGraph, error) {
 		return nil, err
 	}
 	return cg, nil
+}
+
+func newInterner() func(string) string {
+	interned := make(map[string]string)
+	return func(s string) string {
+		if i, ok := interned[s]; ok {
+			return i
+		}
+		interned[s] = s
+		return s
+	}
 }
 
 // This synthetic mnemonic contains a space to ensure it doesn't conflict with any real mnemonic.
@@ -167,9 +189,9 @@ func addRunfilesTreeSpawn(cg *CompactGraph, tree *RunfilesTree) Input {
 	return output
 }
 
-func Diff(old, new *CompactGraph) ([]*spawn_diff.SpawnDiff, error) {
-	if old.settings != new.settings {
-		settingDiffs := diffSettings(&old.settings, &new.settings)
+func Diff(old, new *CompactGraph) (*spawn_diff.DiffResult, error) {
+	settingDiffs := diffSettings(&old.settings, &new.settings)
+	if settingDiffs != nil {
 		return nil, fmt.Errorf("global settings changed:\n%s", strings.Join(settingDiffs, "\n"))
 	}
 
@@ -228,29 +250,25 @@ func Diff(old, new *CompactGraph) ([]*spawn_diff.SpawnDiff, error) {
 	diffWG := sync.WaitGroup{}
 	// Diff runfiles tree spawns first to compute exact content hashes that are used when diffing other spawns.
 	for _, output := range commonRunfilesTrees {
-		diffWG.Add(1)
-		go func() {
-			defer diffWG.Done()
-			spawnDiff, localChange, invalidatedBy := diffRunfilesTrees(old.spawns[output], new.spawns[output], oldResolveSymlinks, newResolveSymlinks)
+		diffWG.Go(func() {
+			spawnDiff, localChange, invalidatedBy := diffRunfilesTrees(old.spawns[output], new.spawns[output], oldResolveSymlinks, newResolveSymlinks, old.settings.workspaceRunfilesDirectory, old.settings.hashFunction)
 			diffResults.Store(output, &diffResult{
 				spawnDiff:     spawnDiff,
 				localChange:   localChange,
 				invalidatedBy: invalidatedBy,
 			})
-		}()
+		})
 	}
 	diffWG.Wait()
 	for _, output := range commonSpawnOutputs {
-		diffWG.Add(1)
-		go func() {
-			defer diffWG.Done()
+		diffWG.Go(func() {
 			spawnDiff, localChange, invalidatedBy := diffSpawns(old.spawns[output], new.spawns[output], oldResolveSymlinks, newResolveSymlinks)
 			diffResults.Store(output, &diffResult{
 				spawnDiff:     spawnDiff,
 				localChange:   localChange,
 				invalidatedBy: invalidatedBy,
 			})
-		}()
+		})
 	}
 	diffWG.Wait()
 
@@ -265,47 +283,64 @@ func Diff(old, new *CompactGraph) ([]*spawn_diff.SpawnDiff, error) {
 		}
 		resultEntry, _ := diffResults.Load(output)
 		result := resultEntry.(*diffResult)
+		if len(result.spawnDiff.GetModified().Diffs) == 0 {
+			continue
+		}
 		spawn := new.spawns[output]
 		foundTransitiveCause := false
-		// Get the deduplicated primary outputs for those spawns referenced via invalidatedBy.
-		invalidatedByPrimaryOutput := make(map[string]struct{})
-		for _, invalidatedBy := range result.invalidatedBy {
-			if s, ok := new.spawns[invalidatedBy]; ok {
-				invalidatedByPrimaryOutput[s.PrimaryOutputPath()] = struct{}{}
+		// Don't propagate invalidations through local changes:
+		// 1) The local change would cause the spawn to be re-run anyway, which in turn may be responsible for the
+		//    invalidation of dependents.
+		// 2) Avoids pathological memory usage during flattening below for a large number of local changes that each
+		//    invalidate a large number of other local changes - if all of them are flattened, the memory usage can grow
+		//    quadratically in the number of local changes.
+		if !result.localChange {
+			// Get the deduplicated primary outputs for those spawns referenced via invalidatedBy.
+			invalidatedByPrimaryOutput := make(map[string]struct{})
+			for _, invalidatedBy := range result.invalidatedBy {
+				if s, ok := new.spawns[invalidatedBy]; ok {
+					invalidatedByPrimaryOutput[s.PrimaryOutputPath()] = struct{}{}
+				}
+			}
+			for invalidatedBy := range invalidatedByPrimaryOutput {
+				if invalidatingResultEntry, ok := diffResults.Load(invalidatedBy); ok {
+					invalidatingResult := invalidatingResultEntry.(*diffResult)
+					foundTransitiveCause = true
+					// Intentionally not flattening the slice here to avoid quadratic complexity when there are many
+					// transitively invalidated target, but few transitive causes. Quadratic complexity can't be avoided
+					// in the general case.
+					invalidatingResult.invalidates = append(invalidatingResult.invalidates, result.invalidates, spawn)
+				}
 			}
 		}
-		for invalidatedBy, _ := range invalidatedByPrimaryOutput {
-			if invalidatingResultEntry, ok := diffResults.Load(invalidatedBy); ok {
-				invalidatingResult := invalidatingResultEntry.(*diffResult)
-				foundTransitiveCause = true
-				// Intentionally not flattening the slice here to avoid quadratic complexity when there are many
-				// transitively invalidated target, but few transitive causes. Quadratic complexity can't be avoided in
-				// the general case.
-				invalidatingResult.invalidates = append(invalidatingResult.invalidates, result.invalidates, spawn)
-			}
-		}
-		if len(result.spawnDiff.GetModified().Diffs) > 0 && (result.localChange || !foundTransitiveCause) {
+		if result.localChange || !foundTransitiveCause {
 			if len(result.invalidates) > 0 {
 				// result.invalidates isn't modified after this point as the spawns are visited in topological order.
-				diffWG.Add(1)
-				go func() {
-					defer diffWG.Done()
-					result.spawnDiff.GetModified().TransitivelyInvalidated = flattenInvalidates(result.invalidates)
-				}()
+				diffWG.Go(func() {
+					result.spawnDiff.GetModified().TransitivelyInvalidated = flattenInvalidates(result.invalidates, isExecOutputPath(output))
+				})
 			}
 			spawnDiffs = append(spawnDiffs, result.spawnDiff)
 		}
 	}
 	diffWG.Wait()
 
-	return spawnDiffs, nil
+	return &spawn_diff.DiffResult{
+		SpawnDiffs:      spawnDiffs,
+		OldInvocationId: old.settings.invocationId,
+		NewInvocationId: new.settings.invocationId,
+	}, nil
 }
 
 // flattenInvalidates flattens a tree of Spawn nodes into a deduplicated map of mnemonic to count of transitively
 // invalidated spawns.
-func flattenInvalidates(invalidates []any) map[string]uint32 {
+// Mnemonics of spawns are suffixed with " (as tool)" if the invalidating spawn is a tool and the invalidated spawn is
+// not, that is, if the dependency path crosses an edge with an "exec" transition (ignoring "exec" transitions on
+// targets that are already in the "exec" configuration).
+func flattenInvalidates(invalidates []any, isTool bool) map[string]uint32 {
 	transitivelyInvalidated := make(map[string]uint32)
 	spawnsSeen := make(map[*Spawn]struct{})
+	slicesSeen := make(map[*any]struct{})
 	toVisit := invalidates
 	for len(toVisit) > 0 {
 		var n any
@@ -314,11 +349,22 @@ func flattenInvalidates(invalidates []any) map[string]uint32 {
 		case *Spawn:
 			if _, seen := spawnsSeen[n]; !seen {
 				spawnsSeen[n] = struct{}{}
-				transitivelyInvalidated[n.Mnemonic]++
+				suffix := ""
+				if isTool && !isExecOutputPath(n.PrimaryOutputPath()) {
+					suffix = " (as tool)"
+				}
+				transitivelyInvalidated[n.Mnemonic+suffix]++
+			}
+		case []any:
+			// The invalidates argument and any slices it transitively references are reachable and not modified while
+			// traversing, so we can identify them with the pointer to their slice data.
+			ptr := unsafe.SliceData(n)
+			if _, seen := slicesSeen[ptr]; !seen {
+				slicesSeen[ptr] = struct{}{}
+				toVisit = append(toVisit, n...)
 			}
 		default:
-			// If n is not a Spawn, it must be a slice of Spawns or slices.
-			toVisit = append(toVisit, n.([]any)...)
+			log.Fatalf("unexpected type in invalidates: %T", n)
 		}
 	}
 	return transitivelyInvalidated
@@ -342,11 +388,10 @@ func diffSettings(old, new *globalSettings) []string {
 			settingDiffs = append(settingDiffs, fmt.Sprintf("  WORKSPACE name: %s -> %s", old.workspaceRunfilesDirectory, new.workspaceRunfilesDirectory))
 		}
 	}
-	if old.legacyExternalRunfiles != new.legacyExternalRunfiles {
-		settingDiffs = append(settingDiffs, fmt.Sprintf("  --legacy_external_runfiles: %t -> %t", old.legacyExternalRunfiles, new.legacyExternalRunfiles))
-	}
-	if old.hasEmptyFiles != new.hasEmptyFiles {
-		settingDiffs = append(settingDiffs, fmt.Sprintf("  --incompatible_default_to_explicit_init_py: %t -> %t", !old.hasEmptyFiles, !new.hasEmptyFiles))
+	// One build may contain spawns with runfiles trees, while the other doesn't. In this case, the flag is set to nil
+	// in the latter build and shouldn't be considered a change.
+	if old.legacyExternalRunfiles != nil && new.legacyExternalRunfiles != nil && *old.legacyExternalRunfiles != *new.legacyExternalRunfiles {
+		settingDiffs = append(settingDiffs, fmt.Sprintf("  --legacy_external_runfiles: %t -> %t", *old.legacyExternalRunfiles, *new.legacyExternalRunfiles))
 	}
 	return settingDiffs
 }
@@ -444,8 +489,7 @@ func (cg *CompactGraph) visitSuccessors(node any, visitor func(input any)) {
 			visitor(transitiveSet)
 		}
 	case *SymlinkEntrySet:
-		targets := maps.Values(n.directEntries)
-		slices.SortFunc(targets, func(a, b Input) int {
+		targets := slices.SortedFunc(maps.Values(n.directEntries), func(a, b Input) int {
 			return cmp.Compare(a.Path(), b.Path())
 		})
 		for _, target := range targets {
@@ -493,23 +537,15 @@ func diffSpawns(old, new *Spawn, oldResolveSymlinks, newResolveSymlinks func(str
 	m := &spawn_diff.Modified{}
 	diff.Diff = &spawn_diff.SpawnDiff_Modified{Modified: m}
 
-	if !maps.Equal(old.Env, new.Env) {
+	envDiff := diffDicts(old.Env, new.Env)
+	if envDiff != nil {
 		localChange = true
-		envDiff := &spawn_diff.DictDiff{
-			OldChanged: make(map[string]string),
-			NewChanged: make(map[string]string),
-		}
-		for key, value := range old.Env {
-			if newValue, ok := new.Env[key]; !ok || value != newValue {
-				envDiff.OldChanged[key] = value
-			}
-		}
-		for key, value := range new.Env {
-			if oldValue, ok := old.Env[key]; !ok || value != oldValue {
-				envDiff.NewChanged[key] = value
-			}
-		}
 		m.Diffs = append(m.Diffs, &spawn_diff.Diff{Diff: &spawn_diff.Diff_Env{Env: envDiff}})
+	}
+	execPropertiesDiff := diffDicts(old.ExecProperties, new.ExecProperties)
+	if execPropertiesDiff != nil {
+		localChange = true
+		m.Diffs = append(m.Diffs, &spawn_diff.Diff{Diff: &spawn_diff.Diff_ExecProperties{ExecProperties: execPropertiesDiff}})
 	}
 	inputPathsDiff, inputContentsDiff := diffInputSets(old.Inputs, new.Inputs, oldResolveSymlinks, newResolveSymlinks)
 	if inputPathsDiff != nil {
@@ -719,7 +755,7 @@ func diffInputSetsInternal(old, new *InputSet, oldResolveSymlinks, newResolveSym
 
 // diffRunfilesTrees returns a diff of the runfiles trees if the paths or contents of the inputs differ, or nil if they
 // are equal.
-func diffRunfilesTrees(old, new *Spawn, oldResolveSymlinks, newResolveSymlinks func(string) string) (diff *spawn_diff.SpawnDiff, localChange bool, invalidatedBy []string) {
+func diffRunfilesTrees(old, new *Spawn, oldResolveSymlinks, newResolveSymlinks func(string) string, workspaceRunfilesDirectory, hashFunction string) (diff *spawn_diff.SpawnDiff, localChange bool, invalidatedBy []string) {
 	oldTree := old.Inputs.DirectEntries[0].(*RunfilesTree)
 	newTree := new.Inputs.DirectEntries[0].(*RunfilesTree)
 
@@ -732,16 +768,16 @@ func diffRunfilesTrees(old, new *Spawn, oldResolveSymlinks, newResolveSymlinks f
 		return
 	}
 
-	oldMapping := oldTree.ComputeMapping()
-	newMapping := newTree.ComputeMapping()
+	oldMapping := oldTree.ComputeMapping(workspaceRunfilesDirectory, hashFunction)
+	newMapping := newTree.ComputeMapping(workspaceRunfilesDirectory, hashFunction)
 
 	var oldOnly, newOnly []string
-	for p, _ := range oldMapping {
+	for p := range oldMapping {
 		if _, ok := newMapping[p]; !ok {
 			oldOnly = append(oldOnly, p)
 		}
 	}
-	for p, _ := range newMapping {
+	for p := range newMapping {
 		if _, ok := oldMapping[p]; !ok {
 			newOnly = append(newOnly, p)
 		}
@@ -758,27 +794,24 @@ func diffRunfilesTrees(old, new *Spawn, oldResolveSymlinks, newResolveSymlinks f
 		return
 	}
 
-	if !contentsCertainlyUnchanged {
-		var fileDiffs []*spawn_diff.FileDiff
-		for p, oldInput := range oldMapping {
-			newInput := newMapping[p]
-			fileDiff := diffContents(oldInput, newInput, p, oldResolveSymlinks, newResolveSymlinks)
-			if fileDiff != nil {
-				fileDiffs = append(fileDiffs, fileDiff)
-				invalidatedBy = append(invalidatedBy, newInput.Path())
-			}
-		}
-		if len(fileDiffs) > 0 {
-			slices.SortFunc(fileDiffs, func(a, b *spawn_diff.FileDiff) int {
-				return cmp.Compare(a.LogicalPath, b.LogicalPath)
-			})
-			m.Diffs = append(m.Diffs, &spawn_diff.Diff{Diff: &spawn_diff.Diff_InputContents{
-				InputContents: &spawn_diff.FileSetDiff{
-					FileDiffs: fileDiffs,
-				}}})
+	var fileDiffs []*spawn_diff.FileDiff
+	for p, oldInput := range oldMapping {
+		newInput := newMapping[p]
+		fileDiff := diffContents(oldInput, newInput, p, oldResolveSymlinks, newResolveSymlinks)
+		if fileDiff != nil {
+			fileDiffs = append(fileDiffs, fileDiff)
+			invalidatedBy = append(invalidatedBy, newInput.Path())
 		}
 	}
-
+	if len(fileDiffs) > 0 {
+		slices.SortFunc(fileDiffs, func(a, b *spawn_diff.FileDiff) int {
+			return cmp.Compare(a.LogicalPath, b.LogicalPath)
+		})
+		m.Diffs = append(m.Diffs, &spawn_diff.Diff{Diff: &spawn_diff.Diff_InputContents{
+			InputContents: &spawn_diff.FileSetDiff{
+				FileDiffs: fileDiffs,
+			}}})
+	}
 	return
 }
 
@@ -817,6 +850,27 @@ func diffContents(old, new Input, logicalPath string, oldResolveSymlinks, newRes
 		fileDiff.New = &spawn_diff.FileDiff_NewInvalidOutput{NewInvalidOutput: newProto}
 	}
 	return fileDiff
+}
+
+func diffDicts(old, new map[string]string) *spawn_diff.DictDiff {
+	if maps.Equal(old, new) {
+		return nil
+	}
+	diff := &spawn_diff.DictDiff{
+		OldChanged: make(map[string]string),
+		NewChanged: make(map[string]string),
+	}
+	for key, value := range old {
+		if newValue, ok := new[key]; !ok || value != newValue {
+			diff.OldChanged[key] = value
+		}
+	}
+	for key, value := range new {
+		if oldValue, ok := old[key]; !ok || value != oldValue {
+			diff.NewChanged[key] = value
+		}
+	}
+	return diff
 }
 
 func newDiff(s *Spawn) *spawn_diff.SpawnDiff {

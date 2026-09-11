@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
@@ -32,6 +36,9 @@ var (
 
 	// This may be optionally set by a configured provider.
 	SecretProvider interfaces.ConfigSecretProvider
+
+	reloadHooksMu sync.Mutex
+	reloadHooks   []func()
 )
 
 func Path() string {
@@ -42,11 +49,11 @@ func expandStringValue(value string) (string, error) {
 	ctx := context.Background()
 	var expandErr error
 	expandedValue := os.Expand(value, func(s string) string {
-		if strings.HasPrefix(s, externalSecretPrefix) {
+		if after, ok := strings.CutPrefix(s, externalSecretPrefix); ok {
 			if SecretProvider == nil {
 				expandErr = status.UnavailableError("config references an external secret but no secret provider is available")
 			} else {
-				name := strings.TrimPrefix(s, externalSecretPrefix)
+				name := after
 				secret, err := SecretProvider.GetSecret(ctx, name)
 				if err != nil {
 					expandErr = status.UnavailableErrorf("could not retrieve config secret %q: %s", name, err)
@@ -94,13 +101,23 @@ func LoadFromFile(configFile string) error {
 func Load() error {
 	configFile := Path()
 
+	// If config_file is explicitly set to an empty string, don't attempt to
+	// load the file.
+	if configFile == "" {
+		return expandFlagValues()
+	}
+
 	log.Infof("Reading buildbuddy config from '%s'", configFile)
 
 	_, err := os.Stat(configFile)
 
 	// If the file does not exist then skip it.
 	if os.IsNotExist(err) {
-		log.Warningf("No config file found at %s.", configFile)
+		if absoluteConfigFile, err := filepath.Abs(configFile); err != nil {
+			log.Warningf("No config file found at %s, error getting absolute path: %s.", configFile, err)
+		} else {
+			log.Warningf("No config file found at %s (%s).", configFile, absoluteConfigFile)
+		}
 		// Expand secrets in flags even if config wasn't loaded from file.
 		return expandFlagValues()
 	}
@@ -108,11 +125,42 @@ func Load() error {
 	return LoadFromFile(configFile)
 }
 
+// OnReload registers fn to run after the config has been successfully
+// reloaded (e.g. on SIGHUP). The order in which hooks run is not guaranteed.
+func OnReload(fn func()) {
+	reloadHooksMu.Lock()
+	defer reloadHooksMu.Unlock()
+	reloadHooks = append(reloadHooks, fn)
+}
+
 // Reload resets the flags to their default values, re-parses the flags and
 // loads the config file specified by config.Path().
 func Reload() error {
-	flagutil.ResetFlags()
-	return Load()
+	if err := flagutil.ResetFlags(); err != nil {
+		return err
+	}
+	if err := Load(); err != nil {
+		return err
+	}
+	reloadHooksMu.Lock()
+	hooks := slices.Clone(reloadHooks)
+	reloadHooksMu.Unlock()
+	for _, fn := range hooks {
+		runReloadHook(fn)
+	}
+	return nil
+}
+
+// runReloadHook runs one reload hook, recovering from any panic so that a
+// misbehaving hook can't take down the reloading goroutine (typically the
+// process-wide SIGHUP handler) or prevent later hooks from running.
+func runReloadHook(fn func()) {
+	defer func() {
+		if panicErr := recover(); panicErr != nil {
+			log.Errorf("Config reload hook panicked: %v\n%s", panicErr, debug.Stack())
+		}
+	}()
+	fn()
 }
 
 // ReloadOnSIGHUP registers a signal handler (as a goroutine) for syscall.SIGHUP

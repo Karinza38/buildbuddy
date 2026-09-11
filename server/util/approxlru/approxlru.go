@@ -1,9 +1,10 @@
 package approxlru
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -103,8 +104,7 @@ type Opts[T Key] struct {
 	EvictionEvictLatencyUsec prometheus.Observer
 	// RateLimit is the maximum number of evictions to perform per second.
 	// If not set, no limit is enforced.
-	RateLimit          float64
-	NumEvictionWorkers int
+	RateLimit float64
 
 	Clock clockwork.Clock
 
@@ -210,7 +210,7 @@ func (l *LRU[T]) resampleK(k int) error {
 
 	// read new entries to put in the pool.
 	additions := make([]*Sample[T], 0, k*l.samplesPerEviction)
-	for i := 0; i < k; i++ {
+	for range k {
 		entries, err := l.onSample(l.ctx, l.samplesPerEviction)
 		if err != nil {
 			return err
@@ -227,8 +227,8 @@ func (l *LRU[T]) resampleK(k int) error {
 	l.samplePool = append(l.samplePool, additions...)
 
 	if len(l.samplePool) > 0 {
-		sort.Slice(l.samplePool, func(i, j int) bool {
-			return l.samplePool[i].Timestamp.UnixNano() > l.samplePool[j].Timestamp.UnixNano()
+		slices.SortFunc(l.samplePool, func(l, r *Sample[T]) int {
+			return cmp.Compare(r.Timestamp.UnixNano(), l.Timestamp.UnixNano())
 		})
 	}
 
@@ -243,15 +243,13 @@ func (l *LRU[T]) evictSingleKey() (*Sample[T], error) {
 	if err := l.limiter.Wait(l.ctx); err != nil {
 		return nil, err
 	}
-	for i := len(l.samplePool) - 1; i >= 0; i-- {
-		sample := l.samplePool[i]
-
+	for i, sample := range slices.Backward(l.samplePool) {
 		l.mu.Lock()
 		oldLocalSizeBytes := l.localSizeBytes
 		oldGlobalSizeBytes := l.globalSizeBytes
 		l.mu.Unlock()
 
-		log.Debugf("Evictor attempting to evict %q (last accessed %s)", sample.Key, l.clock.Since(sample.Timestamp))
+		//log.Debugf("Evictor attempting to evict %q (last accessed %s)", sample.Key, l.clock.Since(sample.Timestamp))
 		err := l.onEvict(l.ctx, sample)
 		if err != nil {
 			log.Warningf("Could not evict %q: %s", sample.Key, err)

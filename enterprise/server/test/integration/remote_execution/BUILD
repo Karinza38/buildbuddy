@@ -9,11 +9,16 @@ go_test(
     # make these tests run faster
     timeout = "long",
     srcs = ["remote_execution_test.go"],
-    args = ["--test.v"],
+    exec_properties = {
+        # TODO: figure out why this test needs such a high resource request in
+        # order to not be flaky.
+        "test.EstimatedComputeUnits": "16",
+    },
     shard_count = 11,
+    tags = ["cpu:8"],
     deps = [
-        "//enterprise/server/build_event_publisher",
         "//enterprise/server/remote_execution/commandutil",
+        "//enterprise/server/remote_execution/oom",
         "//enterprise/server/scheduling/scheduler_server",
         "//enterprise/server/tasksize",
         "//enterprise/server/test/integration/remote_execution/rbetest",
@@ -22,8 +27,11 @@ go_test(
         "//enterprise/server/testutil/testredis",
         "//enterprise/server/util/execution",
         "//proto:build_event_stream_go_proto",
+        "//proto:execution_stats_go_proto",
         "//proto:remote_execution_go_proto",
+        "//proto:scheduler_go_proto",
         "//server/build_event_protocol/build_event_handler",
+        "//server/build_event_publisher",
         "//server/interfaces",
         "//server/metrics",
         "//server/real_environment",
@@ -36,6 +44,7 @@ go_test(
         "//server/util/bazel",
         "//server/util/grpc_client",
         "//server/util/log",
+        "//server/util/platform",
         "//server/util/rexec",
         "//server/util/status",
         "//server/util/testing/flags",

@@ -4,7 +4,6 @@ import { invocation } from "../../proto/invocation_ts_proto";
 import { User } from "../auth/auth_service";
 import capabilities from "../capabilities/capabilities";
 import FilledButton, { OutlinedButton } from "../components/button/button";
-import Spinner from "../components/spinner/spinner";
 import Dialog, {
   DialogBody,
   DialogFooter,
@@ -15,6 +14,7 @@ import Dialog, {
 import Menu, { MenuItem } from "../components/menu/menu";
 import Modal from "../components/modal/modal";
 import Popup from "../components/popup/popup";
+import Spinner from "../components/spinner/spinner";
 import router from "../router/router";
 import rpcService from "../service/rpc_service";
 import { BuildBuddyError } from "../util/errors";
@@ -81,7 +81,7 @@ export default class InvocationMenuComponent extends React.Component<InvocationM
         <div className="invocation-menu-container">
           <OutlinedButton
             onClick={this.onClickMenuButton.bind(this)}
-            className="invocation-menu-button"
+            className="icon-button invocation-menu-button"
             title="More invocation options">
             <MoreVertical />
           </OutlinedButton>

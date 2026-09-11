@@ -20,6 +20,7 @@ import (
 type Handle struct {
 	executionIDsByInvID sync.Map // map of invocationID => a slice of execution IDs
 	invIDs              sync.Map // map of invocationID => struct{}
+	invocationsByInvID  sync.Map // map of invocationID => *tables.Invocation
 }
 
 func (h *Handle) DialectName() string {
@@ -44,7 +45,7 @@ func NewHandle() *Handle {
 	}
 }
 
-func (h *Handle) BucketFromUsecTimestamp(fieldName string, loc *time.Location, interval string) (string, []interface{}) {
+func (h *Handle) BucketFromUsecTimestamp(fieldName string, loc *time.Location, interval string) (string, []any) {
 	return "", nil
 }
 
@@ -54,6 +55,21 @@ func (h *Handle) DateFromUsecTimestamp(fieldNmae string, timezoneOffsetMinutes i
 
 func (h *Handle) FlushInvocationStats(ctx context.Context, ti *tables.Invocation) error {
 	h.invIDs.LoadOrStore(ti.InvocationID, struct{}{})
+	h.invocationsByInvID.Store(ti.InvocationID, ti)
+	return nil
+}
+
+// GetFlushedInvocation returns the invocation flushed with the given
+// invocation ID, or nil if no invocation with that ID was flushed.
+func (h *Handle) GetFlushedInvocation(invID string) *tables.Invocation {
+	v, ok := h.invocationsByInvID.Load(invID)
+	if !ok {
+		return nil
+	}
+	return v.(*tables.Invocation)
+}
+
+func (h *Handle) FlushUsages(ctx context.Context, rows []*schema.RawUsage) error {
 	return nil
 }
 
@@ -82,7 +98,7 @@ func (h *Handle) GetExecutionIDsByInvID(t *testing.T, invID string) []string {
 
 func (h *Handle) GetInvocationIDs() []string {
 	res := []string{}
-	h.executionIDsByInvID.Range(func(k, v interface{}) bool {
+	h.executionIDsByInvID.Range(func(k, v any) bool {
 		invID := k.(string)
 		res = append(res, invID)
 		return true

@@ -3,10 +3,13 @@ package retry
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/jonboulle/clockwork"
 )
 
@@ -57,7 +60,7 @@ func New(ctx context.Context, opts *Options) *Retry {
 				)/math.Log(opts.Multiplier),
 			))
 			b := opts.InitialBackoff
-			for i := 0; i < tries; i++ {
+			for range tries {
 				maxTime += b
 				b = time.Duration(math.Min(float64(b)*opts.Multiplier, float64(opts.MaxBackoff)))
 			}
@@ -206,7 +209,8 @@ func (r *Retry) MaxTotalDelay() time.Duration {
 // Do executes the given function with a retry loop.
 //
 // The caller can indicate that an error should not be retried by wrapping it
-// using NonRetryableError(err).
+// using NonRetryableError(err). This exits the retry loop and returns the
+// error passed into NonRetryableError, not the wrapped error.
 func Do[T any](ctx context.Context, opts *Options, fn func(ctx context.Context) (T, error)) (T, error) {
 	logFailedAttempt := func(err error, message string) {
 		if err == nil || opts.DontLogFailedAttempts {
@@ -224,7 +228,6 @@ func Do[T any](ctx context.Context, opts *Options, fn func(ctx context.Context) 
 	for {
 		makeAttempt, err := r.next()
 		if err != nil {
-			logFailedAttempt(lastError, " and could not be retried as the context is done")
 			return *new(T), err
 		}
 		if !makeAttempt {
@@ -236,8 +239,20 @@ func Do[T any](ctx context.Context, opts *Options, fn func(ctx context.Context) 
 			logFailedAttempt(lastError, ", but succeeded on retry")
 			return rsp, nil
 		}
-		if _, ok := err.(*nonRetryableError); ok {
-			logFailedAttempt(lastError, " and could not be retried due to a non-retryable error")
+		if wrapped, ok := err.(*nonRetryableError); ok {
+			// Remove the wrapper so callers can see their original error.
+			err = wrapped.Unwrap()
+			if err == nil {
+				// Caller called NonRetryableError(nil). This is probably not
+				// intentional; just alert and make sure we return some error
+				// here.
+				alert.CtxUnexpectedEvent(ctx, "Called NonRetryableError with nil error")
+				return *new(T), status.UnknownError("non-retryable error")
+			}
+
+			if lastError != nil {
+				logFailedAttempt(err, fmt.Sprintf(" (last error: %v) and could not be retried due to a non-retryable error", lastError))
+			}
 			return rsp, err
 		}
 		lastError = err
@@ -266,9 +281,9 @@ func (e *nonRetryableError) Unwrap() error {
 	return e.err
 }
 
-// NonRetryableError is used in conjunction with Do to indicate that a
-// particular error should not be retried. Instead of returning the original
-// error, returned the result of calling NonRetryableError(err).
+// NonRetryableError returns a special error that immediately exits a [Do] or
+// [DoVoid] loop. [Do] and [DoVoid] will return the original error passed into
+// this function, not the wrapped error.
 func NonRetryableError(err error) error {
 	return &nonRetryableError{err}
 }

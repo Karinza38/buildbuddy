@@ -1,25 +1,3 @@
-import React from "react";
-import { fromEvent, Subscription } from "rxjs";
-import { User } from "../../../app/auth/auth_service";
-import capabilities from "../../../app/capabilities/capabilities";
-import Button from "../../../app/components/button/button";
-import LinkButton from "../../../app/components/button/link_button";
-import { Tooltip } from "../../../app/components/tooltip/tooltip";
-import Link from "../../../app/components/link/link";
-import format from "../../../app/format/format";
-import router from "../../../app/router/router";
-import { ROLE_PARAM_NAME } from "../../../app/router/router_params";
-import rpcService, { CancelablePromise } from "../../../app/service/rpc_service";
-import { invocation } from "../../../proto/invocation_ts_proto";
-import { invocation_status } from "../../../proto/invocation_status_ts_proto";
-import FilterComponent from "../filter/filter";
-import OrgJoinRequestsComponent from "../org/org_join_requests";
-import InvocationCardComponent from "../../../app/invocation/invocation_card";
-import HistoryInvocationStatCardComponent from "./history_invocation_stat_card";
-import { ProtoFilterParams, getProtoFilterParams } from "../filter/filter_util";
-import Spinner from "../../../app/components/spinner/spinner";
-import shortcuts, { KeyCombo } from "../../../app/shortcuts/shortcuts";
-import Long from "long";
 import {
   BarChart2,
   CheckCircle,
@@ -27,11 +5,34 @@ import {
   Clock,
   GitBranch,
   GitCommit,
-  Github,
   Hash,
   Percent,
   XCircle,
 } from "lucide-react";
+import React from "react";
+import { fromEvent, Subscription } from "rxjs";
+import { User } from "../../../app/auth/auth_service";
+import capabilities from "../../../app/capabilities/capabilities";
+import Breadcrumbs from "../../../app/components/breadcrumbs/breadcrumbs";
+import Button from "../../../app/components/button/button";
+import LinkButton from "../../../app/components/button/link_button";
+import Link from "../../../app/components/link/link";
+import Spinner from "../../../app/components/spinner/spinner";
+import { Tooltip } from "../../../app/components/tooltip/tooltip";
+import format from "../../../app/format/format";
+import { Github } from "../../../app/icons/github_lucide";
+import InvocationCardComponent from "../../../app/invocation/invocation_card";
+import router, { Path } from "../../../app/router/router";
+import { ROLE_PARAM_NAME } from "../../../app/router/router_params";
+import rpcService, { CancelablePromise } from "../../../app/service/rpc_service";
+import shortcuts, { KeyCombo } from "../../../app/shortcuts/shortcuts";
+import { tryParseURL } from "../../../app/util/url";
+import { invocation_status } from "../../../proto/invocation_status_ts_proto";
+import { invocation } from "../../../proto/invocation_ts_proto";
+import FilterComponent from "../filter/filter";
+import { getProtoFilterParams, ProtoFilterParams } from "../filter/filter_util";
+import OrgJoinRequestsComponent from "../org/org_join_requests";
+import HistoryInvocationStatCardComponent from "./history_invocation_stat_card";
 
 interface State {
   /**
@@ -56,7 +57,6 @@ interface State {
   aggregateStats?: invocation.InvocationStat[];
   loadingAggregateStats?: boolean;
 
-  hoveredInvocationId?: string;
   pageToken?: string;
   invocationIdToCompare?: string;
 
@@ -121,6 +121,28 @@ export default class HistoryComponent extends React.Component<Props, State> {
     return invocation.InvocationSort.SortField.UNKNOWN_SORT_FIELD;
   }
 
+  getInvocationQueryFields(): invocation.IInvocationQuery & invocation.IInvocationStatQuery {
+    const filterParams = getProtoFilterParams(this.props.search);
+    return {
+      host: this.props.hostname || filterParams.host,
+      user: this.props.username || filterParams.user,
+      repoUrl: this.props.repo || filterParams.repo,
+      branchName: this.props.branch || filterParams.branch,
+      commitSha: this.props.commit || filterParams.commit,
+      command: filterParams.command,
+      pattern: filterParams.pattern,
+      tags: filterParams.tags,
+      groupId: this.props.user?.selectedGroup?.id,
+      role: filterParams.role,
+      updatedAfter: filterParams.updatedAfter,
+      updatedBefore: filterParams.updatedBefore,
+      status: filterParams.status,
+      minimumDuration: filterParams.minimumDuration,
+      maximumDuration: filterParams.maximumDuration,
+      genericFilters: filterParams.genericFilters,
+    };
+  }
+
   getInvocations(nextPage?: boolean) {
     this.setState({
       loadingInvocations: true,
@@ -131,24 +153,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
 
     const filterParams = getProtoFilterParams(this.props.search);
     let request = new invocation.SearchInvocationRequest({
-      query: new invocation.InvocationQuery({
-        host: this.props.hostname || filterParams.host,
-        user: this.props.username || filterParams.user,
-        repoUrl: this.props.repo || filterParams.repo,
-        branchName: this.props.branch || filterParams.branch,
-        commitSha: this.props.commit || filterParams.commit,
-        command: filterParams.command,
-        pattern: filterParams.pattern,
-        tags: filterParams.tags,
-        groupId: this.props.user?.selectedGroup?.id,
-        role: filterParams.role,
-        updatedAfter: filterParams.updatedAfter,
-        updatedBefore: filterParams.updatedBefore,
-        status: filterParams.status,
-        minimumDuration: filterParams.minimumDuration,
-        maximumDuration: filterParams.maximumDuration,
-        genericFilters: filterParams.genericFilters,
-      }),
+      query: new invocation.InvocationQuery(this.getInvocationQueryFields()),
       sort: new invocation.InvocationSort({
         sortField: this.getSortField(filterParams),
         ascending: filterParams.sortOrder === "asc",
@@ -182,31 +187,17 @@ export default class HistoryComponent extends React.Component<Props, State> {
       .finally(() => this.setState({ loadingInvocations: false }));
   }
 
+  /**
+   * Returns stats grouped by the currently selected dimension, such as host,
+   * user, repo, etc.
+   */
   getAggregateStats() {
     this.setState({ aggregateStats: undefined, loadingAggregateStats: true });
-
-    const aggregationType = this.hashToAggregationTypeMap.get(this.props.tab);
-    const request = new invocation.GetInvocationStatRequest({ aggregationType });
-    const filterParams = getProtoFilterParams(this.props.search);
-    request.query = new invocation.InvocationStatQuery({
-      host: this.props.hostname || filterParams.host,
-      user: this.props.username || filterParams.user,
-      repoUrl: this.props.repo || filterParams.repo,
-      branchName: this.props.branch || filterParams.branch,
-      commitSha: this.props.commit || filterParams.commit,
-      command: filterParams.command,
-      pattern: filterParams.pattern,
-      tags: filterParams.tags,
-      role: filterParams.role,
-      updatedBefore: filterParams.updatedBefore,
-      updatedAfter: filterParams.updatedAfter,
-      status: filterParams.status,
-      dimensionFilter: filterParams.dimensionFilters,
-      genericFilters: filterParams.genericFilters,
-    });
-
     this.aggregateStatsRpc = rpcService.service
-      .getInvocationStat(request)
+      .getInvocationStat({
+        aggregationType: this.hashToAggregationTypeMap.get(this.props.tab),
+        query: new invocation.InvocationStatQuery(this.getInvocationQueryFields()),
+      })
       .then((response) => {
         console.log(response);
         this.setState({ aggregateStats: response.invocationStat.filter((stat) => stat.name) });
@@ -214,45 +205,23 @@ export default class HistoryComponent extends React.Component<Props, State> {
       .finally(() => this.setState({ loadingAggregateStats: false }));
   }
 
+  /**
+   * Returns summary stats for an invocation listing, such as total count,
+   * total duration, etc.
+   */
   getSummaryStat() {
     this.setState({ summaryStat: undefined, loadingSummaryStat: true });
-
-    const filterParams = getProtoFilterParams(this.props.search);
-    const request = new invocation.GetInvocationStatRequest({
-      aggregationType: invocation.AggType.GROUP_ID_AGGREGATION_TYPE,
-    });
-    request.query = new invocation.InvocationQuery({
-      host: this.props.hostname || filterParams.host,
-      user: this.props.username || filterParams.user,
-      repoUrl: this.props.repo || filterParams.repo,
-      branchName: this.props.branch || filterParams.branch,
-      commitSha: this.props.commit || filterParams.commit,
-      command: filterParams.command,
-      pattern: filterParams.pattern,
-      tags: filterParams.tags,
-      role: filterParams.role,
-      updatedAfter: filterParams.updatedAfter,
-      updatedBefore: filterParams.updatedBefore,
-      status: filterParams.status,
-      dimensionFilter: filterParams.dimensionFilters,
-      genericFilters: filterParams.genericFilters,
-    });
-
     this.summaryStatRpc = rpcService.service
-      .getInvocationStat(request)
+      .getInvocationStat({
+        query: new invocation.InvocationStatQuery(this.getInvocationQueryFields()),
+        aggregationType: invocation.AggType.GROUP_ID_AGGREGATION_TYPE,
+      })
       .then((response) => this.setState({ summaryStat: response.invocationStat?.[0] }))
       .finally(() => this.setState({ loadingSummaryStat: false }));
   }
 
   componentDidMount() {
-    document.title = `${
-      this.props.username ||
-      this.props.hostname ||
-      (this.props.repo && format.formatGitUrl(this.props.repo)) ||
-      this.props.branch ||
-      (this.props.commit && format.formatCommitHash(this.props.commit)) ||
-      this.props.user?.selectedGroupName()
-    } Build History | BuildBuddy`;
+    this.updateDocumentTitle();
 
     this.refreshSubscription.add(
       rpcService.events.subscribe({
@@ -331,6 +300,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
   }
 
   componentDidUpdate(prevProps: Props) {
+    this.updateDocumentTitle();
     if (this.props.tab !== prevProps.tab || this.props.search !== prevProps.search) {
       this.fetch();
     }
@@ -418,16 +388,6 @@ export default class HistoryComponent extends React.Component<Props, State> {
     router.clearFilters();
   }
 
-  handleMouseOver(invocation: invocation.Invocation) {
-    this.setState({
-      hoveredInvocationId: invocation.invocationId,
-    });
-  }
-
-  handleMouseOut(invocation: invocation.IInvocation) {
-    this.setState({ hoveredInvocationId: undefined });
-  }
-
   handleLoadNextPageClicked() {
     this.getInvocations(true);
   }
@@ -460,37 +420,65 @@ export default class HistoryComponent extends React.Component<Props, State> {
     return Boolean(this.props.tab);
   }
 
+  private getViewType() {
+    if (this.props.tab == "#users") return "users";
+    if (this.props.tab == "#repos") return "repos";
+    if (this.props.tab == "#branches") return "branches";
+    if (this.props.tab == "#commits") return "commits";
+    if (this.props.tab == "#hosts") return "hosts";
+    return "build history";
+  }
+
+  private getPageTitle() {
+    if (this.props.username) {
+      return `${this.props.username}'s builds`;
+    }
+    if (this.props.hostname) {
+      return `Builds on ${this.props.hostname}`;
+    }
+    if (this.props.repo && this.isFilteredToWorkflows()) {
+      return `Workflow runs of ${format.formatGitUrl(this.props.repo)}`;
+    }
+    if (this.props.repo) {
+      return `Builds of ${format.formatGitUrl(this.props.repo)}`;
+    }
+    if (this.props.branch) {
+      return `Builds from branch ${this.props.branch}`;
+    }
+    if (this.props.commit) {
+      return `Builds from commit ${format.formatCommitHash(this.props.commit)}`;
+    }
+    return `${this.props.user?.selectedGroupName() || "User"}'s ${this.getViewType()}`;
+  }
+
+  private updateDocumentTitle() {
+    document.title = `${this.getPageTitle()} | BuildBuddy`;
+  }
+
   render() {
+    const pageTitle = this.getPageTitle();
     let scope =
       this.props.username ||
       this.props.hostname ||
       (this.props.commit && format.formatCommitHash(this.props.commit)) ||
       this.props.branch ||
       (this.props.repo && format.formatGitUrl(this.props.repo));
-    let viewType = "build history";
-    if (this.props.tab == "#users") viewType = "users";
-    if (this.props.tab == "#repos") viewType = "repos";
-    if (this.props.tab == "#branches") viewType = "branches";
-    if (this.props.tab == "#commits") viewType = "commits";
-    if (this.props.tab == "#hosts") viewType = "hosts";
 
     // Note: we don't show summary stats for scoped views because the summary stats
     // don't currently get filtered by the scope as well.
     // TODO(bduffany): Make sure scope-filtered queries are optimized and remove this limitation.
     const hideSummaryStats = Boolean(scope);
 
+    const repoUrl = tryParseURL(this.state.invocations?.length ? this.state.invocations[0].repoUrl : "");
+
     const commitLink =
-      this.state.invocations?.length &&
-      this.state.invocations[0].repoUrl &&
-      this.state.invocations[0].repoUrl.startsWith("https://github.com")
-        ? `${this.state.invocations[0].repoUrl}/commit/${this.props.commit}`
+      repoUrl && repoUrl.protocol === "https://" && repoUrl.hostname === "github.com"
+        ? `${repoUrl.toString()}/commit/${this.props.commit}`
         : "";
 
     const branchLink =
-      this.state.invocations?.length &&
-      this.state.invocations[0].repoUrl &&
-      this.state.invocations[0].repoUrl.startsWith("https://github.com")
-        ? `${this.state.invocations[0].repoUrl}/tree/${this.props.branch}`
+      repoUrl && repoUrl.protocol === "https://" && repoUrl.hostname === "github.com"
+        ? `${repoUrl.toString()}/tree/${this.props.branch}`
         : "";
 
     return (
@@ -498,49 +486,49 @@ export default class HistoryComponent extends React.Component<Props, State> {
         <div className="shelf">
           <div className="container">
             <div className="top-bar">
-              <div className="breadcrumbs">
+              <Breadcrumbs>
                 {this.props.user && this.props.user?.selectedGroupName() && (
-                  <span onClick={this.handleOrganizationClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={Path.home}>
                     {this.props.user?.selectedGroupName()}
-                  </span>
+                  </Link>
                 )}
                 {(this.props.username || this.props.tab == "#users") && (
-                  <span onClick={this.handleUsersClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={`${Path.home}#users`}>
                     Users
-                  </span>
+                  </Link>
                 )}
                 {(this.props.hostname || this.props.tab == "#hosts") && (
-                  <span onClick={this.handleHostsClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={`${Path.home}#hosts`}>
                     Hosts
-                  </span>
+                  </Link>
                 )}
                 {(this.props.repo || this.props.tab == "#repos") && (
-                  <span onClick={this.handleReposClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={`${Path.home}#repos`}>
                     Repos
-                  </span>
+                  </Link>
                 )}
                 {(this.props.branch || this.props.tab == "#branches") && (
-                  <span onClick={this.handleBranchesClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={`${Path.home}#branches`}>
                     Branches
-                  </span>
+                  </Link>
                 )}
                 {(this.props.commit || this.props.tab == "#commits") && (
-                  <span onClick={this.handleCommitsClicked.bind(this)} className="clickable">
+                  <Link className="clickable" href={`${Path.home}#commits`}>
                     Commits
-                  </span>
+                  </Link>
                 )}
                 {scope && <span>{scope}</span>}
                 {!this.props.username && !this.props.hostname && this.props.tab == "" && (
                   <>{this.isFilteredToWorkflows() ? <span>Workflow runs</span> : <span>Builds</span>}</>
                 )}
-              </div>
+              </Breadcrumbs>
               <FilterComponent search={this.props.search} />
             </div>
             <div className="titles">
               <div className="title">
                 {this.props.username && (
                   <span>
-                    <span className="history-title">{this.props.username}'s builds</span>
+                    <span className="history-title">{pageTitle}</span>
                     <Link className="history-button" href={`/trends/?user=${this.props.username}`}>
                       <BarChart2 /> View trends
                     </Link>
@@ -548,7 +536,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                 )}
                 {this.props.hostname && (
                   <span>
-                    <span className="history-title">Builds on {this.props.hostname}</span>
+                    <span className="history-title">{pageTitle}</span>
                     <Link className="history-button" href={`/trends/?host=${this.props.hostname}`}>
                       <BarChart2 /> View trends
                     </Link>
@@ -556,7 +544,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                 )}
                 {this.props.repo && !this.isFilteredToWorkflows() && (
                   <>
-                    <span className="history-title">Builds of {format.formatGitUrl(this.props.repo)}</span>
+                    <span className="history-title">{pageTitle}</span>
                     {this.getRepoUrl() && (
                       <a className="history-button" target="_blank" href={this.getRepoUrl()}>
                         <Github /> View repo
@@ -569,7 +557,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                 )}
                 {this.props.repo && this.isFilteredToWorkflows() && (
                   <>
-                    <span className="history-title">Workflow runs of {format.formatGitUrl(this.props.repo)}</span>
+                    <span className="history-title">{pageTitle}</span>
                     {this.getRepoUrl() && (
                       <a className="history-button" target="_blank" href={this.getRepoUrl()}>
                         <Github /> View repo
@@ -579,7 +567,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                 )}
                 {this.props.branch && (
                   <>
-                    <span className="history-title">Builds from branch {this.props.branch}</span>
+                    <span className="history-title">{pageTitle}</span>
                     {branchLink && (
                       <a className="history-button" target="_blank" href={branchLink}>
                         <GitBranch /> View branch
@@ -592,9 +580,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                 )}
                 {this.props.commit && (
                   <span>
-                    <span className="history-title">
-                      Builds from commit {format.formatCommitHash(this.props.commit)}
-                    </span>
+                    <span className="history-title">{pageTitle}</span>
                     {commitLink && (
                       <a className="history-button" target="_blank" href={commitLink}>
                         <GitCommit /> View commit
@@ -610,7 +596,7 @@ export default class HistoryComponent extends React.Component<Props, State> {
                   !this.props.repo &&
                   !this.props.branch &&
                   !this.props.commit &&
-                  `${this.props.user?.selectedGroupName() || "User"}'s ${viewType}`}
+                  pageTitle}
               </div>
             </div>
             {this.state.loadingSummaryStat && !hideSummaryStats && (
@@ -622,19 +608,19 @@ export default class HistoryComponent extends React.Component<Props, State> {
             {this.state.summaryStat && !hideSummaryStats && (
               <div className="details">
                 <div className="detail">
-                  <Hash className="icon gray" />
+                  <Hash className="gray" />
                   {format.formatWithCommas(this.state.summaryStat.totalNumBuilds)} builds
                 </div>
                 <div className="detail">
-                  <CheckCircle className="icon green" />
+                  <CheckCircle className="green" />
                   {format.formatWithCommas(this.state.summaryStat.totalNumSucessfulBuilds)} passed
                 </div>
                 <div className="detail">
-                  <XCircle className="icon red" />
+                  <XCircle className="red" />
                   {format.formatWithCommas(this.state.summaryStat.totalNumFailingBuilds)} failed
                 </div>
                 <div className="detail">
-                  <Percent className="icon grey" />
+                  <Percent className="grey" />
                   {format.percent(
                     Number(this.state.summaryStat.totalNumSucessfulBuilds) /
                       (Number(this.state.summaryStat.totalNumSucessfulBuilds) +
@@ -643,11 +629,11 @@ export default class HistoryComponent extends React.Component<Props, State> {
                   passed
                 </div>
                 <div className="detail">
-                  <Clock className="icon" />
+                  <Clock />
                   {format.durationUsec(this.state.summaryStat.totalBuildTimeUsec)} total
                 </div>
                 <div className="detail">
-                  <Clock className="icon" />
+                  <Clock />
                   {format.durationUsec(
                     Number(this.state.summaryStat.totalBuildTimeUsec) / Number(this.state.summaryStat.totalNumBuilds)
                   )}{" "}
@@ -676,16 +662,15 @@ export default class HistoryComponent extends React.Component<Props, State> {
             </div>
           )}
         </div>
-        {this.props.tab === "#users" && this.props.user?.canCall("getGroupUsers") && (
-          <OrgJoinRequestsComponent user={this.props.user} />
-        )}
+        {this.props.tab === "#users" &&
+          capabilities.config.groupMembershipRequestsEnabled &&
+          this.props.user?.canCall("getGroupUsers") && (
+            <OrgJoinRequestsComponent user={this.props.user} includeMargin={true} />
+          )}
         {Boolean(this.state.invocations?.length || this.state.aggregateStats?.length) && (
           <div className="container nopadding-dense">
             {this.state.invocations?.map((invocation) => (
               <InvocationCardComponent
-                className={this.state.hoveredInvocationId == invocation.invocationId ? "card-hovered" : ""}
-                onMouseOver={this.handleMouseOver.bind(this, invocation)}
-                onMouseOut={this.handleMouseOut.bind(this, invocation)}
                 invocation={invocation}
                 isSelectedForCompare={invocation.invocationId === this.state.invocationIdToCompare}
                 isSelectedWithKeyboard={invocation.invocationId === this.state.selectedInvocationId}
@@ -781,9 +766,9 @@ export default class HistoryComponent extends React.Component<Props, State> {
           !this.state.aggregateStats?.length && (
             <div className="container narrow">
               <div className="empty-state history">
-                <h2>No {viewType} found!</h2>
+                <h2>No {this.getViewType()} found!</h2>
                 <p>
-                  You can associate builds with {viewType} using build metadata.
+                  You can associate builds with {this.getViewType()} using build metadata.
                   <br />
                   <br />
                   <a className="button" href="https://www.buildbuddy.io/docs/guide-metadata" target="_blank">

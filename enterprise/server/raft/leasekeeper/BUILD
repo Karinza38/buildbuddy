@@ -1,5 +1,7 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
+package(default_visibility = ["//enterprise:__subpackages__"])
+
 go_library(
     name = "leasekeeper",
     srcs = ["leasekeeper.go"],
@@ -8,6 +10,7 @@ go_library(
     deps = [
         "//enterprise/server/raft/client",
         "//enterprise/server/raft/events",
+        "//enterprise/server/raft/keys",
         "//enterprise/server/raft/listener",
         "//enterprise/server/raft/nodeliveness",
         "//enterprise/server/raft/rangelease",
@@ -16,6 +19,7 @@ go_library(
         "//server/metrics",
         "//server/util/alert",
         "//server/util/boundedstack",
+        "//server/util/lib/set",
         "//server/util/log",
         "//server/util/status",
         "@com_github_lni_dragonboat_v4//:dragonboat",
@@ -24,5 +28,3 @@ go_library(
         "@org_golang_x_sync//errgroup",
     ],
 )
-
-package(default_visibility = ["//enterprise:__subpackages__"])

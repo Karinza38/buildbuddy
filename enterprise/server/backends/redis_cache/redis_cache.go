@@ -3,7 +3,6 @@ package redis_cache
 import (
 	"bytes"
 	"context"
-	"flag"
 	"io"
 	"path/filepath"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/cache_metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/ioutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
@@ -27,7 +27,9 @@ import (
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 )
 
-var maxValueSizeBytes = flag.Int64("cache.redis.max_value_size_bytes", 10000000, "The maximum value size to cache in redis (in bytes).")
+const deprecatedRedisCacheFlagMessage = "The cache.redis backend is deprecated. Use app.default_redis_target or remote_execution.redis_target for Redis-backed shared state and cache.disk.root_directory for cache storage."
+
+var maxValueSizeBytes = flag.Int64("cache.redis.max_value_size_bytes", 10000000, "The maximum value size to cache in redis (in bytes).", flag.Deprecated(deprecatedRedisCacheFlagMessage))
 
 const (
 	ttl = 3 * 24 * time.Hour
@@ -229,6 +231,18 @@ func (c *Cache) Get(ctx context.Context, r *rspb.ResourceName) ([]byte, error) {
 	return b, err
 }
 
+func (c *Cache) GetWithMetadata(ctx context.Context, r *rspb.ResourceName) ([]byte, *interfaces.CacheMetadata, error) {
+	data, err := c.Get(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	md, err := c.Metadata(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, md, nil
+}
+
 func (c *Cache) GetMulti(ctx context.Context, resources []*rspb.ResourceName) (map[*repb.Digest][]byte, error) {
 	if len(resources) == 0 {
 		return nil, nil
@@ -352,12 +366,12 @@ func (c *Cache) Writer(ctx context.Context, r *rspb.ResourceName) (interfaces.Co
 	timer := cache_metrics.NewCacheTimer(cacheLabels)
 	var buffer bytes.Buffer
 	wc := ioutil.NewCustomCommitWriteCloser(&buffer)
-	wc.CommitFn = func(int64) error {
+	wc.SetCommitFn(func(int64) error {
 		err := c.rdbSet(ctx, k, buffer.Bytes())
 		timer.ObserveWrite(int64(buffer.Len()), err)
 		// Locking and key prefixing are handled in Set.
 		return err
-	}
+	})
 	return wc, nil
 }
 
@@ -369,10 +383,14 @@ func (c *Cache) Stop() error {
 	return nil
 }
 
+func (c *Cache) Partition(ctx context.Context, remoteInstanceName string) (string, error) {
+	return "", nil
+}
+
 func (c *Cache) SupportsCompressor(compressor repb.Compressor_Value) bool {
 	return compressor == repb.Compressor_IDENTITY
 }
 
-func (c *Cache) SupportsEncryption(ctx context.Context) bool {
-	return false
+func (c *Cache) RegisterAtimeUpdater(updater interfaces.DigestOperator) error {
+	return nil
 }

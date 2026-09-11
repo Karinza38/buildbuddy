@@ -3,18 +3,27 @@ package redisutil
 import (
 	"context"
 	"crypto/tls"
-	"flag"
 	"fmt"
+	"net"
+	"net/url"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
+	"github.com/buildbuddy-io/buildbuddy/server/util/retry"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/cespare/xxhash/v2"
+	"github.com/dgryski/go-rendezvous"
 	"github.com/go-redis/redis/extra/redisotel/v8"
 	"github.com/go-redis/redis/v8"
 )
@@ -24,6 +33,13 @@ var (
 		"redis_command_buffer_flush_period", 250*time.Millisecond,
 		"How long to wait between flushing buffered redis commands. "+
 			"Setting this to 0 will disable buffering at the cost of higher redis QPS.")
+
+	shardConfigReloadInterval = flag.Duration("redis_sharding_config_reload_interval", 1*time.Minute, "How often to re-check the experiment config for redis shard configuration changes.", flag.Internal)
+)
+
+const (
+	// Timeout for each attempt to dial redis.
+	dialTimeout = 5 * time.Second
 )
 
 // ConfigureLogging configures the Redis library to use our logger.
@@ -68,42 +84,74 @@ func TargetToOptions(redisTarget string) *redis.Options {
 	}
 }
 
-func TargetToOpts(redisTarget string, useTLS bool) *Opts {
+func TargetToOpts(redisTarget string) *Opts {
 	if redisTarget == "" {
 		return nil
 	}
 	libOpts := TargetToOptions(redisTarget)
-	var tlsConfig *tls.Config
-	if useTLS {
-		tlsConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-	}
 	return &Opts{
 		Addrs:     []string{libOpts.Addr},
 		Network:   libOpts.Network,
 		Username:  libOpts.Username,
 		Password:  libOpts.Password,
 		DB:        libOpts.DB,
-		TLSConfig: tlsConfig,
+		TLSConfig: libOpts.TLSConfig,
+		Dialer:    getDialer(libOpts.TLSConfig),
 	}
 }
 
-func ShardsToOpts(shards []string, useTLS bool, username, password string) *Opts {
+func ShardsToOpts(shards []string, username, password string) *Opts {
 	if len(shards) == 0 {
 		return nil
 	}
-	var tlsConfig *tls.Config
-	if useTLS {
-		tlsConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
+	var prevShardScheme string
+	for i, shard := range shards {
+		u, err := url.Parse(shard)
+		if err != nil {
+			log.Errorf("Failed to parse redis shard %q: %s, ignoring", shard, err)
+			continue
 		}
+		if i > 0 {
+			if u.Scheme != prevShardScheme {
+				// TODO(sluongng): return an error instead of logging.
+				log.Warningf("All redis shards must use the same url scheme, but found %q and %q", prevShardScheme, u.Scheme)
+				break
+			}
+		}
+		prevShardScheme = u.Scheme
 	}
-	return &Opts{
-		Addrs:     shards,
-		Username:  username,
-		Password:  password,
-		TLSConfig: tlsConfig,
+	opt := TargetToOpts(shards[0])
+	opt.Addrs = shards
+	opt.Username = username
+	opt.Password = password
+	return opt
+}
+
+func getDialer(tlsConfig *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Create a dialer which should exactly match go-redis' implementation:
+	// https://github.com/redis/go-redis/blob/cae67723092cac2cb441bc87044ab9edacb2484d/options.go#L128-L142
+	//
+	// TODO: when we upgrade redis, we can switch to redis.NewDialer here.
+	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		netDialer := &net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 5 * time.Minute,
+		}
+		if tlsConfig == nil {
+			return netDialer.DialContext(ctx, network, addr)
+		}
+		return tls.DialWithDialer(netDialer, network, addr, tlsConfig)
+	}
+	// Wrap the dialer with retries.
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return retry.Do(ctx, retry.DefaultOptions(), func(ctx context.Context) (net.Conn, error) {
+			conn, err := dialer(ctx, network, addr)
+			if err != nil {
+				metrics.RedisClientDialErrors.Inc()
+				return nil, fmt.Errorf("dial %s %s: %w", network, addr, err)
+			}
+			return conn, nil
+		})
 	}
 }
 
@@ -141,6 +189,11 @@ type Opts struct {
 	IdleCheckFrequency time.Duration
 
 	TLSConfig *tls.Config
+	Dialer    func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// MigrationConfig allows configuring migrations for sharded redis setups.
+	// Use [NewMigrationConfig] to get an instance.
+	MigrationConfig *MigrationConfig
 }
 
 func (o *Opts) toSimpleOpts() (*redis.Options, error) {
@@ -160,6 +213,7 @@ func (o *Opts) toSimpleOpts() (*redis.Options, error) {
 		IdleTimeout:        o.IdleTimeout,
 		IdleCheckFrequency: o.IdleCheckFrequency,
 		TLSConfig:          o.TLSConfig,
+		Dialer:             o.Dialer,
 	}
 	if len(o.Addrs) > 0 {
 		opts.Addr = o.Addrs[0]
@@ -181,12 +235,167 @@ func (o *Opts) toRingOpts() (*redis.RingOptions, error) {
 		IdleTimeout:        o.IdleTimeout,
 		IdleCheckFrequency: o.IdleCheckFrequency,
 		TLSConfig:          o.TLSConfig,
+		Dialer:             o.Dialer,
 	}
 	for i, addr := range o.Addrs {
-		opts.Addrs[fmt.Sprintf("shard%d", i)] = addr
+		if !isRedisURI(addr) {
+			// Assume tcp if no scheme is provided.
+			addr = "redis://" + addr
+		}
+		opt, err := redis.ParseURL(addr)
+		if err != nil {
+			return nil, status.FailedPreconditionErrorf("invalid redis shard address %q: %s", addr, err)
+		}
+		opts.Addrs[fmt.Sprintf("shard%d", i)] = opt.Addr
 	}
 	return opts, nil
 }
+
+type MigrationConfig struct {
+	fp interfaces.ExperimentFlagProvider
+
+	// If nonempty, this is the default value for the enabled shards. If empty,
+	// all shards will be enabled.
+	defaultEnabledAddrs []string
+
+	// experimentName is the experiment that determines which shards are
+	// enabled. If the experiment evaluates to an empty slice (e.g. if the
+	// experiment is not configured yet), then defaultEnabledAddrs is used. The
+	// experiment flag must evaluate to an object matching the shape of
+	// [MigrationExperimentConfig].
+	experimentName string
+}
+
+type MigrationExperimentConfig struct {
+	EnabledAddrs []string `json:"enabled_addrs"`
+}
+
+func NewMigrationConfig(fp interfaces.ExperimentFlagProvider, allAddrs, defaultEnabledAddrs []string, experimentName string) *MigrationConfig {
+	if len(defaultEnabledAddrs) == 0 {
+		defaultEnabledAddrs = allAddrs
+	}
+	return &MigrationConfig{
+		fp:                  fp,
+		defaultEnabledAddrs: defaultEnabledAddrs,
+		experimentName:      experimentName,
+	}
+}
+
+func (m *MigrationConfig) loadEnabledAddrs() []string {
+	expMap := m.fp.Object(context.TODO(), m.experimentName, nil)
+	if len(expMap) == 0 {
+		return m.defaultEnabledAddrs
+	}
+	expStruct := &MigrationExperimentConfig{}
+	if err := experiments.ObjectToStruct(expMap, expStruct); err != nil {
+		log.Errorf("Failed to unmarshal enabled shards experiment object: %s", err)
+		return m.defaultEnabledAddrs
+	}
+	if len(expStruct.EnabledAddrs) == 0 {
+		return m.defaultEnabledAddrs
+	}
+	return expStruct.EnabledAddrs
+}
+
+// getConsistentHashProvider returns a redis hash function provider that filters
+// to the currently enabled shards in the experiment config.
+func getConsistentHashProvider(ctx context.Context, clientName string, migrationConfig *MigrationConfig, shardNameToAddr map[string]string) func(shards []string) redis.ConsistentHash {
+	// The consistent hash uses shard names - build a reverse mapping.
+	addrToShardName := make(map[string]string, len(shardNameToAddr))
+	for k, v := range shardNameToAddr {
+		addrToShardName[v] = k
+	}
+	shardNamesFromAddrs := func(enabledAddrs []string) []string {
+		out := make([]string, 0, len(enabledAddrs))
+		for _, addr := range enabledAddrs {
+			out = append(out, addrToShardName[addr])
+		}
+		return out
+	}
+
+	var enabledShards atomic.Value // *[]string
+	{
+		s := shardNamesFromAddrs(migrationConfig.loadEnabledAddrs())
+		enabledShards.Store(&s)
+	}
+	log.CtxInfof(ctx, "Configured enabled redis shards for %s: %v", clientName, migrationConfig.defaultEnabledAddrs)
+
+	// In the background, reconfigure the enabled shards whenever the experiment
+	// config changes.
+	go func() {
+		configChanged := make(chan struct{}, 1)
+		unsubscribe := migrationConfig.fp.Subscribe(configChanged)
+		defer unsubscribe()
+		// As a backup, poll as well.
+		ticker := time.NewTicker(*shardConfigReloadInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			case <-configChanged:
+			}
+			enabledAddrs := migrationConfig.loadEnabledAddrs()
+			slices.Sort(enabledAddrs)
+			s := shardNamesFromAddrs(enabledAddrs)
+			// If the slice contents have changed, store a new slice pointer in
+			// enabledShards, which will cause the rendezvous hashes below to be
+			// invalidated and rebuilt.
+			if !slices.Equal(s, *enabledShards.Load().(*[]string)) {
+				log.CtxInfof(ctx, "Reconfigured enabled redis shards for %s: %v", clientName, enabledAddrs)
+				enabledShards.Store(&s)
+			}
+		}
+	}()
+	// Return a hash function provider that filters the shard list to the
+	// currently enabled shards, then hashes keys only to the enabled shards.
+	// Internally, it rebuilds the consistent hash whenever the enabled shards
+	// list changes.
+	return func(shards []string) redis.ConsistentHash {
+		type hash struct {
+			*rendezvous.Rendezvous
+			enabledShards *[]string
+		}
+		var h atomic.Value // *hash
+		h.Store(&hash{})
+		getHashWithEnabledShardsOnly := func() *hash {
+			// Check whether the hash needs to be rebuilt to reflect the
+			// enabled shards list.
+			enabledShardsPtr, _ := enabledShards.Load().(*[]string)
+			hVal := h.Load().(*hash)
+			if enabledShardsPtr == hVal.enabledShards {
+				// Current hash is up to date; return it.
+				return hVal
+			}
+			// Hash is out of date and needs to be rebuilt. Build a new hash
+			// from the shards list, filtering to enabled shards only.
+			enabled := *enabledShardsPtr
+			shards := slices.Clone(shards)
+			shards = slices.DeleteFunc(shards, func(s string) bool {
+				return !slices.Contains(enabled, s)
+			})
+			// NOTE: this hash construction exactly matches what go-redis does
+			// in its default NewConsistentHash implementation.
+			hVal = &hash{
+				Rendezvous:    rendezvous.New(shards, xxhash.Sum64String),
+				enabledShards: enabledShardsPtr,
+			}
+			h.Store(hVal)
+			return hVal
+		}
+		return consistentHashFunc(func(key string) string {
+			hash := getHashWithEnabledShardsOnly()
+			shardName := hash.Lookup(key)
+			return shardName
+		})
+	}
+}
+
+// consistentHashFunc implements [redis.ConsistentHash] by just calling the func.
+type consistentHashFunc func(key string) string
+
+func (f consistentHashFunc) Get(key string) string { return f(key) }
 
 func NewClientWithOpts(opts *Opts, checker interfaces.HealthChecker, healthCheckName string) (redis.UniversalClient, error) {
 	var redisClient redis.UniversalClient
@@ -200,6 +409,9 @@ func NewClientWithOpts(opts *Opts, checker interfaces.HealthChecker, healthCheck
 		ringOpts, err := opts.toRingOpts()
 		if err != nil {
 			return nil, err
+		}
+		if opts.MigrationConfig != nil {
+			ringOpts.NewConsistentHash = getConsistentHashProvider(context.TODO(), healthCheckName, opts.MigrationConfig, ringOpts.Addrs)
 		}
 		redisClient = redis.NewRing(ringOpts)
 	}
@@ -271,7 +483,7 @@ func (r *redlock) Unlock(ctx context.Context) error {
 }
 
 type valueExpiration struct {
-	value      interface{}
+	value      any
 	expiration time.Duration
 }
 
@@ -310,9 +522,9 @@ type CommandBuffer struct {
 	// Buffer for HINCRBY commands.
 	hincr map[string]map[string]int64
 	// Buffer for RPUSH commands.
-	rpush map[string][]interface{}
+	rpush map[string][]any
 	// Buffer for SADD commands.
-	sadd map[string]map[interface{}]struct{}
+	sadd map[string]map[any]struct{}
 	// Buffer for EXPIRE commands.
 	expire map[string]time.Duration
 	// Whether the server is shutting down.
@@ -330,8 +542,8 @@ func (c *CommandBuffer) init() {
 	c.set = map[string]valueExpiration{}
 	c.incr = map[string]int64{}
 	c.hincr = map[string]map[string]int64{}
-	c.rpush = map[string][]interface{}{}
-	c.sadd = map[string]map[interface{}]struct{}{}
+	c.rpush = map[string][]any{}
+	c.sadd = map[string]map[any]struct{}{}
 	c.expire = map[string]time.Duration{}
 }
 
@@ -383,7 +595,7 @@ func (c *CommandBuffer) HIncrBy(ctx context.Context, key, field string, incremen
 // If the server is shutting down, the command will be issued to Redis
 // synchronously using the given context. Otherwise, the command is added to
 // the buffer and the context is ignored.
-func (c *CommandBuffer) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
+func (c *CommandBuffer) Set(ctx context.Context, key string, value any, expiration time.Duration) error {
 	c.mu.Lock()
 	if c.shouldFlushSynchronously() {
 		c.mu.Unlock()
@@ -401,7 +613,7 @@ func (c *CommandBuffer) Set(ctx context.Context, key string, value interface{}, 
 // If the server is shutting down, the command will be issued to Redis
 // synchronously using the given context. Otherwise, the command is added to
 // the buffer and the context is ignored.
-func (c *CommandBuffer) SAdd(ctx context.Context, key string, members ...interface{}) error {
+func (c *CommandBuffer) SAdd(ctx context.Context, key string, members ...any) error {
 	c.mu.Lock()
 	if c.shouldFlushSynchronously() {
 		c.mu.Unlock()
@@ -411,7 +623,7 @@ func (c *CommandBuffer) SAdd(ctx context.Context, key string, members ...interfa
 
 	set, ok := c.sadd[key]
 	if !ok {
-		set = make(map[interface{}]struct{}, len(members))
+		set = make(map[any]struct{}, len(members))
 		c.sadd[key] = set
 	}
 	for _, m := range members {
@@ -425,7 +637,7 @@ func (c *CommandBuffer) SAdd(ctx context.Context, key string, members ...interfa
 // If the server is shutting down, the command will be issued to Redis
 // synchronously using the given context. Otherwise, the command is added to
 // the buffer and the context is ignored.
-func (c *CommandBuffer) RPush(ctx context.Context, key string, values ...interface{}) error {
+func (c *CommandBuffer) RPush(ctx context.Context, key string, values ...any) error {
 	c.mu.Lock()
 	if c.shouldFlushSynchronously() {
 		c.mu.Unlock()
@@ -502,7 +714,7 @@ func (c *CommandBuffer) Flush(ctx context.Context) error {
 		pipe.RPush(ctx, key, values...)
 	}
 	for key, set := range sadd {
-		members := []interface{}{}
+		members := []any{}
 		for member := range set {
 			members = append(members, member)
 		}

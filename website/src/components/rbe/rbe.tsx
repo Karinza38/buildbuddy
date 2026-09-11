@@ -1,8 +1,6 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import common from "../../css/common.module.css";
 import styles from "./rbe.module.css";
-import { useEffect } from "react";
-import { useState } from "react";
 
 function Component() {
   let [index, setIndex] = useState(0);
@@ -13,13 +11,11 @@ function Component() {
     return () => clearInterval(interval);
   }, []);
 
-  let unixTimeForOct1st2023 = 1696143600;
-  let minutesSavedOnOct1st2023 = 2943179231;
-  let savingsPerSecond = 158.28;
-  let minutesInAYear = 525600;
-  let minuteSaved = Math.round(
-    minutesSavedOnOct1st2023 + savingsPerSecond * (new Date().getTime() / 1000 - unixTimeForOct1st2023)
-  );
+  const baselineUnixTime = Date.parse("2026-09-11T00:00:00Z") / 1000;
+  const minutesSavedAtBaseline = 29686846011;
+  const savingsPerSecond = 815.3;
+  const minutesInAYear = 525600;
+  const minuteSaved = Math.round(minutesSavedAtBaseline + savingsPerSecond * (Date.now() / 1000 - baselineUnixTime));
 
   return (
     <div className={`${common.section} ${common.sectionDark}`}>
@@ -39,7 +35,7 @@ function Component() {
         <div className={styles.deploymentModels}>
           <div className={styles.deploymentModel}>
             <div className={styles.deploymentModelTitle}>{minuteSaved.toLocaleString()} </div>
-            <div className={styles.deploymentModelUnit}>Total Compute Minutes Saved</div>
+            <div className={styles.deploymentModelUnit}>Compute Minutes Saved</div>
             <div className={styles.deploymentModelDescription}>
               By organizations using BuildBuddy Cloud remote caching &mdash; that's{" "}
               {Math.round(minuteSaved / minutesInAYear).toLocaleString()} years not spent waiting for builds to finish.

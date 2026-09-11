@@ -41,6 +41,30 @@ func CounterValue(t testing.TB, metric prometheus.Counter) float64 {
 	return m.Counter.GetValue()
 }
 
+func CounterValueForLabels(t testing.TB, metric *prometheus.CounterVec, labels prometheus.Labels) float64 {
+	m := &dto.Metric{}
+	err := metric.With(labels).Write(m)
+	require.NoError(t, err)
+	return m.Counter.GetValue()
+}
+
+type CounterVecValue struct {
+	Labels map[string]string
+	Value  float64
+}
+
+func CounterValues(t testing.TB, metric *prometheus.CounterVec) []CounterVecValue {
+	metrics := collectAll(t, metric)
+	out := make([]CounterVecValue, 0, len(metrics))
+	for _, m := range metrics {
+		out = append(out, CounterVecValue{
+			Labels: labelMap(m.GetLabel()),
+			Value:  m.Counter.GetValue(),
+		})
+	}
+	return out
+}
+
 type HistogramValues struct {
 	// Metric label values.
 	Labels map[string]string

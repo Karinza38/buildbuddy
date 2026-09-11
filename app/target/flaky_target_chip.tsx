@@ -1,11 +1,11 @@
+import { HelpCircle } from "lucide-react";
 import React from "react";
 import { target } from "../../proto/target_ts_proto";
-import rpc_service from "../service/rpc_service";
-import { Path } from "../router/router";
-import { OutlinedLinkButton } from "../components/button/link_button";
-import { HelpCircle } from "lucide-react";
 import { OutlinedButton } from "../components/button/button";
+import { OutlinedLinkButton } from "../components/button/link_button";
 import Spinner from "../components/spinner/spinner";
+import { Path } from "../router/router";
+import rpc_service from "../service/rpc_service";
 
 interface Props {
   repo: string;
@@ -43,17 +43,24 @@ export default class FlakyTargetChipComponent extends React.Component<Props, Sta
       .map((v) => v.label);
     if (flakes && flakes.length > 0) {
       const targets = flakes.join(" ");
+      const params = new URLSearchParams();
+      params.set("days", "7");
+      if (this.props.repo) {
+        params.set("repo", this.props.repo);
+      }
+      if (this.props.labels.length === 1) {
+        params.set("target", targets);
+      } else {
+        params.set("targetFilter", targets);
+      }
       const title =
         this.props.labels.length === 1
           ? "This target was recently flaky--click to see samples."
           : "Some failed targets were recently flaky--click to see samples.";
-      const href =
-        this.props.labels.length === 1
-          ? `${Path.tapPath}?target=${encodeURIComponent(targets)}&days=7#flakes`
-          : `${Path.tapPath}?targetFilter=${encodeURIComponent(targets)}&days=7#flakes`;
+      const href = `${Path.tapPath}?${params}#flakes`;
       return (
         <OutlinedLinkButton href={href} title={title} className="flaky-target-chip">
-          <HelpCircle className="icon orange" /> Recently flaky
+          <HelpCircle className="orange" /> Recently flaky
         </OutlinedLinkButton>
       );
     }

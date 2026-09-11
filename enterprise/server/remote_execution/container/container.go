@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,24 +11,30 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/block_io"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor_auth"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/operation"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/platform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/oci"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/background"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/hash"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/buildbuddy-io/buildbuddy/server/util/unixcred"
 	"github.com/jonboulle/clockwork"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	gstatus "google.golang.org/grpc/status"
 
+	espb "github.com/buildbuddy-io/buildbuddy/proto/execution_stats"
 	fcpb "github.com/buildbuddy-io/buildbuddy/proto/firecracker"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	tspb "google.golang.org/protobuf/types/known/timestamppb"
@@ -38,36 +45,30 @@ const (
 	// re-authentication with the remote registry is required.
 	defaultImageCacheTokenTTL = 15 * time.Minute
 
-	// Time window over which to measure CPU usage when exporting the milliCPU
-	// used metric.
-	cpuUsageUpdateInterval = 1 * time.Second
-
 	// Exit code used when returning an error instead of an actual exit code.
 	// TODO: fix circular dependency with commandutil and reference that const
 	// instead.
 	noExitCode = -2
 
-	// How often to poll container stats.
-	statsPollInterval = 50 * time.Millisecond
+	// How long to extend the context deadline to allow the final container
+	// stats to be collected once execution has completed.
+	statsFinalMeasurementDeadlineExtension = 1 * time.Second
 
 	// Max uncompressed size in bytes to retain for timeseries data. After this
 	// limit is reached, samples are dropped.
-	timeseriesSizeLimitBytes = 1_000_000
+	timeseriesSizeLimitBytes = 2_000_000
 )
 
 var (
-	// Metrics is a shared metrics object to handle proper prometheus metrics
-	// accounting across container instances.
-	Metrics = NewContainerMetrics()
-
 	// ErrRemoved is returned by TracedCommandContainer operations when an
 	// operation fails due to the container already being removed.
 	ErrRemoved = status.UnavailableError("container has been removed")
 
 	recordUsageTimelines          = flag.Bool("executor.record_usage_timelines", false, "Capture resource usage timeseries data in UsageStats for each task.")
 	imagePullTimeout              = flag.Duration("executor.image_pull_timeout", 5*time.Minute, "How long to wait for the container image to be pulled before returning an Unavailable (retryable) error for an action execution attempt. Applies to all isolation types (docker, firecracker, etc.)")
+	cgroupStatsPollInterval       = flag.Duration("executor.cgroup_stats_poll_interval", 500*time.Millisecond, "How often to poll container stats.")
 	debugUseLocalImagesOnly       = flag.Bool("debug_use_local_images_only", false, "Do not pull OCI images and only used locally cached images. This can be set to test local image builds during development without needing to push to a container registry. Not intended for production use.")
-	DebugEnableAnonymousRecycling = flag.Bool("debug_enable_anonymous_runner_recycling", false, "Whether to enable runner recycling for unauthenticated requests. For debugging purposes only - do not use in production.")
+	debugEnableAnonymousRecycling = flag.Bool("debug_enable_anonymous_runner_recycling", false, "Whether to enable runner recycling for unauthenticated requests. For debugging purposes only - do not use in production.")
 
 	slowPullWarnOnce sync.Once
 
@@ -124,101 +125,13 @@ type Init struct {
 	Publisher *operation.Publisher
 }
 
-// ContainerMetrics handles Prometheus metrics accounting for CommandContainer
-// instances.
-type ContainerMetrics struct {
-	mu sync.Mutex
-	// Latest stats observed, per-container.
-	latest map[CommandContainer]*repb.UsageStats
-	// CPU usage for the current usage interval, per-container. This is cleared
-	// every time we update the CPU gauge.
-	intervalCPUNanos int64
-}
-
-func NewContainerMetrics() *ContainerMetrics {
-	return &ContainerMetrics{
-		latest: make(map[CommandContainer]*repb.UsageStats),
-	}
-}
-
-// Start kicks off a goroutine that periodically updates the CPU gauge.
-func (m *ContainerMetrics) Start(ctx context.Context) {
-	go func() {
-		t := time.NewTicker(cpuUsageUpdateInterval)
-		defer t.Stop()
-		lastTick := time.Now()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				tick := time.Now()
-				m.updateCPUMetric(tick.Sub(lastTick))
-				lastTick = tick
-			}
-		}
-	}()
-}
-
-func (m *ContainerMetrics) updateCPUMetric(dt time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	milliCPU := (float64(m.intervalCPUNanos) / 1e6) / dt.Seconds()
-	metrics.RemoteExecutionCPUUtilization.Set(milliCPU)
-	m.intervalCPUNanos = 0
-}
-
-// Observe records the latest stats for the current container execution.
-func (m *ContainerMetrics) Observe(c CommandContainer, s *repb.UsageStats) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s == nil {
-		delete(m.latest, c)
-	} else {
-		// Before recording CPU usage, sum the previous CPU usage so we know how
-		// much new usage has been incurred.
-		var prevCPUNanos int64
-		for _, stats := range m.latest {
-			prevCPUNanos += stats.CpuNanos
-		}
-		m.latest[c] = s
-		var cpuNanos int64
-		for _, stats := range m.latest {
-			cpuNanos += stats.CpuNanos
-		}
-		diffCPUNanos := cpuNanos - prevCPUNanos
-		// Note: This > 0 check is here to avoid panicking in case there are
-		// issues with process stats returning non-monotonically-increasing
-		// values for CPU usage.
-		if diffCPUNanos > 0 {
-			metrics.RemoteExecutionUsedMilliCPU.Add(float64(diffCPUNanos) / 1e6)
-			m.intervalCPUNanos += diffCPUNanos
-		}
-	}
-	var totalMemBytes, totalPeakMemBytes int64
-	for _, stats := range m.latest {
-		totalMemBytes += stats.MemoryBytes
-		totalPeakMemBytes += stats.PeakMemoryBytes
-	}
-	metrics.RemoteExecutionMemoryUsageBytes.Set(float64(totalMemBytes))
-	metrics.RemoteExecutionPeakMemoryUsageBytes.Set(float64(totalPeakMemBytes))
-}
-
-// Unregister records that the given container has completed execution. It must
-// be called for each container whose stats are observed via ObserveStats,
-// otherwise a memory leak will occur.
-func (m *ContainerMetrics) Unregister(c CommandContainer) {
-	m.Observe(c, nil)
-}
-
 // UsageStats holds usage stats for a container.
 // It is useful for keeping track of usage relative to when the container
 // last executed a task.
-//
-// TODO: see whether its feasible to execute each task in its own cgroup
-// so that we can avoid this bookkeeping and get stats without polling.
 type UsageStats struct {
 	Clock clockwork.Clock
+
+	mu sync.RWMutex
 
 	// last is the last stats update we observed.
 	last *repb.UsageStats
@@ -229,6 +142,12 @@ type UsageStats struct {
 	// execution. This is reset between tasks so that we can determine a task's
 	// peak memory usage when using a recycled runner.
 	peakMemoryUsageBytes int64
+	// peakGPUUsage is the peak GPU memory usage observed during the current
+	// task execution. It is tracked separately from the live reading, which
+	// drops to zero once the task's processes exit. This is reset between
+	// tasks so that we can determine a task's peak GPU usage when using a
+	// recycled runner.
+	peakGPUUsage *repb.GPUUsage
 	// baselineCPUNanos is the CPU usage from when a task last finished
 	// executing. This is needed so that we can determine a task's CPU usage
 	// when using a recycled runner.
@@ -253,11 +172,16 @@ type timelineState struct {
 	lastTimestampUnixMillis int64
 	lastCPUMillis           int64
 	lastMemoryKB            int64
+	lastGPUMemoryKB         int64
+	lastDiskRbytes          int64
+	lastWbytes              int64
+	lastDiskRios            int64
+	lastDiskWios            int64
 	// When adding new fields here, also update:
 	// - The size calculation in updateTimeline()
 	// - The test
 	// - The trace format adapter logic in execution_service.go
-	// - TIME_SERIES_EVENT_NAMES_AND_ARG_KEYS in trace_events.ts
+	// - TIME_SERIES_METADATA in trace_events.ts
 }
 
 func (s *UsageStats) clock() clockwork.Clock {
@@ -268,12 +192,15 @@ func (s *UsageStats) clock() clockwork.Clock {
 }
 
 // Reset resets resource usage counters in preparation for a new task, so that
-// the new task's resource usage can be accounted for. It should be called at
-// the beginning of Run() as well as at the beginning of Exec() in the container
-// lifecycle.
+// the new task's resource usage can be accounted for.
+// TODO: make this private - it should only be used by TrackExecution.
 func (s *UsageStats) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.last != nil {
 		s.last.MemoryBytes = 0
+		s.last.GpuUsage = nil
 	}
 	s.baselineCPUNanos = s.last.GetCpuNanos()
 	s.baselineCPUPressure = s.last.GetCpuPressure()
@@ -281,6 +208,7 @@ func (s *UsageStats) Reset() {
 	s.baselineIOPressure = s.last.GetIoPressure()
 	s.baselineIOStats = s.last.GetCgroupIoStats()
 	s.peakMemoryUsageBytes = 0
+	s.peakGPUUsage = nil
 
 	now := s.clock().Now()
 	if *recordUsageTimelines {
@@ -290,8 +218,28 @@ func (s *UsageStats) Reset() {
 	}
 }
 
-// TaskStats returns the usage stats for an executed task.
+// TaskStats returns the usage stats for an executed task, including the usage
+// timeline if one was recorded. The returned timeline is not cloned, so callers
+// that need to read stats while they are being updated should use
+// BasicTaskStats.
 func (s *UsageStats) TaskStats() *repb.UsageStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.taskStatsLocked(true /*=includeTimeline*/)
+}
+
+// BasicTaskStats returns the usage stats for an executed task without the
+// usage timeline. This is intended for live stats polling while usage stats are
+// being updated.
+func (s *UsageStats) BasicTaskStats() *repb.UsageStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.taskStatsLocked(false /*=includeTimeline*/)
+}
+
+func (s *UsageStats) taskStatsLocked(includeTimeline bool) *repb.UsageStats {
 	if s.last == nil {
 		return &repb.UsageStats{}
 	}
@@ -300,6 +248,7 @@ func (s *UsageStats) TaskStats() *repb.UsageStats {
 
 	taskStats.CpuNanos -= s.baselineCPUNanos
 	taskStats.PeakMemoryBytes = s.peakMemoryUsageBytes
+	taskStats.GpuUsage = s.peakGPUUsage.CloneVT()
 
 	// Update all IO stats to be relative to the baseline
 	ioStats := taskStats.CgroupIoStats
@@ -331,8 +280,12 @@ func (s *UsageStats) TaskStats() *repb.UsageStats {
 		taskStats.IoPressure.Full.Total -= s.baselineIOPressure.GetFull().GetTotal()
 	}
 
-	// Note: we don't clone the timeline because it's expensive.
-	taskStats.Timeline = s.timeline
+	if includeTimeline {
+		// Note: we don't clone the timeline because it's expensive. Callers
+		// that need to access stats while they are being updated should use
+		// BasicTaskStats instead.
+		taskStats.Timeline = s.timeline
+	}
 
 	return taskStats
 }
@@ -341,7 +294,14 @@ func (s *UsageStats) updateTimeline(now time.Time) {
 	st := s.timeline
 	totalLength := len(st.GetTimestamps()) +
 		len(st.GetCpuSamples()) +
-		len(st.GetMemoryKbSamples())
+		len(st.GetMemoryKbSamples()) +
+		len(st.GetWbytesTotalSamples()) +
+		len(st.GetRbytesTotalSamples()) +
+		len(st.GetWiosTotalSamples()) +
+		len(st.GetRiosTotalSamples())
+	if gpuTimeline := st.GetGpuUsage(); gpuTimeline != nil {
+		totalLength += len(gpuTimeline.GetTotalMemoryKbSamples())
+	}
 	if 8*totalLength > timeseriesSizeLimitBytes {
 		return
 	}
@@ -363,69 +323,166 @@ func (s *UsageStats) updateTimeline(now time.Time) {
 	memDelta := mem - s.timelineState.lastMemoryKB
 	s.timeline.MemoryKbSamples = append(s.timeline.MemoryKbSamples, memDelta)
 	s.timelineState.lastMemoryKB = mem
+
+	// Update GPU memory samples with the current total usage across GPUs, in
+	// KB (1000 bytes).
+	gpuUsage := s.last.GetGpuUsage()
+	gpuTimeline := s.timeline.GetGpuUsage()
+	if gpuUsage.GetTotalMemoryBytes() > 0 && gpuTimeline == nil {
+		// Start the GPU series lazily on the first nonzero reading, so that
+		// tasks which never use a GPU don't record an all-zero series.
+		// Backfill zeros for the samples recorded before this one; the current
+		// sample's timestamp was already appended above, hence the minus one.
+		gpuTimeline = &repb.GPUUsageTimeline{
+			TotalMemoryKbSamples: make([]int64, len(s.timeline.GetTimestamps())-1),
+		}
+		s.timeline.GpuUsage = gpuTimeline
+	}
+	if gpuTimeline != nil {
+		// A nil reading means GPU usage was unavailable at this poll (e.g. an
+		// NVML query failed), so carry the last observation forward rather
+		// than record a false zero.
+		gpuMemoryKB := s.timelineState.lastGPUMemoryKB
+		if gpuUsage != nil {
+			gpuMemoryKB = gpuUsage.GetTotalMemoryBytes() / 1e3
+		}
+		gpuTimeline.TotalMemoryKbSamples = append(gpuTimeline.TotalMemoryKbSamples, gpuMemoryKB-s.timelineState.lastGPUMemoryKB)
+		s.timelineState.lastGPUMemoryKB = gpuMemoryKB
+	}
+
+	// Update disk rbytes samples with cumulative bytes read.
+	diskRbytes := s.last.GetCgroupIoStats().GetRbytes()
+	diskRbytesDelta := diskRbytes - s.timelineState.lastDiskRbytes
+	s.timeline.RbytesTotalSamples = append(s.timeline.RbytesTotalSamples, diskRbytesDelta)
+	s.timelineState.lastDiskRbytes = diskRbytes
+
+	// Update disk wbytes samples with cumulative bytes written.
+	diskWbytes := s.last.GetCgroupIoStats().GetWbytes()
+	diskWbytesDelta := diskWbytes - s.timelineState.lastWbytes
+	s.timeline.WbytesTotalSamples = append(s.timeline.WbytesTotalSamples, diskWbytesDelta)
+	s.timelineState.lastWbytes = diskWbytes
+
+	// Update disk rios samples with cumulative read operations.
+	diskRios := s.last.GetCgroupIoStats().GetRios()
+	diskRiosDelta := diskRios - s.timelineState.lastDiskRios
+	s.timeline.RiosTotalSamples = append(s.timeline.RiosTotalSamples, diskRiosDelta)
+	s.timelineState.lastDiskRios = diskRios
+
+	// Update disk wios samples with cumulative write operations.
+	diskWios := s.last.GetCgroupIoStats().GetWios()
+	diskWiosDelta := diskWios - s.timelineState.lastDiskWios
+	s.timeline.WiosTotalSamples = append(s.timeline.WiosTotalSamples, diskWiosDelta)
+	s.timelineState.lastDiskWios = diskWios
 }
 
 // Update updates the usage for the current task, given a reading from the
 // lifetime stats (e.g. cgroup created when the task container was initially
 // created).
+// TODO: make this private - it should only be used by TrackExecution.
 func (s *UsageStats) Update(lifetimeStats *repb.UsageStats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.last = lifetimeStats.CloneVT()
 	if lifetimeStats.GetMemoryBytes() > s.peakMemoryUsageBytes {
 		s.peakMemoryUsageBytes = lifetimeStats.GetMemoryBytes()
 	}
-	if *recordUsageTimelines {
+	// Fold the latest point-in-time GPU reading into the task peaks. The
+	// total tracks the largest sum observed in a single reading while each
+	// device entry tracks its own high-water mark, so the total can be less
+	// than the sum of device peaks.
+	if gpuUsage := lifetimeStats.GetGpuUsage(); gpuUsage.GetTotalMemoryBytes() > 0 {
+		if s.peakGPUUsage == nil {
+			s.peakGPUUsage = &repb.GPUUsage{}
+		}
+		if gpuUsage.GetTotalMemoryBytes() > s.peakGPUUsage.GetPeakTotalMemoryBytes() {
+			s.peakGPUUsage.PeakTotalMemoryBytes = gpuUsage.GetTotalMemoryBytes()
+		}
+		for _, device := range gpuUsage.GetDeviceUsage() {
+			if device.GetMemoryBytes() <= 0 {
+				continue
+			}
+			var peakDevice *repb.GPUDeviceUsage
+			for _, d := range s.peakGPUUsage.GetDeviceUsage() {
+				if d.GetId() == device.GetId() {
+					peakDevice = d
+					break
+				}
+			}
+			if peakDevice == nil {
+				peakDevice = &repb.GPUDeviceUsage{Id: device.GetId(), Vendor: device.GetVendor()}
+				s.peakGPUUsage.DeviceUsage = append(s.peakGPUUsage.DeviceUsage, peakDevice)
+			}
+			if device.GetMemoryBytes() > peakDevice.GetPeakMemoryBytes() {
+				peakDevice.PeakMemoryBytes = device.GetMemoryBytes()
+			}
+		}
+	}
+	if *recordUsageTimelines && s.timeline != nil {
 		s.updateTimeline(s.clock().Now())
 	}
 }
 
-// TrackStats starts a goroutine to monitor the container's resource usage. It
-// polls c.Stats() to get the cumulative usage since the start of the current
-// task.
+// TrackExecution starts a goroutine to monitor a container's resource usage
+// during an execution, periodically calling Update. It polls the given stats
+// function to get the cumulative usage for the lifetime of the container (not
+// just the current task).
 //
 // The returned func stops tracking resource usage. It must be called, or else a
 // goroutine leak may occur. Monitoring can safely be stopped more than once.
-//
-// The returned channel should be received from at most once, *after* calling
-// the returned stop function. The received value can be nil if stats were not
-// successfully sampled at least once.
-func TrackStats(ctx context.Context, c CommandContainer) (stop func(), res <-chan *repb.UsageStats) {
+func (s *UsageStats) TrackExecution(ctx context.Context, lifetimeStatsFn func(ctx context.Context) (*repb.UsageStats, error)) (stop func()) {
+	// Since we're starting a new execution, set the stats baseline to the last
+	// observed value.
+	s.Reset()
+
+	originalCtx := ctx
+
 	ctx, cancel := context.WithCancel(ctx)
-	result := make(chan *repb.UsageStats, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer Metrics.Unregister(c)
-		var last *repb.UsageStats
 		var lastErr error
 
 		start := time.Now()
 		defer func() {
 			// Only log an error if the task ran long enough that we could
 			// reasonably expect to sample stats at least once while it was
-			// executing. Note that we can't sample stats until podman creates
-			// the container, which can take a few hundred ms or possibly longer
-			// if the executor is heavily loaded.
+			// executing.
 			dur := time.Since(start)
-			if last == nil && dur > 1*time.Second && lastErr != nil {
+			if dur > 1*time.Second && lastErr != nil && s.TaskStats() == nil {
 				log.CtxWarningf(ctx, "Failed to read container stats: %s", lastErr)
 			}
 		}()
 
-		t := time.NewTicker(statsPollInterval)
+		t := time.NewTicker(*cgroupStatsPollInterval)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				result <- last
+				// Do one more stats collection right at the end of the
+				// execution. This serves two purposes: first, it makes sure we
+				// count any CPU usage that we might've missed at the very end
+				// of the execution. Second, it ensures we update memory usage
+				// to reflect what the task looks like at the very end, after
+				// the main task process has exited, which is important since we
+				// don't recycle runners if their current memory usage exceeds a
+				// certain threshold.
+				ctx, cancel := background.ExtendContextForFinalization(originalCtx, statsFinalMeasurementDeadlineExtension)
+				defer cancel()
+				stats, err := lifetimeStatsFn(ctx)
+				if err != nil {
+					log.CtxWarningf(ctx, "failed to read final container stats: %s", err)
+				} else {
+					s.Update(stats)
+				}
 				return
 			case <-t.C:
-				stats, err := c.Stats(ctx)
+				stats, err := lifetimeStatsFn(ctx)
 				if err != nil {
 					lastErr = err
 					continue
 				}
-				Metrics.Observe(c, stats)
-				last = stats
+				s.Update(stats)
 			}
 		}
 	}()
@@ -433,15 +490,23 @@ func TrackStats(ctx context.Context, c CommandContainer) (stop func(), res <-cha
 		cancel()
 		<-done
 	}
-	return stop, result
+	return stop
 }
 
 type FileSystemLayout struct {
 	RemoteInstanceName string
 	DigestFunction     repb.DigestFunction_Value
 	Inputs             *repb.Tree
-	OutputDirs         []string
+	InputFetcher       InputFetcher
+	WorkingDirectory   string
+	OutputDirectories  []string
 	OutputFiles        []string
+	OutputPaths        []string
+}
+
+// InputFetcher ensures that an input file is available in the local file cache.
+type InputFetcher interface {
+	Fetch(ctx context.Context, node *repb.FileNode) error
 }
 
 // CommandContainer provides an execution environment for commands.
@@ -479,6 +544,13 @@ type CommandContainer interface {
 	// stdin of the executed process. If stdout is non-nil, the stdout of the
 	// executed process will be written to the stdout writer rather than being
 	// written to the command result's stdout field (same for stderr).
+	//
+	// Implementations should populate UsageStats for the execution. If stats
+	// are reported, they must reflect only the particular command executed.
+	//
+	// Implementations should NOT record usage stats for long-lived persistent
+	// worker executions, and should instead implement [StatsTracker] so that
+	// stats can be tracked while each work request is being fulfilled.
 	Exec(ctx context.Context, command *repb.Command, stdio *interfaces.Stdio) *interfaces.CommandResult
 
 	// Signal sends the given signal to all containerized processes.
@@ -505,10 +577,21 @@ type CommandContainer interface {
 	//
 	// A `nil` value may be returned if the resource usage is unknown.
 	//
-	// Implementations may assume that this will only be called when the
-	// container is paused, for the purposes of computing resources used for
-	// pooled runners.
+	// Live stats are used by the OOM killer to decide which tasks to kill when
+	// the executor is running low on memory. Paused stats are used for pooled
+	// runner accounting.
 	Stats(ctx context.Context) (*repb.UsageStats, error)
+}
+
+// StatsRecorder is an optional interface implemented by a [CommandContainer]
+// that allows tracking usage stats outside of normal execution.
+//
+// Specifically, this can be used to report stats for persistent worker
+// requests, in which tasks are executed by writing work requests to stdin then
+// reading work requests from stdout, rather than calling Exec or Run (which
+// would normally be responsible for reporting stats).
+type StatsRecorder interface {
+	RecordStats(ctx context.Context) (stop func() (*repb.UsageStats, error))
 }
 
 // VM is an interface implemented by containers backed by VMs (i.e. just
@@ -526,9 +609,65 @@ type VM interface {
 	VMConfig() *fcpb.VMConfiguration
 }
 
+// RecordImageFetchMetrics records the image fetch duration histogram.
+// Counts are available via the histogram's _count suffix.
+func RecordImageFetchMetrics(isolation, registry, trigger string, onDisk, hasCreds, useOCIFetcher bool, err error, duration time.Duration) {
+	labels := prometheus.Labels{
+		metrics.IsolationTypeLabel:           isolation,
+		metrics.ImageFetchRegistryLabel:      registry,
+		metrics.StatusLabel:                  ImagePullMetricStatus(err),
+		metrics.ImageFetchOnDiskLabel:        strconv.FormatBool(onDisk),
+		metrics.ImageFetchHasCredsLabel:      strconv.FormatBool(hasCreds),
+		metrics.ImageFetchTriggerLabel:       trigger,
+		metrics.ImageFetchUseOCIFetcherLabel: strconv.FormatBool(useOCIFetcher),
+	}
+	metrics.ImageFetchDurationUsec.With(labels).Observe(float64(duration.Microseconds()))
+}
+
+func LogImagePullError(ctx context.Context, imageRef, isolation, trigger string, useOCIFetcher bool, err error, duration time.Duration) {
+	if !ShouldCountImagePullError(err) {
+		return
+	}
+	log.CtxWarningf(ctx,
+		"image_pull_error: image=%q registry=%s isolation=%s trigger=%s use_oci_fetcher=%v duration=%s err=%s",
+		imageRef, oci.RegistryETLDPlusOne(imageRef), isolation, trigger, useOCIFetcher, duration, err)
+}
+
+// ImagePullMetricStatus returns the metrics status label for an image pull result.
+func ImagePullMetricStatus(err error) string {
+	if err == nil {
+		return metrics.OCIFetcherStatusOK
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.IsDeadlineExceededError(err) {
+		return metrics.OCIFetcherStatusTimeout
+	}
+	if errors.Is(err, context.Canceled) || status.IsCanceledError(err) {
+		return metrics.OCIFetcherStatusCanceled
+	}
+	if !ShouldCountImagePullError(err) {
+		return metrics.OCIFetcherStatusUserError
+	}
+	return metrics.OCIFetcherStatusError
+}
+
+// ShouldCountImagePullError reports whether a failed image pull should count as
+// an image pull error in metrics and logs. This is based on the gRPC status code
+// intentionally constructed at the call site, not the error message text.
+func ShouldCountImagePullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch gstatus.Code(err) {
+	case codes.InvalidArgument, codes.NotFound, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition, codes.OutOfRange:
+		return false
+	default:
+		return true
+	}
+}
+
 // PullImageIfNecessary pulls the image configured for the container if it
 // is not cached locally.
-func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string) error {
+func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string, useOCIFetcher bool) error {
 	if *debugUseLocalImagesOnly || imageRef == "" {
 		return nil
 	}
@@ -542,7 +681,21 @@ func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 		defer cancel()
 	}
 
-	if err := pullImageIfNecessary(ctx, env, ctr, creds, imageRef); err != nil {
+	start := time.Now()
+	cached, err := pullImageIfNecessary(ctx, env, ctr, creds, imageRef)
+	duration := time.Since(start)
+	RecordImageFetchMetrics(
+		ctr.IsolationType(),
+		oci.RegistryETLDPlusOne(imageRef),
+		metrics.ImageFetchTriggerExecution,
+		cached,
+		!creds.IsEmpty(),
+		useOCIFetcher,
+		err,
+		duration,
+	)
+	LogImagePullError(ctx, imageRef, ctr.IsolationType(), metrics.ImageFetchTriggerExecution, useOCIFetcher, err, duration)
+	if err != nil {
 		// make sure we always return Unavailable if the context deadline
 		// was exceeded
 		if err == context.DeadlineExceeded || ctx.Err() != nil {
@@ -553,7 +706,9 @@ func PullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 	return nil
 }
 
-func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string) error {
+// pullImageIfNecessary returns (cached, err) where cached indicates whether
+// the image was already present on the executor.
+func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandContainer, creds oci.Credentials, imageRef string) (bool, error) {
 	cacheAuth := env.GetImageCacheAuthenticator()
 	if cacheAuth == nil || env.GetAuthenticator() == nil {
 		// If we don't have an authenticator available, fall back to
@@ -561,7 +716,7 @@ func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 		slowPullWarnOnce.Do(func() {
 			log.CtxWarningf(ctx, "Authentication is not properly configured; this will result in slower image pulls.")
 		})
-		return ctr.PullImage(ctx, creds)
+		return false, ctr.PullImage(ctx, creds)
 	}
 
 	// TODO(iain): the auth/existence/pull synchronization is getting unruly.
@@ -571,31 +726,31 @@ func pullImageIfNecessary(ctx context.Context, env environment.Env, ctr CommandC
 	mu, ok := uncastmu.(*sync.Mutex)
 	if !ok {
 		alert.UnexpectedEvent("loaded mutex from sync.map that isn't a mutex!")
-		return status.InternalError("PullImageIfNecessary failed: cannot obtain mutex")
+		return false, status.InternalError("PullImageIfNecessary failed: cannot obtain mutex")
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	isCached, err := ctr.IsImageCached(ctx)
+	onDisk, err := ctr.IsImageCached(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	cacheToken, err := NewImageCacheToken(ctx, env, creds, imageRef)
 	if err != nil {
-		return status.WrapError(err, "create image cache token")
+		return false, status.WrapError(err, "create image cache token")
 	}
 	// If the image is cached and these credentials have been used recently
 	// by this group to pull the image, no need to re-auth.
-	if isCached && cacheAuth.IsAuthorized(cacheToken) {
-		return nil
+	if onDisk && cacheAuth.IsAuthorized(cacheToken) {
+		return true, nil
 	}
 	if err := ctr.PullImage(ctx, creds); err != nil {
-		return err
+		return onDisk, err
 	}
 	// Pull was successful, which means auth was successful. Refresh the token so
 	// we don't have to keep re-authenticating on every action until the token
 	// expires.
 	cacheAuth.Refresh(cacheToken)
-	return nil
+	return onDisk, nil
 }
 
 // NewImageCacheToken returns the token representing the authenticated group ID,
@@ -712,6 +867,8 @@ type TracedCommandContainer struct {
 	mu       sync.RWMutex
 	removed  bool
 	Delegate CommandContainer
+
+	pauseDuration time.Duration
 }
 
 func (t *TracedCommandContainer) IsolationType() string {
@@ -719,6 +876,7 @@ func (t *TracedCommandContainer) IsolationType() string {
 }
 
 func (t *TracedCommandContainer) Run(ctx context.Context, command *repb.Command, workingDir string, creds oci.Credentials) *interfaces.CommandResult {
+	t.pauseDuration = 0
 	ctx, span := tracing.StartSpan(ctx, trace.WithAttributes(t.implAttr))
 	defer span.End()
 
@@ -771,6 +929,7 @@ func (t *TracedCommandContainer) Create(ctx context.Context, workingDir string) 
 }
 
 func (t *TracedCommandContainer) Exec(ctx context.Context, command *repb.Command, opts *interfaces.Stdio) *interfaces.CommandResult {
+	t.pauseDuration = 0
 	ctx, span := tracing.StartSpan(ctx, trace.WithAttributes(t.implAttr))
 	defer span.End()
 
@@ -819,7 +978,10 @@ func (t *TracedCommandContainer) Pause(ctx context.Context) error {
 		return ErrRemoved
 	}
 
-	return t.Delegate.Pause(ctx)
+	start := time.Now()
+	err := t.Delegate.Pause(ctx)
+	t.pauseDuration = time.Since(start)
+	return err
 }
 
 func (t *TracedCommandContainer) Remove(ctx context.Context) error {
@@ -838,6 +1000,14 @@ func (t *TracedCommandContainer) Remove(ctx context.Context) error {
 	return t.Delegate.Remove(ctx)
 }
 
+func (t *TracedCommandContainer) RecordStats(ctx context.Context) func() (*repb.UsageStats, error) {
+	if st, ok := t.Delegate.(StatsRecorder); ok {
+		return st.RecordStats(ctx)
+	} else {
+		return func() (*repb.UsageStats, error) { return nil, nil }
+	}
+}
+
 func (t *TracedCommandContainer) Stats(ctx context.Context) (*repb.UsageStats, error) {
 	ctx, span := tracing.StartSpan(ctx, trace.WithAttributes(t.implAttr))
 	defer span.End()
@@ -851,9 +1021,32 @@ func (t *TracedCommandContainer) Stats(ctx context.Context) (*repb.UsageStats, e
 	return t.Delegate.Stats(ctx)
 }
 
+func (t *TracedCommandContainer) PostCompletionStats() *espb.PostCompletionStats {
+	type postCompletionStatsProvider interface {
+		PostCompletionStats() *espb.PostCompletionStats
+	}
+	stats := &espb.PostCompletionStats{}
+	if p, ok := t.Delegate.(postCompletionStatsProvider); ok {
+		if s := p.PostCompletionStats(); s != nil {
+			stats = s
+		} else {
+			log.Debugf("container type %T returned nil PostCompletionStats", t.Delegate)
+		}
+	}
+	stats.PauseDurationUsec = t.pauseDuration.Microseconds()
+	return stats
+}
+
 func NewTracedCommandContainer(delegate CommandContainer) *TracedCommandContainer {
 	return &TracedCommandContainer{
 		Delegate: delegate,
 		implAttr: attribute.String("container.impl", fmt.Sprintf("%T", delegate)),
 	}
+}
+
+func AnonymousRecyclingEnabled() bool {
+	// If the executor is registered to the app without auth, then anonymous
+	// recycling should be enabled. Otherwise, it's only enabled if the debug
+	// flag is set.
+	return executor_auth.APIKey() == "" || *debugEnableAnonymousRecycling
 }

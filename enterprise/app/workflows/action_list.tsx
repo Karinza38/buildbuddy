@@ -1,12 +1,12 @@
-import React from "react";
-import router from "../../../app/router/router";
-import { invocation_status } from "../../../proto/invocation_status_ts_proto";
-import { workflow } from "../../../proto/workflow_ts_proto";
-import format from "../../../app/format/format";
-import { durationToMillis } from "../../../app/util/proto";
 import { GitCommit } from "lucide-react";
+import React from "react";
 import Link from "../../../app/components/link/link";
 import { MouseCoords, Tooltip, pinBottomLeftOffsetFromMouse } from "../../../app/components/tooltip/tooltip";
+import format from "../../../app/format/format";
+import router from "../../../app/router/router";
+import { durationToMillis } from "../../../app/util/proto";
+import { invocation_status } from "../../../proto/invocation_status_ts_proto";
+import { workflow } from "../../../proto/workflow_ts_proto";
 
 export type ActionListComponentProps = {
   repoUrl: string;
@@ -178,7 +178,7 @@ export default class ActionListComponent extends React.Component<ActionListCompo
                   <div className="title">{h.actionName}</div>
                   {latestCompletedRun && (
                     <div className="subtitle">
-                      {getRunStatusText(latestRunStatus)} at <GitCommit className="icon inline-icon" />{" "}
+                      {getRunStatusText(latestRunStatus)} at <GitCommit className="inline-icon" />{" "}
                       {format.formatCommitHash(latestCompletedRun.commitSha)}
                     </div>
                   )}

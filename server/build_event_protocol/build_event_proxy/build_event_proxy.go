@@ -101,17 +101,9 @@ func (c *BuildEventProxyClient) newAsyncStreamProxy(ctx context.Context, opts ..
 	asp.PublishBuildEvent_PublishBuildToolEventStreamClient = stream
 	// Start a goroutine that will open the stream and pass along events.
 	go func() {
-		// `range` *copies* the values it returns into the loopvar, and
-		// copies of protos are not permitted, so rather than range over the
-		// channel we read from the channel inside of an outer loop.
-		for {
-			req, ok := <-asp.events
-			if !ok {
-				break
-			}
-			err := stream.Send(req)
-			if err != nil {
-				log.Warningf("Error sending req on stream: %s", err.Error())
+		for req := range asp.events {
+			if err := stream.Send(req); err != nil {
+				log.Warningf("Error sending req on stream: %s", err)
 				break
 			}
 		}
@@ -139,7 +131,12 @@ func (asp *asyncStreamProxy) CloseSend() error {
 	return nil
 }
 
-func (c *BuildEventProxyClient) PublishBuildToolEventStream(_ context.Context, opts ...grpc.CallOption) (pepb.PublishBuildEvent_PublishBuildToolEventStreamClient, error) {
+func (c *BuildEventProxyClient) PublishBuildToolEventStream(ctx context.Context, opts ...grpc.CallOption) (pepb.PublishBuildEvent_PublishBuildToolEventStreamClient, error) {
 	c.reconnectIfNecessary()
+
+	if c.synchronous {
+		return c.client.PublishBuildToolEventStream(ctx, opts...)
+	}
+
 	return c.newAsyncStreamProxy(c.rootCtx, opts...)
 }

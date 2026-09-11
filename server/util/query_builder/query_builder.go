@@ -39,7 +39,7 @@ type joinClause struct {
 	onClause      string
 }
 
-func (j *joinClause) Build() (string, []interface{}) {
+func (j *joinClause) Build() (string, []any) {
 	subQuery, args := j.tableSubquery.Build()
 	q := pad(joinSQLKeyword) + "(" + subQuery + ") AS" + pad(j.alias) + pad(onSQLKeyword) + pad(j.onClause)
 	return q, args
@@ -51,7 +51,7 @@ type Query struct {
 	orderBy      string
 	groupBy      string
 	baseQuery    string
-	arguments    []interface{}
+	arguments    []any
 	whereClauses []string
 	joinClauses  []joinClause
 	fromClause   *Query
@@ -62,12 +62,12 @@ func NewQuery(baseQuery string) *Query {
 	return &Query{
 		baseQuery:    baseQuery,
 		whereClauses: make([]string, 0),
-		arguments:    make([]interface{}, 0),
+		arguments:    make([]any, 0),
 	}
 }
 
 // For those who simply can't help but use args in SELECT clauses
-func NewQueryWithArgs(baseQuery string, baseArgs []interface{}) *Query {
+func NewQueryWithArgs(baseQuery string, baseArgs []any) *Query {
 	return &Query{
 		baseQuery:    baseQuery,
 		whereClauses: make([]string, 0),
@@ -75,7 +75,7 @@ func NewQueryWithArgs(baseQuery string, baseArgs []interface{}) *Query {
 	}
 }
 
-func (q *Query) AddWhereClause(clause string, args ...interface{}) *Query {
+func (q *Query) AddWhereClause(clause string, args ...any) *Query {
 	clause = pad(clause)
 	q.whereClauses = append(q.whereClauses, clause)
 	q.arguments = append(q.arguments, args...)
@@ -128,20 +128,21 @@ func (q *Query) SetOffset(offset int64) *Query {
 	q.offset = &offset
 	return q
 }
-func (q *Query) Build() (string, []interface{}) {
+func (q *Query) Build() (string, []any) {
 	// Reference: SELECT foo FROM TABLE [JOIN TABLE2 ON a = b] WHERE bar = baz ORDER BY ack ASC LIMIT 10
-	fullQuery := q.baseQuery
+	var fullQuery strings.Builder
+	fullQuery.WriteString(q.baseQuery)
 	if q.fromClause != nil {
 		fromClauseStr, args := q.fromClause.Build()
 		q.arguments = append(args, q.arguments...)
 		fromClauseStr = " FROM (" + fromClauseStr + ")"
-		fullQuery += fromClauseStr
+		fullQuery.WriteString(fromClauseStr)
 	}
-	var argsInJoinClauses []interface{}
+	var argsInJoinClauses []any
 	for _, j := range q.joinClauses {
 		joinClause, args := j.Build()
 		argsInJoinClauses = append(argsInJoinClauses, args...)
-		fullQuery += joinClause
+		fullQuery.WriteString(joinClause)
 	}
 	q.arguments = append(argsInJoinClauses, q.arguments...)
 	if len(q.whereClauses) > 0 {
@@ -150,40 +151,40 @@ func (q *Query) Build() (string, []interface{}) {
 			whereClauses = append(whereClauses, " ("+c+") ")
 		}
 		whereRestrict := strings.Join(whereClauses, andQueryJoiner)
-		fullQuery += pad(whereSQLKeyword) + pad(whereRestrict)
+		fullQuery.WriteString(pad(whereSQLKeyword) + pad(whereRestrict))
 	}
 	if q.groupBy != "" {
-		fullQuery += pad(groupBySQLPhrase) + pad(q.groupBy)
+		fullQuery.WriteString(pad(groupBySQLPhrase) + pad(q.groupBy))
 	}
 	if q.orderBy != "" {
-		fullQuery += pad(orderBySQLPhrase) + pad(q.orderBy)
+		fullQuery.WriteString(pad(orderBySQLPhrase) + pad(q.orderBy))
 		if q.ascending {
-			fullQuery += "ASC"
+			fullQuery.WriteString("ASC")
 		} else {
-			fullQuery += "DESC"
+			fullQuery.WriteString("DESC")
 		}
 	}
 	if q.limit != nil {
-		fullQuery += pad(limitSQLKeyword) + pad(fmt.Sprintf("%d", *q.limit))
+		fullQuery.WriteString(pad(limitSQLKeyword) + pad(fmt.Sprintf("%d", *q.limit)))
 	}
 	if q.offset != nil {
-		fullQuery += pad(offsetSQLKeyword) + pad(fmt.Sprintf("%d", *q.offset))
+		fullQuery.WriteString(pad(offsetSQLKeyword) + pad(fmt.Sprintf("%d", *q.offset)))
 	}
-	return fullQuery, q.arguments
+	return fullQuery.String(), q.arguments
 }
 
 type OrClauses struct {
 	whereClauses []string
-	arguments    []interface{}
+	arguments    []any
 }
 
-func (o *OrClauses) AddOr(clause string, args ...interface{}) *OrClauses {
+func (o *OrClauses) AddOr(clause string, args ...any) *OrClauses {
 	o.whereClauses = append(o.whereClauses, pad(clause))
 	o.arguments = append(o.arguments, args...)
 	return o
 }
 
-func (o *OrClauses) Build() (string, []interface{}) {
+func (o *OrClauses) Build() (string, []any) {
 	fullQuery := ""
 	if len(o.whereClauses) > 0 {
 		whereRestrict := strings.Join(o.whereClauses, orQueryJoiner)

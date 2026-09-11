@@ -1,10 +1,10 @@
 package resources_test
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
-	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenviron"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
 )
@@ -62,7 +62,7 @@ func TestConfigure(t *testing.T) {
 				flags.Set(t, flag, value)
 			}
 			for name, value := range test.env {
-				testenviron.Set(t, name, value)
+				t.Setenv(name, value)
 			}
 
 			err := resources.Configure(false /*=mmapLRUEnabled*/)
@@ -74,4 +74,114 @@ func TestConfigure(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetCustomResourceParentMap(t *testing.T) {
+	flags.Set(t, "executor.custom_resources", []resources.CustomResource{
+		{Name: "apple_simulator", Value: 2},
+		{Name: "sim_version_26_5", Value: 2, Parent: "apple_simulator", ParentAccounting: "ceil"},
+		{Name: "sim_version_18_0", Value: 2, Parent: "apple_simulator"},
+		{Name: "sim_version_17_0", Value: 2, Parent: "apple_simulator", ParentAccounting: "sum"},
+	})
+
+	parentMap, err := resources.GetCustomResourceParentMap()
+	require.NoError(t, err)
+	require.Equal(t, map[string]resources.CustomResourceParent{
+		"sim_version_26_5": {Name: "apple_simulator", Accounting: "ceil"},
+		"sim_version_18_0": {Name: "apple_simulator", Accounting: "sum"},
+		"sim_version_17_0": {Name: "apple_simulator", Accounting: "sum"},
+	}, parentMap)
+}
+
+func TestGetCustomResourceParentMap_Invalid(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		resources []resources.CustomResource
+	}{
+		{
+			name: "missing parent",
+			resources: []resources.CustomResource{
+				{Name: "sim_version_26_5", Value: 2, Parent: "apple_simulator"},
+			},
+		},
+		{
+			name: "self parent",
+			resources: []resources.CustomResource{
+				{Name: "apple_simulator", Value: 2, Parent: "apple_simulator"},
+			},
+		},
+		{
+			name: "accounting without parent",
+			resources: []resources.CustomResource{
+				{Name: "apple_simulator", Value: 2, ParentAccounting: "ceil"},
+			},
+		},
+		{
+			name: "nested parents",
+			resources: []resources.CustomResource{
+				{Name: "sim_version_26_5", Value: 2, Parent: "apple_simulator"},
+				{Name: "apple_simulator", Value: 2, Parent: "device"},
+				{Name: "device", Value: 2},
+			},
+		},
+		{
+			name: "parent cycle",
+			resources: []resources.CustomResource{
+				{Name: "a", Value: 2, Parent: "b"},
+				{Name: "b", Value: 2, Parent: "a"},
+			},
+		},
+		{
+			name: "unsupported parent accounting",
+			resources: []resources.CustomResource{
+				{Name: "apple_simulator", Value: 2},
+				{Name: "sim_version_26_5", Value: 2, Parent: "apple_simulator", ParentAccounting: "floor"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			flags.Set(t, "executor.custom_resources", test.resources)
+			_, err := resources.GetCustomResourceParentMap()
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestConfigureDiskCapacity(t *testing.T) {
+	t.Run("disk_bytes flag sets capacity directly", func(t *testing.T) {
+		flags.Set(t, "executor.disk_bytes", int64(1234567))
+		// The ratio should be ignored when disk_bytes is set explicitly.
+		flags.Set(t, "executor.disk_capacity_ratio", 0.5)
+
+		require.NoError(t, resources.ConfigureDiskCapacity(t.TempDir()))
+		require.Equal(t, int64(1234567), resources.GetAllocatedDiskBytes())
+	})
+
+	t.Run("capacity is derived from filesystem size scaled by ratio", func(t *testing.T) {
+		buildRoot := t.TempDir()
+
+		flags.Set(t, "executor.disk_capacity_ratio", 1.0)
+		require.NoError(t, resources.ConfigureDiskCapacity(buildRoot))
+		full := resources.GetAllocatedDiskBytes()
+		require.Greater(t, full, int64(0))
+
+		flags.Set(t, "executor.disk_capacity_ratio", 0.5)
+		require.NoError(t, resources.ConfigureDiskCapacity(buildRoot))
+		half := resources.GetAllocatedDiskBytes()
+
+		// Can't assert an absolute size since it depends on the test machine's
+		// filesystem, but halving the ratio should halve the reported capacity.
+		require.InDelta(t, float64(full)/2, float64(half), float64(full)*0.01)
+	})
+
+	t.Run("out-of-range ratio returns error", func(t *testing.T) {
+		for _, ratio := range []float64{0, -1, 1.5} {
+			flags.Set(t, "executor.disk_capacity_ratio", ratio)
+			require.Error(t, resources.ConfigureDiskCapacity(t.TempDir()))
+		}
+	})
+
+	t.Run("nonexistent build root returns error", func(t *testing.T) {
+		require.Error(t, resources.ConfigureDiskCapacity(filepath.Join(t.TempDir(), "nonexistent")))
+	})
 }

@@ -1,7 +1,8 @@
+load("@aspect_rules_esbuild//esbuild:defs.bzl", "esbuild")
+load("@aspect_rules_jasmine//jasmine:defs.bzl", "jasmine_test")
 load("@aspect_rules_swc//swc:defs.bzl", "swc_compile")
-load("@npm//@bazel/esbuild:index.bzl", "esbuild")
-load("@npm//@bazel/jasmine:index.bzl", "jasmine_node_test")
-load("@npm//@bazel/typescript:index.bzl", "ts_project")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 
 def _swc(**kwargs):
     swc_compile(
@@ -9,12 +10,14 @@ def _swc(**kwargs):
         **kwargs
     )
 
-def ts_library(name, srcs, **kwargs):
+def ts_library(name, srcs, tsconfig = "//:tsconfig", **kwargs):
+    # TODO: Enable isolated_typecheck = True for faster builds.
     ts_project(
         name = name,
-        tsconfig = "//:tsconfig",
-        composite = True,
+        tsconfig = tsconfig,
+        declaration = True,
         transpiler = _swc,
+        validator = "@npm_typescript6//:validator",
         srcs = srcs,
         **kwargs
     )
@@ -31,7 +34,11 @@ def ts_jasmine_node_test(name, srcs, deps = [], size = "small", **kwargs):
         name = "%s_esm" % name,
         testonly = 1,
         srcs = srcs,
-        deps = deps + ["@npm//@types/jasmine"],
+        # TypeScript 6+ does not automatically discover @types/jasmine in this
+        # project, so explicitly load its global declarations.
+        tsconfig = {"compilerOptions": {"types": ["jasmine"]}},
+        extends = "//:tsconfig",
+        deps = deps + ["//:node_modules/@types/jasmine"],
         **kwargs
     )
 
@@ -50,7 +57,7 @@ def ts_jasmine_node_test(name, srcs, deps = [], size = "small", **kwargs):
     # more easily supported there.
     esbuild(
         name = "%s_commonjs" % name,
-        args = {"resolveExtensions": [".mjs", ".js"]},
+        config = {"resolveExtensions": [".mjs", ".js"]},
         testonly = 1,
         entry_point = srcs[0],
         deps = ["%s_esm" % name],
@@ -59,16 +66,20 @@ def ts_jasmine_node_test(name, srcs, deps = [], size = "small", **kwargs):
     # Copy the commonjs module to trick jasmine_node_test into thinking this is
     # a plain JS source. The test fails with "no specs found" if we try to pass
     # the commonjs module output as srcs directly.
-    native.genrule(
+    copy_file(
         name = "%s_entrypoint" % name,
-        srcs = [":%s_commonjs.js" % name],
-        outs = [":%s_commonjs.test.js" % name],
-        cmd_bash = "cp $(SRCS) $@",
+        src = ":%s_commonjs.js" % name,
+        out = ":%s_commonjs.test.js" % name,
+        allow_symlink = True,
+        testonly = True,
     )
 
-    jasmine_node_test(
+    jasmine_test(
         name = name,
         size = "small",
-        srcs = [":%s_commonjs.test.js" % name],
+        args = ["*.test.js"],
+        chdir = native.package_name(),
+        data = [":%s_commonjs.test.js" % name],
+        node_modules = "//:node_modules",
         **kwargs
     )

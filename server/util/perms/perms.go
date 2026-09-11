@@ -3,6 +3,7 @@ package perms
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
@@ -121,10 +122,8 @@ func AuthorizeRead(u interfaces.UserInfo, acl *aclpb.ACL) error {
 		return nil
 	}
 	if perms&GROUP_READ != 0 {
-		for _, groupID := range u.GetAllowedGroups() {
-			if groupID == acl.GetGroupId() {
-				return nil
-			}
+		if slices.Contains(u.GetAllowedGroups(), acl.GetGroupId()) {
+			return nil
 		}
 	}
 
@@ -153,10 +152,8 @@ func AuthorizeWrite(authenticatedUser *interfaces.UserInfo, acl *aclpb.ACL) erro
 		return nil
 	}
 	if perms&GROUP_WRITE != 0 {
-		for _, groupID := range u.GetAllowedGroups() {
-			if groupID == acl.GetGroupId() {
-				return nil
-			}
+		if slices.Contains(u.GetAllowedGroups(), acl.GetGroupId()) {
+			return nil
 		}
 	}
 
@@ -190,7 +187,7 @@ func GetPermissionsCheckClauses(ctx context.Context, env environment.Env, q *que
 	if u, err := auth.AuthenticatedUser(ctx); err == nil {
 		hasUser = true
 		if u.GetUserID() != "" {
-			groupArgs := []interface{}{
+			groupArgs := []any{
 				GROUP_READ,
 			}
 			groupParams := make([]string, 0)
@@ -203,7 +200,7 @@ func GetPermissionsCheckClauses(ctx context.Context, env environment.Env, q *que
 			o.AddOr(groupQueryStr, groupArgs...)
 			o.AddOr(fmt.Sprintf("(%sperms & ? != 0 AND %suser_id = ?)", tablePrefix, tablePrefix), OWNER_READ, u.GetUserID())
 		} else if u.GetGroupID() != "" {
-			groupArgs := []interface{}{
+			groupArgs := []any{
 				GROUP_READ,
 				u.GetGroupID(),
 			}

@@ -1,17 +1,19 @@
 import React from "react";
-import rpcService from "../../../app/service/rpc_service";
 import { User } from "../../../app/auth/auth_service";
-import { invocation } from "../../../proto/invocation_ts_proto";
-import router, { Path } from "../../../app/router/router";
-import format from "../../../app/format/format";
-import Select, { Option } from "../../../app/components/select/select";
 import capabilities from "../../../app/capabilities/capabilities";
+import TextInput from "../../../app/components/input/input";
+import Select, { Option } from "../../../app/components/select/select";
 import errorService from "../../../app/errors/error_service";
+import format from "../../../app/format/format";
+import router, { Path } from "../../../app/router/router";
+import rpcService from "../../../app/service/rpc_service";
 import { normalizeRepoURL } from "../../../app/util/git";
-import TestGridComponent from "./grid";
+import { invocation } from "../../../proto/invocation_ts_proto";
+import DateRangePickerButton from "../filter/date_range_picker_button";
+import { getProtoFilterParams } from "../filter/filter_util";
 import FlakesComponent from "./flakes";
+import TestGridComponent from "./grid";
 import GridSortControlsComponent from "./grid_sort_controls";
-import DatePickerButton from "../filter/date_picker_button";
 
 interface Props {
   user: User;
@@ -35,14 +37,24 @@ export default class TapComponent extends React.Component<Props, State> {
   };
 
   isV2 = Boolean(capabilities.config.testGridV2Enabled);
+  branchInputRef = React.createRef<HTMLInputElement>();
 
   componentWillMount() {
-    document.title = `Tests | BuildBuddy`;
     this.fetchRepos();
   }
 
-  componentDidUpdate() {
-    localStorage[LAST_SELECTED_REPO_LOCALSTORAGE_KEY] = this.selectedRepo();
+  componentDidMount() {
+    this.updateDocumentTitle();
+    if (this.branchInputRef.current) {
+      this.branchInputRef.current.value = this.props.search.get("branch") || "";
+    }
+  }
+
+  componentDidUpdate(prevProps: Props) {
+    this.updateDocumentTitle();
+    if (this.branchInputRef.current) {
+      this.branchInputRef.current.value = this.props.search.get("branch") || "";
+    }
   }
 
   getSelectedTab(): Tab {
@@ -56,6 +68,18 @@ export default class TapComponent extends React.Component<Props, State> {
     router.navigateTo(Path.tapPath + "#" + tab);
   }
 
+  private getPageTitle() {
+    const target = this.props.search.get("target");
+    if (this.getSelectedTab() === "flakes") {
+      return target ? `Flakes for ${target}` : "Flakes";
+    }
+    return "Tests";
+  }
+
+  private updateDocumentTitle() {
+    document.title = `${this.getPageTitle()} | BuildBuddy`;
+  }
+
   fetchRepos(): Promise<void> {
     if (!this.isV2) return Promise.resolve();
 
@@ -64,10 +88,16 @@ export default class TapComponent extends React.Component<Props, State> {
     const selectedRepo = this.selectedRepo();
     if (selectedRepo) this.setState({ repos: [selectedRepo] });
 
+    const filterParams = getProtoFilterParams(this.props.search);
+
     const fetchPromise = rpcService.service
       .getInvocationStat(
         invocation.GetInvocationStatRequest.create({
           aggregationType: invocation.AggType.REPO_URL_AGGREGATION_TYPE,
+          query: new invocation.InvocationStatQuery({
+            updatedBefore: filterParams.updatedBefore,
+            updatedAfter: filterParams.updatedAfter,
+          }),
         })
       )
       .then((response) => {
@@ -94,13 +124,20 @@ export default class TapComponent extends React.Component<Props, State> {
 
   handleRepoChange(event: React.ChangeEvent<HTMLSelectElement>) {
     const repo = event.target.value;
-    router.replaceParams({ repo });
+    router.setQueryParam("repo", repo || undefined);
+  }
+
+  handleBranchInputKeyPress(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") {
+      router.setQueryParam("branch", (event.target as HTMLInputElement).value || undefined);
+    }
   }
 
   render() {
     const tab = this.getSelectedTab();
-    let tabContent;
     const repo = this.selectedRepo();
+    const title = this.getPageTitle();
+    let tabContent;
     if (tab === "flakes") {
       tabContent = <FlakesComponent repo={repo} search={this.props.search} dark={this.props.dark}></FlakesComponent>;
     } else {
@@ -108,8 +145,6 @@ export default class TapComponent extends React.Component<Props, State> {
         <TestGridComponent repo={repo} search={this.props.search} user={this.props.user}></TestGridComponent>
       );
     }
-
-    const title = capabilities.config.targetFlakesUiEnabled ? "Test history" : "Test grid";
 
     return (
       <div className={`tap ${this.isV2 ? "v2" : ""}`}>
@@ -120,37 +155,31 @@ export default class TapComponent extends React.Component<Props, State> {
                 <div className="tap-header-left-section">
                   <div className="tap-title">{title}</div>
                   {this.isV2 && this.state.repos.length > 0 && (
-                    <Select
-                      onChange={this.handleRepoChange.bind(this)}
-                      value={this.selectedRepo()}
-                      className="repo-picker">
-                      {this.state.repos.map((repo) => (
-                        <Option key={repo} value={repo}>
-                          {format.formatGitUrl(repo)}
-                        </Option>
-                      ))}
-                    </Select>
+                    <>
+                      <Select
+                        onChange={this.handleRepoChange.bind(this)}
+                        value={this.selectedRepo()}
+                        className="repo-picker">
+                        {this.state.repos.map((repo) => (
+                          <Option key={repo} value={repo}>
+                            {format.formatGitUrl(repo)}
+                          </Option>
+                        ))}
+                      </Select>
+                      <TextInput
+                        placeholder="Branch"
+                        // Use uncontrolled input to avoid re-rendering.
+                        ref={this.branchInputRef}
+                        onKeyPress={(e) => this.handleBranchInputKeyPress(e)}
+                      />
+                    </>
                   )}
                 </div>
                 <div className="controls">
                   {tab === "grid" && <GridSortControlsComponent search={this.props.search}></GridSortControlsComponent>}
-                  {tab === "flakes" && <DatePickerButton search={this.props.search}></DatePickerButton>}
+                  {tab === "flakes" && <DateRangePickerButton search={this.props.search} />}
                 </div>
               </div>
-              {capabilities.config.targetFlakesUiEnabled && (
-                <div className="tabs">
-                  <div
-                    onClick={() => this.updateSelectedTab("grid")}
-                    className={`tab ${this.getSelectedTab() === "grid" ? "selected" : ""}`}>
-                    Test Grid
-                  </div>
-                  <div
-                    onClick={() => this.updateSelectedTab("flakes")}
-                    className={`tab ${this.getSelectedTab() === "flakes" ? "selected" : ""}`}>
-                    Flakes
-                  </div>
-                </div>
-              )}
             </div>
           </div>
         </div>

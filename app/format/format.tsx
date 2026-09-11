@@ -1,12 +1,16 @@
+import { isSameDay } from "date-fns";
 import Long from "long";
 import moment from "moment";
-import { isSameDay } from "date-fns";
 import { google as google_duration } from "../../proto/duration_ts_proto";
 import { durationToMillis } from "../util/proto";
 
-export function percent(percent: number | Long) {
-  if (!percent) return "0";
-  return `${(+percent * 100).toFixed(0)}`;
+/**
+ * Formats a fractional value like 0.123 as a percentage like "12".
+ * This does not include the "%" symbol.
+ */
+export function percent(fraction: number | Long) {
+  if (!fraction) return "0";
+  return `${(+fraction * 100).toFixed(0)}`;
 }
 
 export function durationProto(duration: google_duration.protobuf.IDuration) {
@@ -165,23 +169,25 @@ function truncateDecimalZeroes(numString: string): string {
 }
 
 export function bytes(bytes: number | Long) {
-  bytes = +bytes;
-  if (bytes < 1e3) {
-    return bytes + "B";
+  bytes = Number(bytes);
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  for (const [i, unit] of units.entries()) {
+    if (bytes < Math.pow(1000, i + 1) || i === units.length - 1) {
+      return truncateDecimalZeroes((bytes / Math.pow(1000, i)).toPrecision(4)) + unit;
+    }
   }
-  if (bytes < 1e6) {
-    return truncateDecimalZeroes((bytes / 1e3).toPrecision(4)) + "KB";
+  throw new Error("unreachable code");
+}
+
+export function bytesIEC(bytes: number | Long) {
+  bytes = Number(bytes);
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  for (const [i, unit] of units.entries()) {
+    if (bytes < Math.pow(1024, i + 1) || i === units.length - 1) {
+      return truncateDecimalZeroes((bytes / Math.pow(1024, i)).toPrecision(4)) + unit;
+    }
   }
-  if (bytes < 1e9) {
-    return truncateDecimalZeroes((bytes / 1e6).toPrecision(4)) + "MB";
-  }
-  if (bytes < 1e12) {
-    return truncateDecimalZeroes((bytes / 1e9).toPrecision(4)) + "GB";
-  }
-  if (bytes < 1e15) {
-    return truncateDecimalZeroes((bytes / 1e12).toPrecision(4)) + "TB";
-  }
-  return truncateDecimalZeroes((bytes / 1e15).toPrecision(4)) + "PB";
+  throw new Error("unreachable code");
 }
 
 export function bitsPerSecond(bitsPerSecond: number | Long) {
@@ -251,6 +257,11 @@ export function formatTimestamp(timestamp: { seconds?: number | Long; nanos?: nu
 
 export function formatDate(date: Date): string {
   return formatTimestampMillis(date.getTime());
+}
+
+/** Formats the given date as a date without a time, e.g. "Jul 5, 2026". */
+export function formatDateOnly(date: Date): string {
+  return moment(date).format("MMM D, YYYY");
 }
 
 export function formatDateFromUsec(timestamp: number | Long, { compact = false } = {}) {
@@ -339,6 +350,24 @@ export function formatDateRange(startDate: Date, endDate?: Date, { now = new Dat
   return `${start} ${DATE_RANGE_SEPARATOR} ${end}`;
 }
 
+export function relativeTimeSeconds(timestamp: { seconds?: number | Long; nanos?: number | Long }): string {
+  if (!timestamp) return "Never";
+
+  const timestampMs = +(timestamp.seconds || 0) * 1000 + +(timestamp.nanos || 0) / 1000000;
+  const now = Date.now();
+  const diffMs = now - timestampMs;
+
+  if (diffMs < 0) return "Just now";
+
+  const seconds = Math.floor(diffMs / 1000);
+  return `${seconds} second${seconds === 1 ? "" : "s"} ago`;
+}
+
+export function durationSince(timestamp: { seconds?: number | Long; nanos?: number | Long }): string {
+  const timestampMs = +(timestamp.seconds || 0) * 1000 + +(timestamp.nanos || 0) / 1000000;
+  return durationMillis(Math.max(0, Date.now() - timestampMs));
+}
+
 export function formatGitUrl(url: string) {
   return url
     ?.replace("https://", "")
@@ -367,23 +396,23 @@ export function formatRole(role: string): string | null {
   return null;
 }
 
-export function formatWithCommas(num: number | Long | Number | undefined) {
+export function formatWithCommas(num: number | Long | Number | undefined, options?: Intl.NumberFormatOptions) {
   if (num === undefined || num === null) {
     return "";
   }
-  return (+num).toLocaleString("en-US");
+  return (+num).toLocaleString("en-US", options);
 }
 
 export function differenceInCalendarDays(start: Date, end: Date) {
   return moment(end).diff(start, "days");
 }
 
-export function colorHash(input: string) {
+export function colorHashHue(input: string): number {
   let num = 0;
   for (var i = 0; i < input.length; i++) {
     num = input.charCodeAt(i) + ((num << 5) - num);
   }
-  return `hsl(${(num % 360000) / 1000}, 50%, 80%)`;
+  return (num % 360000) / 1000;
 }
 
 export function enumLabel(e: string) {
@@ -403,6 +432,7 @@ export default {
   sentenceCase,
   percent,
   bytes,
+  bytesIEC,
   bitsPerSecond,
   count,
   truncateList,
@@ -415,7 +445,9 @@ export default {
   formatRole,
   formatWithCommas,
   formatDateRange,
-  colorHash,
+  colorHashHue,
   enumLabel,
   formatDateFromUsec,
+  relativeTimeSeconds,
+  durationSince,
 };

@@ -1,9 +1,53 @@
 import { fillCenteredText, fillCircle, fillTextBox } from "../util/canvas";
+import { computeTraceEventColor } from "../util/color";
 import { ClientXY, domRectContains } from "../util/dom";
 import { truncateDecimals } from "../util/math";
 import * as constants from "./constants";
 import { TraceEvent } from "./trace_events";
 import { LinePlotModel, PanelModel, SectionModel, TrackModel } from "./trace_viewer_model";
+
+type LinePlotColorKey = "lightColor" | "darkColor";
+
+type ThemeColors = {
+  gridline: string;
+  mouseGridline: string;
+  timestampFont: string;
+  mouseTimestampBg: string;
+  timestampHeaderBg: string;
+  sectionBg: string;
+  sectionBorder: string;
+  sectionFont: string;
+  eventFiltered: string;
+  eventHighlightStroke: string;
+  eventLabelFont: string;
+  linePlotFill: LinePlotColorKey;
+  linePlotStroke: LinePlotColorKey;
+  linePlotFillOpacity: number;
+  linePlotStrokeOpacity: number;
+};
+
+function readThemeColors(): ThemeColors {
+  const style = getComputedStyle(document.documentElement);
+  const get = (name: string) => style.getPropertyValue(name).trim();
+  const dark = document.documentElement.classList.contains("dark");
+  return {
+    gridline: get("--color-trace-gridline"),
+    mouseGridline: get("--color-trace-mouse-gridline"),
+    timestampFont: get("--color-trace-timestamp-font"),
+    mouseTimestampBg: get("--color-trace-mouse-timestamp-bg"),
+    timestampHeaderBg: get("--color-trace-timestamp-header-bg"),
+    sectionBg: get("--color-trace-section-bg"),
+    sectionBorder: get("--color-trace-section-border"),
+    sectionFont: get("--color-trace-section-font"),
+    eventFiltered: get("--color-trace-event-filtered"),
+    eventHighlightStroke: get("--color-trace-event-highlight-stroke"),
+    eventLabelFont: get("--color-trace-event-label-font"),
+    linePlotFill: dark ? "darkColor" : "lightColor",
+    linePlotStroke: dark ? "lightColor" : "darkColor",
+    linePlotFillOpacity: dark ? constants.DARK_LINE_PLOT_FILL_OPACITY : 1,
+    linePlotStrokeOpacity: dark ? constants.DARK_LINE_PLOT_STROKE_OPACITY : 1,
+  };
+}
 
 /**
  * Draws the data from a `PanelModel` to a canvas.
@@ -34,6 +78,12 @@ export default class Panel {
 
   filter = "";
 
+  // If set, visually highlight this event to indicate that it is the current search match.
+  highlightEvent?: { track: TrackModel; index: number };
+
+  private theme: ThemeColors;
+  private eventColorCache = new Map<string, string>();
+
   constructor(
     readonly model: PanelModel,
     readonly canvas: HTMLCanvasElement,
@@ -41,6 +91,29 @@ export default class Panel {
   ) {
     this.ctx = canvas.getContext("2d")!;
     this.container = canvas.parentElement!;
+    this.theme = readThemeColors();
+    this.buildEventColorCache();
+  }
+
+  onThemeChange() {
+    this.theme = readThemeColors();
+    this.buildEventColorCache();
+  }
+
+  private buildEventColorCache() {
+    this.eventColorCache.clear();
+    for (const section of this.model.sections) {
+      for (const track of section.tracks ?? []) {
+        const eventIndices = track.eventIndices;
+        const thread = track.thread;
+        for (let i = 0; i < eventIndices.length; i++) {
+          const colorKey = thread.getColorKey(eventIndices[i]);
+          if (!this.eventColorCache.has(colorKey)) {
+            this.eventColorCache.set(colorKey, computeTraceEventColor(colorKey));
+          }
+        }
+      }
+    }
   }
 
   private isSectionVisible(section: SectionModel) {
@@ -124,7 +197,7 @@ export default class Panel {
 
     const modelMouse = this.getMouseModelCoordinates();
     let trackY = section.y + constants.SECTION_LABEL_HEIGHT + constants.SECTION_LABEL_PADDING_BOTTOM;
-    const trackYIncrement = constants.TRACK_HEIGHT + constants.EVENT_HORIZONTAL_GAP;
+    const trackYIncrement = constants.TRACK_HEIGHT + constants.TRACK_VERTICAL_GAP;
     for (const track of section.tracks) {
       if (modelMouse.y >= trackY && modelMouse.y <= trackY + trackYIncrement) {
         if (modelMouse.y > trackY + constants.TRACK_HEIGHT) {
@@ -147,11 +220,18 @@ export default class Panel {
     const modelMouse = this.getMouseModelCoordinates();
 
     const onePx = 1 / this.canvasXPerModelX;
-    for (const event of track.events) {
-      if (modelMouse.x >= event.ts && modelMouse.x <= event.ts + Math.max(event.dur, onePx)) {
-        return event;
+    const eventIndices = track.eventIndices;
+    const thread = track.thread;
+    const ts = thread.ts;
+    const dur = thread.dur;
+    const eventCount = eventIndices.length;
+    for (let i = 0; i < eventCount; i++) {
+      const eventIndex = eventIndices[i];
+      const eventTs = ts[eventIndex];
+      if (modelMouse.x >= eventTs && modelMouse.x <= eventTs + Math.max(dur[eventIndex], onePx)) {
+        return thread.getEvent(eventIndex);
       }
-      if (event.ts > modelMouse.x) return null;
+      if (eventTs > modelMouse.x) return null;
     }
     return null;
   }
@@ -188,7 +268,7 @@ export default class Panel {
       ctx.moveTo(x + 0.5, 0);
       ctx.lineTo(x + 0.5, height);
     }
-    ctx.strokeStyle = constants.GRIDLINE_COLOR;
+    ctx.strokeStyle = this.theme.gridline;
     ctx.stroke();
   }
 
@@ -201,7 +281,7 @@ export default class Panel {
     ctx.lineTo(x - 0.5, this.canvasHeight);
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 4]);
-    ctx.strokeStyle = `${constants.MOUSE_GRIDLINE_COLOR}`;
+    ctx.strokeStyle = this.theme.mouseGridline;
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -218,9 +298,9 @@ export default class Panel {
     }
 
     fillTextBox(ctx, text, textBoxX, constants.TIMESTAMP_HEADER_SIZE - 4, {
-      textColor: constants.TIMESTAMP_FONT_COLOR,
+      textColor: this.theme.timestampFont,
       font: `${constants.TIMESTAMP_FONT_SIZE} ${this.fontFamily}`,
-      boxColor: "#E0E0E0",
+      boxColor: this.theme.mouseTimestampBg,
       boxRadius: 8,
       boxPadding: 2,
       xAnchor,
@@ -240,8 +320,10 @@ export default class Panel {
         constants.SECTION_LABEL_PADDING_BOTTOM +
         constants.TIME_SERIES_HEIGHT;
       const pointClientY = plotClientBottom - (mouseModelY / section.linePlot.yMax) * constants.TIME_SERIES_HEIGHT;
-      fillCircle(ctx, x, pointClientY, 2, section.linePlot.darkColor);
-      fillTextBox(ctx, String(truncateDecimals(mouseModelY, 2)), textBoxX, pointClientY - 6, {
+      const dotColor = section.linePlot[this.theme.linePlotStroke];
+      fillCircle(ctx, x, pointClientY, 2, dotColor);
+      const unit = section.linePlot.unit ? " " + section.linePlot.unit : "";
+      fillTextBox(ctx, String(truncateDecimals(mouseModelY, 2)) + unit, textBoxX, pointClientY - 6, {
         boxPadding: 1,
         boxRadius: 8,
         xAnchor,
@@ -251,13 +333,13 @@ export default class Panel {
 
   private drawTimeline(ticks: Ticks) {
     const ctx = this.ctx;
-    ctx.fillStyle = constants.TIMESTAMP_HEADER_COLOR;
+    ctx.fillStyle = this.theme.timestampHeaderBg;
     ctx.fillRect(0, 0, this.canvasWidth, constants.TIMESTAMP_HEADER_SIZE);
-    ctx.fillStyle = constants.SECTION_LABEL_BORDER_COLOR;
+    ctx.fillStyle = this.theme.sectionBorder;
     ctx.fillRect(0, constants.TIMESTAMP_HEADER_SIZE, this.canvasWidth, 1);
     this.drawGridlines(ticks, constants.TIMESTAMP_HEADER_SIZE);
     let tick = ticks.start;
-    ctx.fillStyle = constants.TIMESTAMP_FONT_COLOR;
+    ctx.fillStyle = this.theme.timestampFont;
     ctx.font = `${constants.TIMESTAMP_FONT_SIZE} ${this.fontFamily}`;
     for (let i = 0; i < ticks.count; i++, tick += ticks.size) {
       const x = Math.floor(this.canvasXPerModelX * tick) - this.scrollX;
@@ -269,6 +351,7 @@ export default class Panel {
     const ctx = this.ctx;
     const xMin = this.scrollX / this.canvasXPerModelX;
     const xMax = (this.scrollX + this.canvasWidth) / this.canvasXPerModelX;
+    const lowerFilter = this.filter.toLowerCase();
     let i = 0;
     for (; i < this.model.sections.length; i++) {
       if (this.isSectionVisible(this.model.sections[i])) break;
@@ -278,14 +361,14 @@ export default class Panel {
       const section = this.model.sections[i];
       const y = constants.TIMESTAMP_HEADER_SIZE + section.y - this.scrollY;
       // Section header BG
-      ctx.fillStyle = constants.SECTION_LABEL_BG_COLOR;
+      ctx.fillStyle = this.theme.sectionBg;
       ctx.fillRect(0, y, this.canvasWidth, constants.SECTION_LABEL_HEIGHT);
-      ctx.fillStyle = constants.SECTION_LABEL_BORDER_COLOR;
+      ctx.fillStyle = this.theme.sectionBorder;
       // Section header top border
       ctx.fillRect(0, y, this.canvasWidth, 1);
       // Section header text (always pinned to the left)
       ctx.font = `600 ${constants.SECTION_LABEL_FONT_SIZE} ${this.fontFamily}`;
-      ctx.fillStyle = constants.SECTION_LABEL_FONT_COLOR;
+      ctx.fillStyle = this.theme.sectionFont;
       fillCenteredText(ctx, section.name, 8, y, 0, constants.SECTION_LABEL_HEIGHT, { vertical: true });
 
       // Draw tracks
@@ -298,7 +381,7 @@ export default class Panel {
           trackIndex * (constants.TRACK_HEIGHT + constants.TRACK_VERTICAL_GAP);
         // TODO: skip drawing track if not visible *within* the current section.
         // This may be needed if we have to render very tall sections.
-        this.drawTrack(track, trackY, xMin, xMax);
+        this.drawTrack(track, trackY, xMin, xMax, lowerFilter);
         trackIndex++;
       }
 
@@ -313,6 +396,8 @@ export default class Panel {
   private drawLinePlot(plot: LinePlotModel, yTop: number, xMin: number, xMax: number) {
     const ctx = this.ctx;
     const yBottom = yTop + constants.TIME_SERIES_HEIGHT;
+    const fillColor = plot[this.theme.linePlotFill];
+    const strokeColor = plot[this.theme.linePlotStroke];
     // TODO: reduce plot resolution based on zoom level
     // TODO: render the point *before* xMin and *after* xMax since we connect to those
     let i = 0;
@@ -324,7 +409,7 @@ export default class Panel {
     i = Math.max(0, i - 1);
     const i0 = i;
     const canvasYPerModelY = constants.TIME_SERIES_HEIGHT / plot.yMax;
-    // Draw the background (lighter color).
+    // Draw the background fill.
     let started = false;
     let done = false;
     for (let i = i0; i < plot.xs.length && !done; i++) {
@@ -351,10 +436,11 @@ export default class Panel {
       }
     }
     ctx.closePath();
-    ctx.fillStyle = plot.lightColor;
+    ctx.globalAlpha = this.theme.linePlotFillOpacity;
+    ctx.fillStyle = fillColor;
     ctx.fill();
 
-    // Draw the outline (darker color).
+    // Draw the outline.
     started = false;
     done = false;
     for (let i = i0; i < plot.xs.length && !done; i++) {
@@ -379,62 +465,72 @@ export default class Panel {
       }
     }
     ctx.closePath();
+    ctx.globalAlpha = this.theme.linePlotStrokeOpacity;
     ctx.lineWidth = 1;
-    ctx.strokeStyle = plot.darkColor;
+    ctx.strokeStyle = strokeColor;
     ctx.stroke();
+    ctx.globalAlpha = 1;
   }
 
-  private drawTrack(track: TrackModel, y: number, xMin: number, xMax: number) {
-    let i = 0;
-    let lastEventRendered = false;
-    for (; i < track.xs.length; i++) {
-      let modelX = track.xs[i];
+  private drawTrack(track: TrackModel, y: number, xMin: number, xMax: number, lowerFilter: string) {
+    const eventIndices = track.eventIndices;
+    const thread = track.thread;
+    const dur = thread.dur;
+    const ts = thread.ts;
+    const eventCount = eventIndices.length;
+    const scale = this.canvasXPerModelX;
+    const scrollX = this.scrollX;
+    let lastRenderedPixelRight = -Infinity;
+    for (let i = 0; i < eventCount; i++) {
+      const eventIndex = eventIndices[i];
+      let modelX = ts[eventIndex];
       if (modelX > xMax) break;
 
-      let modelWidth = track.widths[i];
+      let modelWidth = dur[eventIndex];
       if (modelX + modelWidth < xMin) continue;
 
-      let color = track.colors[i];
-
-      if (
-        this.filter == "" ||
-        track.events[i].name.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].cat.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].args?.target?.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].args?.mnemonic?.toLowerCase().includes(this.filter.toLowerCase()) ||
-        track.events[i].out?.toLowerCase().includes(this.filter.toLowerCase())
-      ) {
-        this.ctx.fillStyle = color;
-      } else {
-        this.ctx.fillStyle = constants.EVENT_FILTERED_OUT_COLOR;
-      }
-
       // TODO: only apply the horizontal gap if there's an event just after us.
-      let width = modelWidth * this.canvasXPerModelX - constants.EVENT_HORIZONTAL_GAP;
+      let width = modelWidth * scale - constants.EVENT_HORIZONTAL_GAP;
+      const x = modelX * scale - scrollX;
       if (width <= 0) {
-        // If the event is less than 1px side, and less than 1px away from the previous
-        // event start that rendered, don't render it.
-        if (lastEventRendered && Math.abs(modelX - track.xs[i - 1]) * this.canvasXPerModelX <= 1) {
-          lastEventRendered = false;
-          continue;
-        }
-        width = 1;
+        width = constants.MIN_RENDER_PIXEL_WIDTH;
       }
-      const x = modelX * this.canvasXPerModelX - this.scrollX;
+
+      const isHighlighted = this.highlightEvent?.track === track && this.highlightEvent.index === i;
+      const pixelLeft = Math.floor(x);
+      const pixelRight = Math.max(pixelLeft + 1, Math.ceil(x + width));
+      // At low zoom, many consecutive events can collapse into the same pixel.
+      // Drawing all of them does extra canvas work without adding detail.
+      if (!isHighlighted && pixelRight <= lastRenderedPixelRight) {
+        continue;
+      }
+      lastRenderedPixelRight = pixelRight;
+
+      if (lowerFilter && !thread.matchesFilter(eventIndex, lowerFilter)) {
+        this.ctx.fillStyle = this.theme.eventFiltered;
+      } else {
+        this.ctx.fillStyle = this.eventColorCache.get(thread.getColorKey(eventIndex))!;
+      }
       this.ctx.fillRect(x, y, width, constants.TRACK_HEIGHT);
-      lastEventRendered = true;
+
+      // If this event is the one currently selected via search, draw a border
+      // around it so it's easy to spot.
+      if (isHighlighted) {
+        this.ctx.lineWidth = 2;
+        this.ctx.strokeStyle = this.theme.eventHighlightStroke;
+        this.ctx.strokeRect(x, y, width, constants.TRACK_HEIGHT);
+      }
 
       const visibleWidth = width + Math.min(0, x);
       if (visibleWidth > constants.EVENT_LABEL_WIDTH_THRESHOLD) {
-        let name = track.events[i].name;
         this.ctx.font = `${constants.EVENT_LABEL_FONT_SIZE} ${this.fontFamily}`;
-        this.ctx.fillStyle = constants.EVENT_LABEL_FONT_COLOR;
+        this.ctx.fillStyle = this.theme.eventLabelFont;
         this.ctx.save();
         this.ctx.beginPath();
         this.ctx.rect(x, y, width, constants.TRACK_HEIGHT);
         this.ctx.clip();
         this.ctx.fillText(
-          name,
+          thread.getName(eventIndex),
           // Pin label to left edge if out of view.
           Math.max(0, x) + 2,
           y + constants.TRACK_HEIGHT - 4
@@ -464,7 +560,7 @@ function formatMicroseconds(microseconds: number) {
  *
  * Returns undefined if x is out of bounds.
  */
-function interpolate(x: number, xs: number[], ys: number[]): number | undefined {
+function interpolate(x: number, xs: ArrayLike<number>, ys: ArrayLike<number>): number | undefined {
   if (!xs.length) return undefined;
   if (x < xs[0]) return undefined;
 

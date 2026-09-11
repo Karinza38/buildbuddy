@@ -1,4 +1,5 @@
 // shlex contains facilities for shell code parsing and generation.
+// Keep in sync with app/util/shlex.ts
 
 package shlex
 
@@ -10,8 +11,8 @@ import (
 )
 
 var (
-	allSafeCharsRegexp   = regexp.MustCompile(`^[A-Za-z0-9/_\-]+$`)
-	flagAssignmentRegexp = regexp.MustCompile(`^--[A-Za-z_-]+=`)
+	allSafeCharsRegexp   = regexp.MustCompile(`^[A-Za-z0-9_:\-,.%@/=]+$`)
+	flagAssignmentRegexp = regexp.MustCompile(`^--[A-Za-z0-9_:\-,.%@/]+=`)
 )
 
 // Split parses the given shell command and returns the canonical tokenized
@@ -49,14 +50,14 @@ func Split(command string) ([]string, error) {
 // The fourth argument "~" has a tilde which would be expanded to $HOME,
 // so must also be escaped.
 func Quote(tokens ...string) string {
-	out := ""
+	var out strings.Builder
 	for i, arg := range tokens {
-		out += quoteSingle(arg)
+		out.WriteString(quoteSingle(arg))
 		if i < len(tokens)-1 {
-			out += " "
+			out.WriteString(" ")
 		}
 	}
-	return out
+	return out.String()
 }
 
 func quoteSingle(arg string) string {

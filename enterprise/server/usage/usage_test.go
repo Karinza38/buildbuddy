@@ -2,12 +2,14 @@ package usage_test
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"math/rand"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column/orderedmap"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/redis_metrics_collector"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/usage"
@@ -15,7 +17,11 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testclickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
+	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
+	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/go-redis/redis/v8"
@@ -25,6 +31,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
+
+	olaptables "github.com/buildbuddy-io/buildbuddy/server/util/clickhouse/schema"
 )
 
 const (
@@ -32,6 +40,8 @@ const (
 )
 
 var (
+	clickhouseEnabled = flag.Bool("test_clickhouse_enabled", false, "Whether to enable Clickhouse for usage tracking tests")
+
 	// Define some usage periods
 
 	period1Start = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -40,8 +50,16 @@ var (
 	period4Start = period1Start.Add(3 * periodDuration)
 )
 
-func setupEnv(t *testing.T) *testenv.TestEnv {
-	te := testenv.GetTestEnv(t)
+func setupEnv(t *testing.T, opts ...testenv.TestEnvOption) *testenv.TestEnv {
+	te := testenv.GetTestEnv(t, opts...)
+
+	if *clickhouseEnabled {
+		clickhouseDSN := testclickhouse.Start(t, true /*=reuseServer*/)
+		flags.Set(t, "olap_database.data_source", clickhouseDSN)
+		flags.Set(t, "app.write_usage_to_olap_db", true)
+		err := clickhouse.Register(te)
+		require.NoError(t, err)
+	}
 
 	redisTarget := testredis.Start(t).Target
 	rdb := redis.NewClient(redisutil.TargetToOptions(redisTarget))
@@ -50,7 +68,7 @@ func setupEnv(t *testing.T) *testenv.TestEnv {
 	rmc := redis_metrics_collector.New(rdb, rbuf)
 	te.SetMetricsCollector(rmc)
 
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(
 		"US1", "GR1",
 		"US2", "GR2",
 	))
@@ -76,7 +94,7 @@ func queryAllUsages(t *testing.T, te *testenv.TestEnv) []*tables.Usage {
 	dbh := te.GetDBHandle()
 	rq := dbh.NewQuery(ctx, "get_usages").Raw(`
 		SELECT * From "Usages"
-		ORDER BY group_id, period_start_usec, region, client, origin ASC;
+		ORDER BY group_id, period_start_usec, region, client, server, origin, proxy ASC;
 	`)
 
 	err := db.ScanEach(rq, func(ctx context.Context, tu *tables.Usage) error {
@@ -89,6 +107,22 @@ func queryAllUsages(t *testing.T, te *testenv.TestEnv) []*tables.Usage {
 	})
 	require.NoError(t, err)
 	return usages
+}
+
+func queryAllOLAPUsages(t *testing.T, te *testenv.TestEnv) []*olaptables.Usage {
+	rows := []*olaptables.Usage{}
+	ctx := context.Background()
+	dbh := te.GetOLAPDBHandle()
+	rq := dbh.NewQuery(ctx, "get_olap_usages").Raw(`
+		SELECT * From "Usage"
+		ORDER BY group_id, period_start, sku, labels ASC;
+	`)
+	err := db.ScanEach(rq, func(ctx context.Context, u *olaptables.Usage) error {
+		rows = append(rows, u)
+		return nil
+	})
+	require.NoError(t, err)
+	return rows
 }
 
 // requireNoFurtherDBAccess makes the test fail immediately if it tries to
@@ -120,10 +154,43 @@ func TestUsageTracker_Increment_MultipleGroupsInSameCollectionPeriod(t *testing.
 	require.NoError(t, err)
 
 	labels := &tables.UsageLabels{Origin: "internal", Client: "bazel"}
+	olapLabels := sku.Labels{
+		sku.Origin: sku.OriginInternal,
+		sku.Client: sku.ClientBazel,
+	}
 
-	// Increment for group 1, then group 2
-	ut.Increment(ctx1, labels, &tables.UsageCounts{CASCacheHits: 1})
-	ut.Increment(ctx2, labels, &tables.UsageCounts{CASCacheHits: 10})
+	executionLabels := sku.Labels{
+		sku.Origin:     sku.OriginInternal,
+		sku.Client:     sku.ClientBazel,
+		sku.OS:         sku.OSLinux,
+		sku.SelfHosted: sku.SelfHostedFalse,
+	}
+	recordUsage := func(ctx context.Context, counts *tables.UsageCounts) {
+		// Record primary DB usage and the corresponding OLAP rows explicitly.
+		// Legacy usage records durations in microseconds; OLAP records durations in nanoseconds.
+		require.NoError(t, ut.Increment(ctx, labels, counts))
+		require.NoError(t, ut.IncrementOLAP(ctx, olapLabels, map[sku.SKU]int64{
+			sku.RemoteCacheCASHits:                   counts.CASCacheHits,
+			sku.RemoteCacheACCachedExecDurationNanos: counts.TotalCachedActionExecUsec * 1000,
+		}))
+		require.NoError(t, ut.IncrementOLAP(ctx, executionLabels, map[sku.SKU]int64{
+			sku.RemoteExecutionExecuteWorkerDurationNanos: counts.LinuxExecutionDurationUsec * 1000,
+			sku.RemoteExecutionExecuteWorkerMemoryGBNanos: counts.MemoryGBUsec * 1000,
+		}))
+	}
+	// Increment cache and execution usage for group 1, then group 2.
+	recordUsage(ctx1, &tables.UsageCounts{
+		CASCacheHits:               1,
+		LinuxExecutionDurationUsec: 12,
+		TotalCachedActionExecUsec:  123,
+		MemoryGBUsec:               34,
+	})
+	recordUsage(ctx2, &tables.UsageCounts{
+		CASCacheHits:               10,
+		LinuxExecutionDurationUsec: 56,
+		TotalCachedActionExecUsec:  456,
+		MemoryGBUsec:               78,
+	})
 
 	encodedCollection1 := "group_id=GR1&origin=internal&client=bazel"
 	encodedCollection2 := "group_id=GR2&origin=internal&client=bazel"
@@ -138,20 +205,65 @@ func TestUsageTracker_Increment_MultipleGroupsInSameCollectionPeriod(t *testing.
 	collectionsKey := "usage/collections/" + timeStr(period1Start)
 	countsKey1 := "usage/counts/" + timeStr(period1Start) + "/" + encodedCollection1
 	countsKey2 := "usage/counts/" + timeStr(period1Start) + "/" + encodedCollection2
+	expectedKeys := []string{countsKey1, countsKey2, collectionsKey}
+	if *clickhouseEnabled {
+		chCollectionsKey := "usage/v2/collections/" + timeStr(period1Start)
+		chEncodedCollection1 := "group_id=GR1&label=client=bazel&label=origin=internal"
+		chEncodedCollection2 := "group_id=GR2&label=client=bazel&label=origin=internal"
+		chEncodedExecutionCollection1 := "group_id=GR1&label=client=bazel&label=origin=internal&label=os=linux&label=self_hosted=false"
+		chEncodedExecutionCollection2 := "group_id=GR2&label=client=bazel&label=origin=internal&label=os=linux&label=self_hosted=false"
+		chCountsKey1 := "usage/v2/counts/" + timeStr(period1Start) + "/" + chEncodedCollection1
+		chCountsKey2 := "usage/v2/counts/" + timeStr(period1Start) + "/" + chEncodedCollection2
+		chCountsExecutionKey1 := "usage/v2/counts/" + timeStr(period1Start) + "/" + chEncodedExecutionCollection1
+		chCountsExecutionKey2 := "usage/v2/counts/" + timeStr(period1Start) + "/" + chEncodedExecutionCollection2
+		expectedKeys = append(expectedKeys, chCollectionsKey, chCountsKey1, chCountsKey2, chCountsExecutionKey1, chCountsExecutionKey2)
+
+		chCounts1, err := rdb.HGetAll(ctx, chCountsKey1).Result()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"remote_cache.content_addressable_storage.hits":             "1",
+			"remote_cache.action_cache.cached_execution_duration_nanos": "123000",
+		}, chCounts1, "counts should match what we observed")
+		chExecCounts1, err := rdb.HGetAll(ctx, chCountsExecutionKey1).Result()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"remote_execution.execute.worker_duration_nanos":  "12000",
+			"remote_execution.execute.worker_memory_gb_nanos": "34000",
+		}, chExecCounts1, "counts should match what we observed")
+
+		chCounts2, err := rdb.HGetAll(ctx, chCountsKey2).Result()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"remote_cache.content_addressable_storage.hits":             "10",
+			"remote_cache.action_cache.cached_execution_duration_nanos": "456000",
+		}, chCounts2, "counts should match what we observed")
+		chExecCounts2, err := rdb.HGetAll(ctx, chCountsExecutionKey2).Result()
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"remote_execution.execute.worker_duration_nanos":  "56000",
+			"remote_execution.execute.worker_memory_gb_nanos": "78000",
+		}, chExecCounts2, "counts should match what we observed")
+	}
 	require.ElementsMatch(
-		t, []string{countsKey1, countsKey2, collectionsKey}, keys,
+		t, expectedKeys, keys,
 		"redis keys should match expected format")
 
 	counts1, err := rdb.HGetAll(ctx, countsKey1).Result()
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{
-		"cas_cache_hits": "1",
+		"cas_cache_hits":                "1",
+		"linux_execution_duration_usec": "12",
+		"total_cached_action_exec_usec": "123",
+		"memory_gb_usec":                "34",
 	}, counts1, "counts should match what we observed")
 
 	counts2, err := rdb.HGetAll(ctx, countsKey2).Result()
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{
-		"cas_cache_hits": "10",
+		"cas_cache_hits":                "10",
+		"linux_execution_duration_usec": "56",
+		"total_cached_action_exec_usec": "456",
+		"memory_gb_usec":                "78",
 	}, counts2, "counts should match what we observed")
 
 	encodedCollections, err := rdb.SMembers(ctx, collectionsKey).Result()
@@ -172,24 +284,207 @@ func TestUsageTracker_Increment_MultipleGroupsInSameCollectionPeriod(t *testing.
 	// should be finalized up to the second period.
 	assert.Equal(t, []*tables.Usage{
 		{
-			PeriodStartUsec: period1Start.UnixMicro(),
-			GroupID:         "GR1",
-			Region:          "us-west1",
-			UsageCounts: tables.UsageCounts{
-				CASCacheHits: 1,
-			},
-			UsageLabels: *labels,
+			PeriodStartUsec:            period1Start.UnixMicro(),
+			GroupID:                    "GR1",
+			Region:                     "us-west1",
+			CASCacheHits:               1,
+			LinuxExecutionDurationUsec: 12,
+			TotalCachedActionExecUsec:  123,
+			MemoryGBUsec:               34,
+			UsageLabels:                *labels,
 		},
 		{
-			PeriodStartUsec: period1Start.UnixMicro(),
-			GroupID:         "GR2",
-			Region:          "us-west1",
-			UsageCounts: tables.UsageCounts{
-				CASCacheHits: 10,
-			},
-			UsageLabels: *labels,
+			PeriodStartUsec:            period1Start.UnixMicro(),
+			GroupID:                    "GR2",
+			Region:                     "us-west1",
+			CASCacheHits:               10,
+			LinuxExecutionDurationUsec: 56,
+			TotalCachedActionExecUsec:  456,
+			MemoryGBUsec:               78,
+			UsageLabels:                *labels,
 		},
 	}, usages, "data flushed to DB should match expected values")
+
+	if *clickhouseEnabled {
+		olapUsages := queryAllOLAPUsages(t, te)
+		require.Equal(t, []*olaptables.Usage{
+			{
+				GroupID:     "GR1",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteCacheACCachedExecDurationNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin: "internal",
+					sku.Client: "bazel",
+				},
+				Count: 123000,
+			},
+			{
+				GroupID:     "GR1",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteCacheCASHits,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin: "internal",
+					sku.Client: "bazel",
+				},
+				Count: 1,
+			},
+			{
+				GroupID:     "GR1",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteExecutionExecuteWorkerDurationNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin:     "internal",
+					sku.Client:     "bazel",
+					sku.OS:         sku.OSLinux,
+					sku.SelfHosted: sku.SelfHostedFalse,
+				},
+				Count: 12000,
+			},
+			{
+				GroupID:     "GR1",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteExecutionExecuteWorkerMemoryGBNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin:     "internal",
+					sku.Client:     "bazel",
+					sku.OS:         sku.OSLinux,
+					sku.SelfHosted: sku.SelfHostedFalse,
+				},
+				Count: 34000,
+			},
+			{
+				GroupID:     "GR2",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteCacheACCachedExecDurationNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin: "internal",
+					sku.Client: "bazel",
+				},
+				Count: 456000,
+			},
+			{
+				GroupID:     "GR2",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteCacheCASHits,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin: "internal",
+					sku.Client: "bazel",
+				},
+				Count: 10,
+			},
+			{
+				GroupID:     "GR2",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteExecutionExecuteWorkerDurationNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin:     "internal",
+					sku.Client:     "bazel",
+					sku.OS:         sku.OSLinux,
+					sku.SelfHosted: sku.SelfHostedFalse,
+				},
+				Count: 56000,
+			},
+			{
+				GroupID:     "GR2",
+				PeriodStart: period1Start,
+				SKU:         sku.RemoteExecutionExecuteWorkerMemoryGBNanos,
+				Labels: map[sku.LabelName]sku.LabelValue{
+					sku.Origin:     "internal",
+					sku.Client:     "bazel",
+					sku.OS:         sku.OSLinux,
+					sku.SelfHosted: sku.SelfHostedFalse,
+				},
+				Count: 78000,
+			},
+		}, olapUsages)
+	}
+}
+
+func TestClickHouseUsageView_DedupesDuplicateRawUsageRows(t *testing.T) {
+	if !*clickhouseEnabled {
+		t.Skip("ClickHouse is not enabled")
+	}
+
+	te := setupEnv(t)
+	ctx := context.Background()
+
+	// Insert many duplicate RawUsage rows, recreating the labels map with
+	// different capacities and write orders each time. The Usage view should
+	// use RawUsage FINAL to collapse these duplicated flushes to a single row.
+	const numRows = 100
+	rows := make([]*olaptables.RawUsage, 0, numRows)
+	for i := range numRows {
+		labels := make(map[sku.LabelName]sku.LabelValue, i%11)
+		if i%2 == 0 {
+			labels[sku.Client] = "bazel"
+			labels[sku.Origin] = "internal"
+			labels[sku.Server] = "app"
+		} else {
+			labels[sku.Server] = "app"
+			labels[sku.Origin] = "internal"
+			labels[sku.Client] = "bazel"
+		}
+		rows = append(rows, &olaptables.RawUsage{
+			GroupID:     "GR1",
+			PeriodStart: period1Start,
+			SKU:         sku.RemoteCacheCASHits,
+			Labels:      orderedmap.FromMap(labels),
+			BufferID:    "us-west1:redis",
+			Count:       7,
+		})
+	}
+	require.NoError(t, te.GetOLAPDBHandle().FlushUsages(ctx, rows))
+
+	// The Usage view should read RawUsage FINAL and expose one deduped usage
+	// row, not the sum of every duplicate flush.
+	assert.Equal(t, []*olaptables.Usage{
+		{
+			GroupID:     "GR1",
+			PeriodStart: period1Start,
+			SKU:         sku.RemoteCacheCASHits,
+			Labels: map[sku.LabelName]sku.LabelValue{
+				sku.Client: "bazel",
+				sku.Origin: "internal",
+				sku.Server: "app",
+			},
+			Count: 7,
+		},
+	}, queryAllOLAPUsages(t, te))
+}
+
+func TestUsageTracker_Increment_ImpersonationSuppressesUsage(t *testing.T) {
+	clock := clockwork.NewFakeClockAt(period1Start)
+	te := setupEnv(t)
+	ut, err := usage.NewTracker(te, clock, newFlushLock(t, te))
+	require.NoError(t, err)
+
+	// Create an impersonating user context.
+	impersonatingUser := &claims.Claims{
+		UserID:        "US1",
+		GroupID:       "GR1",
+		AllowedGroups: []string{"GR1"},
+		Impersonating: true,
+	}
+	ctx := testauth.WithAuthenticatedUserInfo(context.Background(), impersonatingUser)
+
+	labels := &tables.UsageLabels{Origin: "internal", Client: "bazel"}
+	err = ut.Increment(ctx, labels, &tables.UsageCounts{CASCacheHits: 100})
+	require.NoError(t, err)
+
+	// Flush redis buffer and verify no usage keys were written.
+	err = te.GetMetricsCollector().Flush(context.Background())
+	require.NoError(t, err)
+	rdb := te.GetDefaultRedisClient()
+	keys, err := rdb.Keys(context.Background(), "usage/*").Result()
+	require.NoError(t, err)
+	assert.Empty(t, keys, "no usage data should be written for impersonation requests")
+
+	// Advance clock and flush to DB to confirm nothing is persisted.
+	clock.Advance(2 * periodDuration)
+	err = ut.FlushToDB(context.Background())
+	require.NoError(t, err)
+	usages := queryAllUsages(t, te)
+	assert.Empty(t, usages, "no usage rows should be flushed for impersonation requests")
 }
 
 func TestUsageTracker_Flush_DoesNotFlushUnsettledCollectionPeriods(t *testing.T) {
@@ -227,10 +522,8 @@ func TestUsageTracker_Flush_DoesNotFlushUnsettledCollectionPeriods(t *testing.T)
 			GroupID:         "GR1",
 			Region:          "us-west1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts: tables.UsageCounts{
-				CASCacheHits: 1,
-			},
-			UsageLabels: *labels,
+			CASCacheHits:    1,
+			UsageLabels:     *labels,
 		},
 	}, usages)
 }
@@ -287,7 +580,7 @@ func TestUsageTracker_Flush_ConcurrentAccessAcrossApps(t *testing.T) {
 	clock.Advance(2 * periodDuration)
 
 	eg, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		eg.Go(func() error {
 			ut, err := usage.NewTracker(
 				te, clock,
@@ -317,14 +610,14 @@ func TestUsageTracker_Flush_ConcurrentAccessAcrossApps(t *testing.T) {
 			GroupID:         "GR1",
 			Region:          "us-west1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{CASCacheHits: 1},
+			CASCacheHits:    1,
 			UsageLabels:     *labels,
 		},
 		{
 			GroupID:         "GR1",
 			Region:          "us-west1",
 			PeriodStartUsec: period2Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{CASCacheHits: 1000},
+			CASCacheHits:    1000,
 			UsageLabels:     *labels,
 		},
 	}, usages)
@@ -334,8 +627,7 @@ func TestUsageTracker_Flush_CrossRegion(t *testing.T) {
 	// Set up 2 envs, one for each region. DB should be the same for each, but
 	// Redis instances should be different.
 	te1 := setupEnv(t)
-	te2 := setupEnv(t)
-	te2.SetDBHandle(te1.GetDBHandle())
+	te2 := setupEnv(t, testenv.WithDBHandle(te1.GetDBHandle()))
 	ctx1 := authContext(te1, "US1")
 	ctx2 := authContext(te2, "US1")
 	clock := clockwork.NewFakeClockAt(period1Start)
@@ -370,14 +662,14 @@ func TestUsageTracker_Flush_CrossRegion(t *testing.T) {
 			GroupID:         "GR1",
 			Region:          "europe-north1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{CASCacheHits: 100},
+			CASCacheHits:    100,
 			UsageLabels:     *labels,
 		},
 		{
 			GroupID:         "GR1",
 			Region:          "us-west1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{CASCacheHits: 1},
+			CASCacheHits:    1,
 			UsageLabels:     *labels,
 		},
 	}, usages)
@@ -445,22 +737,23 @@ func TestUsageTracker_UsageLabels_Basic(t *testing.T) {
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
+			Invocations:     1,
 			UsageLabels:     tables.UsageLabels{},
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 2},
-			UsageLabels:     tables.UsageLabels{Client: "bazel"},
+			Invocations:     2,
+			Client:          "bazel",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "executor", Origin: "internal"},
+			Invocations:     1,
+			Client:          "executor",
+			Origin:          "internal",
 		},
 	}, usages)
 
@@ -487,36 +780,37 @@ func TestUsageTracker_UsageLabels_Basic(t *testing.T) {
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
+			Invocations:     1,
 			UsageLabels:     tables.UsageLabels{},
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 2},
-			UsageLabels:     tables.UsageLabels{Client: "bazel"},
+			Invocations:     2,
+			Client:          "bazel",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "executor", Origin: "internal"},
+			Invocations:     1,
+			Client:          "executor",
+			Origin:          "internal",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period3Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "bazel"},
+			Invocations:     1,
+			Client:          "bazel",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period3Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "executor"},
+			Invocations:     1,
+			Client:          "executor",
 		},
 	}, usages)
 }
@@ -560,7 +854,7 @@ func TestUsageTracker_UsageLabels_AllFieldsAreMapped(t *testing.T) {
 	require.NoError(t, err)
 	clock.Advance(2 * periodDuration)
 	var eg errgroup.Group
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		eg.Go(func() error {
 			err := ut.FlushToDB(ctx)
 			require.NoError(t, err)
@@ -577,36 +871,64 @@ func TestUsageTracker_UsageLabels_AllFieldsAreMapped(t *testing.T) {
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
+			Invocations:     1,
 			UsageLabels:     tables.UsageLabels{},
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Origin: "Origin-TestValue1"},
+			Invocations:     1,
+			Proxy:           "Proxy-TestValue1",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Origin: "Origin-TestValue2"},
+			Invocations:     1,
+			Proxy:           "Proxy-TestValue2",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "Client-TestValue1"},
+			Invocations:     1,
+			Origin:          "Origin-TestValue1",
 		},
 		{
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Client: "Client-TestValue2"},
+			Invocations:     1,
+			Origin:          "Origin-TestValue2",
+		},
+		{
+			Region:          "us-west1",
+			GroupID:         "GR1",
+			PeriodStartUsec: period1Start.UnixMicro(),
+			Invocations:     1,
+			Server:          "Server-TestValue1",
+		},
+		{
+			Region:          "us-west1",
+			GroupID:         "GR1",
+			PeriodStartUsec: period1Start.UnixMicro(),
+			Invocations:     1,
+			Server:          "Server-TestValue2",
+		},
+		{
+			Region:          "us-west1",
+			GroupID:         "GR1",
+			PeriodStartUsec: period1Start.UnixMicro(),
+			Invocations:     1,
+			Client:          "Client-TestValue1",
+		},
+		{
+			Region:          "us-west1",
+			GroupID:         "GR1",
+			PeriodStartUsec: period1Start.UnixMicro(),
+			Invocations:     1,
+			Client:          "Client-TestValue2",
 		},
 	}, usages)
 }
@@ -646,8 +968,8 @@ func TestUsageTracker_UsageLabels_UnrecognizedLabelsAreNotFlushed(t *testing.T) 
 			Region:          "us-west1",
 			GroupID:         "GR1",
 			PeriodStartUsec: period1Start.UnixMicro(),
-			UsageCounts:     tables.UsageCounts{Invocations: 1},
-			UsageLabels:     tables.UsageLabels{Origin: "internal"},
+			Invocations:     1,
+			Origin:          "internal",
 		},
 	}, usages)
 }
@@ -655,8 +977,8 @@ func TestUsageTracker_UsageLabels_UnrecognizedLabelsAreNotFlushed(t *testing.T) 
 func increasingCountsStartingAt(value int64) *tables.UsageCounts {
 	counts := &tables.UsageCounts{}
 	countsValue := reflect.ValueOf(counts).Elem()
-	for i := 0; i < countsValue.NumField(); i++ {
-		countsValue.Field(i).Set(reflect.ValueOf(value))
+	for _, field := range countsValue.Fields() {
+		field.Set(reflect.ValueOf(value))
 		value++
 	}
 	return counts

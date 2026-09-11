@@ -3,15 +3,18 @@ package invocation_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/buildbuddy_enterprise"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testexecutor"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testbazel"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/webtester"
 	"github.com/buildbuddy-io/buildbuddy/server/util/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,9 +22,8 @@ func TestAuthenticatedInvocation_CacheEnabled(t *testing.T) {
 	wt := webtester.New(t)
 	target := buildbuddy_enterprise.SetupWebTarget(t)
 
-	workspacePath := testbazel.MakeTempWorkspace(t, map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
+	workspacePath := testbazel.MakeTempModule(t, map[string]string{
+		"BUILD": `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
 	})
 	buildArgs := []string{
 		"//:a",
@@ -134,9 +136,8 @@ func TestAuthenticatedInvocation_PersonalAPIKey_CacheEnabled(t *testing.T) {
 	wt := webtester.New(t)
 	target := buildbuddy_enterprise.SetupWebTarget(t)
 
-	workspacePath := testbazel.MakeTempWorkspace(t, map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
+	workspacePath := testbazel.MakeTempModule(t, map[string]string{
+		"BUILD": `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
 	})
 	buildArgs := []string{
 		"//:a",
@@ -172,7 +173,7 @@ func TestAuthenticatedInvocation_PersonalAPIKey_CacheEnabled(t *testing.T) {
 	}
 	wt.Find(`.api-key-value-hide`).Click()
 	apiKey := ""
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		apiKey = wt.Find(".api-key-value").Text()
 		if !strings.Contains(apiKey, "••••") {
 			break
@@ -229,13 +230,20 @@ func TestAuthenticatedInvocation_PersonalAPIKey_CacheEnabled(t *testing.T) {
 }
 
 func TestInvocationWithRemoteExecution(t *testing.T) {
+	// TODO: make this test work in dev QA, using dev executors.
+	buildbuddy_enterprise.MarkTestLocalOnly(t)
+
 	ctx := context.Background()
 	wt := webtester.New(t)
-	target := buildbuddy_enterprise.SetupWebTarget(t)
+	target := buildbuddy_enterprise.SetupWebTarget(
+		t,
+		"--remote_execution.enable_remote_exec=true",
+	)
+	// Register an executor so that we can test RBE end-to-end.
+	_ = testexecutor.Run(t, "--executor.app_target="+target.GRPCAddress())
 
-	workspacePath := testbazel.MakeTempWorkspace(t, map[string]string{
-		"WORKSPACE": "",
-		"BUILD":     `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
+	workspacePath := testbazel.MakeTempModule(t, map[string]string{
+		"BUILD": `genrule(name = "a", outs = ["a.sh"], cmd_bash = "touch $@")`,
 	})
 	buildArgs := []string{
 		"//:a",
@@ -267,8 +275,28 @@ func TestInvocationWithRemoteExecution(t *testing.T) {
 	row := rows[0]
 	require.Contains(t, row.Text(), "genrule-setup.sh", "row should show command snippet")
 
-	// TODO: run an actual executor, and make sure we can click through to the
-	// action page and see the action
+	// Click through to the action page
+	row.Click()
+
+	// The ExecuteResponse is cached in the background after the invocation
+	// completes; refresh the page until the ExecuteResponse is cached.
+	actionResultFound := false
+	for i := range 8 {
+		textContent := wt.Find(".invocation-action-card .content").Text()
+		if !strings.Contains(textContent, "Action result not found") {
+			actionResultFound = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond * time.Duration(math.Pow(2, float64(i))))
+		wt.Refresh()
+	}
+	require.True(t, actionResultFound, "Cached action result was not found")
+
+	// Verify that a few basic details are present.
+	textContent := wt.Find(".invocation-action-card .content").Text()
+	assert.Regexp(t, `Cacheable\s+Yes`, textContent, "Action details should be present")
+	assert.Regexp(t, `Served from cache\s+No`, textContent, "ActionResult details should be present")
+	assert.Regexp(t, `MilliCPU:\s+\d+`, textContent, "ExecutedActionMetadata details should be present")
 }
 
 type CacheRequestRow struct {

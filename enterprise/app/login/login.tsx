@@ -1,16 +1,17 @@
+import { ArrowRight, Lock, User } from "lucide-react";
 import React from "react";
+import alertService from "../../../app/alert/alert_service";
 import authService from "../../../app/auth/auth_service";
 import capabilities from "../../../app/capabilities/capabilities";
+import Input from "../../../app/components/input/input";
+import error_service from "../../../app/errors/error_service";
+import { GithubIcon } from "../../../app/icons/github";
+import { GoogleIcon } from "../../../app/icons/google";
 import router from "../../../app/router/router";
 import rpcService from "../../../app/service/rpc_service";
-import Input from "../../../app/components/input/input";
-import alertService from "../../../app/alert/alert_service";
-import { grp } from "../../../proto/group_ts_proto";
-import { ArrowRight, Lock, User } from "lucide-react";
 import popup from "../../../app/util/popup";
-import error_service from "../../../app/errors/error_service";
-import { GoogleIcon } from "../../../app/icons/google";
-import { GithubIcon } from "../../../app/icons/github";
+import { tryParseURL } from "../../../app/util/url";
+import { grp } from "../../../proto/group_ts_proto";
 
 interface State {
   loading: boolean;
@@ -41,21 +42,21 @@ export default class LoginComponent extends React.Component<Props, State> {
   }
 
   isJoiningOrg() {
-    return window.location.pathname.startsWith("/join/");
+    return capabilities.config.groupMembershipRequestsEnabled && window.location.pathname.startsWith("/join/");
   }
 
   isOrgSpecific() {
-    return this.isJoiningOrg() || capabilities.config.customerSubdomain;
+    return this.isJoiningOrg() || capabilities.config.defaultLoginSlug || capabilities.config.customerSubdomain;
   }
 
   getUrlSlug() {
     if (this.isJoiningOrg()) {
       return window.location.pathname.split("/").pop();
     }
-    if (this.isOrgSpecific()) {
+    if (this.isOrgSpecific() && capabilities.config.customerSubdomain) {
       return window.location.host.split(".")[0];
     }
-    return "";
+    return capabilities.config.defaultLoginSlug;
   }
 
   async fetchOrgName() {
@@ -126,12 +127,18 @@ export default class LoginComponent extends React.Component<Props, State> {
   isGoogleConfigured() {
     return (
       capabilities.config.configuredIssuers.length &&
-      capabilities.config.configuredIssuers[0].includes("accounts.google.com")
+      tryParseURL(capabilities.config.configuredIssuers[0])?.hostname === "accounts.google.com"
     );
   }
   isOktaConfigured() {
+    if (!capabilities.config.configuredIssuers.length) {
+      return false;
+    }
+    const issuerURL = tryParseURL(capabilities.config.configuredIssuers[0]);
     return (
-      capabilities.config.configuredIssuers.length && capabilities.config.configuredIssuers[0].includes("okta.com")
+      issuerURL?.hostname === "okta.com" ||
+      // subdomains of "okta.com" are also acceptable.
+      issuerURL?.hostname.endsWith(".okta.com")
     );
   }
 

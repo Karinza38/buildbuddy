@@ -40,12 +40,15 @@ If you want to test workflows locally with firecracker, make sure to set
 You can run Firecracker in debug mode to see more detailed
 VM logs, including logs from the init binary and vmexec server.
 
-To run in debug mode, set `--executor.firecracker_debug_mode=true`
-on the executor, or pass `--test_arg=--executor.firecracker_debug_mode=true`
+To run in debug mode, set `--executor.firecracker_debug_stream_vm_logs=true`
+on the executor, or pass `--test_arg=--executor.firecracker_debug_stream_vm_logs=true`
 to `bazel test`.
 
 It's useful to use debug mode whenever the executor can't connect
 to the VM (indicating the VM might have crashed).
+
+You can also stream test outputs to stdout with `--debug_stream_command_outputs`
+passed either to the executor or as part of `--test_arg=...`.
 
 ### SSH into a VM
 
@@ -125,7 +128,7 @@ shows the directories relevant to a firecracker container instance:
         # For ext4 images, the top-level directory is the sha256 of the
         # image name string.
         #
-        # See enterprise/server/util/ociconv/ociconv.go
+        # See enterprise/server/oci/ociconv/ociconv.go
         #
         # Ex: sha256("gcr.io/flame-public/executor-docker-default:latest")
         - /1f89a08e2136061a0bf54aaea89e47b533504b4241a5ff98d96c3dcbe04a67f3/:
@@ -144,7 +147,7 @@ shows the directories relevant to a firecracker container instance:
         # For other VM resources, the dir name is the sha256 of the file
         # contents and the dir contains a single file matching that sha256.
         #
-        # See putFileIntoDir() in enterprise/server/util/ociconv/ociconv.go
+        # See putFileIntoDir() in enterprise/server/oci/ociconv/ociconv.go
         #
         # Ex: sha256(fileContents("vmlinux"))
         - /fc81fa0933db7977b5e1d4b9ff3a757914b579c7812b63f9cdcabc035c7057e0/:

@@ -1,29 +1,45 @@
 package scheduler_client
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"flag"
+	"fmt"
+	"html/template"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor_auth"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executorplatform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/priority_task_scheduler"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/scheduling/task_leaser"
+	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+	"github.com/buildbuddy-io/buildbuddy/server/util/redact"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
 	"github.com/buildbuddy-io/buildbuddy/server/version"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 )
 
-var pool = flag.String("executor.pool", "", "Executor pool name. Only one of this config option or the MY_POOL environment variable should be specified.")
+var (
+	pool                         = flag.String("executor.pool", "", "Executor pool name. Only one of this config option or the MY_POOL environment variable should be specified.")
+	labels                       = flag.Map[string, string]("executor.labels", map[string]string{}, "Optional labels identifying this executor, similar to Kubernetes labels (e.g. 'canary=true,experiment-ramfs=control,region=us-east1'). Reported to the scheduler at registration and used for server-side debug routing via the 'debug-executor-labels' platform property.")
+	xcodeSimulatorRuntimes       = flag.Slice("executor.xcode_simulator_runtimes", []string{}, "Optional Xcode Simulator Runtime strings to report in executor metadata.")
+	proactiveCancellationEnabled = flag.Bool("executor.proactive_cancellation_enabled", false, "Whether the executor supports proactive task cancellation.", flag.Internal)
+)
 
 const (
 	schedulerCheckInInterval         = 5 * time.Second
@@ -34,6 +50,19 @@ const (
 	// itself controls how long the executor will backoff after requesting
 	// more work, so this timeout is only used on the initial call.
 	idleExecutorMoreWorkTimeout = 5 * time.Second
+
+	// Limits on the labels reported to the scheduler. Registration fails if a
+	// key or value is longer than maxLabelLen, or if there are more than
+	// maxLabels labels.
+	maxLabels   = 20
+	maxLabelLen = 50
+)
+
+var (
+	// Caching for parsed command-line flags, to avoid racing against config
+	// reparsing logic in config.go.
+	registerReloadHookOnce sync.Once
+	configuredFlagsCache   atomic.Pointer[[]string]
 )
 
 // Options provide overrides for executor registration properties.
@@ -42,9 +71,18 @@ type Options struct {
 	HostnameOverride string
 	// TESTING ONLY: overrides the API key sent by the client
 	APIKeyOverride string
+
+	// FilecacheMaxSizeBytes is the configured maximum local filecache size.
+	// If set to 0, the local filecache is disabled.
+	FilecacheMaxSizeBytes *int64
+	// WarmupImages are the container images configured to warm up during
+	// executor startup.
+	WarmupImages []*scpb.WarmupImage
+	// StartTime is when the executor process started.
+	StartTime *timestamppb.Timestamp
 }
 
-func makeExecutionNode(pool, executorID, executorHostID string, options *Options) (*scpb.ExecutionNode, error) {
+func makeExecutionNode(pool, executorID, executorHostID string, xcodeLocator interfaces.XcodeLocator, options *Options) (*scpb.ExecutionNode, error) {
 	hostname := options.HostnameOverride
 	if hostname == "" {
 		resHostname, err := resources.GetMyHostname()
@@ -53,19 +91,58 @@ func makeExecutionNode(pool, executorID, executorHostID string, options *Options
 		}
 		hostname = resHostname
 	}
+
+	// Get supported isolation types from platform configuration
+	executorProps := executorplatform.GetExecutorProperties()
+	supportedTypes := make([]string, 0, len(executorProps.SupportedIsolationTypes))
+	for _, t := range executorProps.SupportedIsolationTypes {
+		supportedTypes = append(supportedTypes, string(t))
+	}
+
+	customResources, err := resources.GetAllocatedCustomResources()
+	if err != nil {
+		return nil, err
+	}
+	if len(*labels) > maxLabels {
+		return nil, status.InvalidArgumentErrorf("too many executor labels: %d (max %d)", len(*labels), maxLabels)
+	}
+	trimmedLabels := make(map[string]string, len(*labels))
+	for k, v := range *labels {
+		key := strings.TrimSpace(k)
+		val := strings.TrimSpace(v)
+		if len(key) > maxLabelLen {
+			return nil, status.InvalidArgumentErrorf("executor label key %q is too long: %d chars (max %d)", key, len(key), maxLabelLen)
+		}
+		if len(val) > maxLabelLen {
+			return nil, status.InvalidArgumentErrorf("executor label value %q is too long: %d chars (max %d)", val, len(val), maxLabelLen)
+		}
+		trimmedLabels[key] = val
+	}
 	return &scpb.ExecutionNode{
 		Host: hostname,
 		// TODO: stop setting port once the scheduler no longer requires it.
 		Port:                      1,
 		AssignableMemoryBytes:     resources.GetAllocatedRAMBytes(),
 		AssignableMilliCpu:        resources.GetAllocatedCPUMillis(),
-		AssignableCustomResources: resources.GetAllocatedCustomResources(),
-		Os:                        resources.GetOS(),
+		AssignableDiskBytes:       resources.GetAllocatedDiskBytes(),
+		AssignableCustomResources: customResources,
+		OsFamily:                  resources.GetOSFamily(),
+		OsDisplayName:             resources.GetOSDisplayName(),
 		Arch:                      resources.GetArch(),
 		Pool:                      strings.ToLower(pool),
 		Version:                   version.Tag(),
 		ExecutorId:                executorID,
 		ExecutorHostId:            executorHostID,
+		SupportedIsolationTypes:   supportedTypes,
+		CurrentQueueLength:        0,
+		XcodeVersions:             xcodeLocator.Versions(),
+		XcodeSimulatorRuntimes:    *xcodeSimulatorRuntimes,
+		// TODO: hard-code this to true once it's battle-tested.
+		SupportsProactiveCancellation: *proactiveCancellationEnabled,
+		WarmupImages:                  options.WarmupImages,
+		FilecacheMaxSizeBytes:         options.FilecacheMaxSizeBytes,
+		StartTime:                     options.StartTime,
+		Labels:                        trimmedLabels,
 	}, nil
 }
 
@@ -85,9 +162,11 @@ type Registration struct {
 	apiKey          string
 	shutdownSignal  chan struct{}
 
-	mu          sync.Mutex
-	connected   bool
-	idleSeconds atomic.Int64
+	mu             sync.Mutex
+	connected      bool
+	idleSeconds    atomic.Int64
+	paused         atomic.Bool
+	updateRunState chan bool
 }
 
 func (r *Registration) getConnected() bool {
@@ -103,17 +182,64 @@ func (r *Registration) setConnected(connected bool) {
 }
 
 func (r *Registration) Check(ctx context.Context) error {
-	if r.getConnected() {
+	paused := r.paused.Load()
+	if paused || r.getConnected() {
 		return nil
 	}
 	return errors.New("not registered to scheduler yet")
 }
 
-func (r *Registration) processWorkStream(ctx context.Context, stream scpb.Scheduler_RegisterAndStreamWorkClient, schedulerMsgs chan *scpb.RegisterAndStreamWorkResponse, schedulerErr chan error, registrationTicker, requestMoreWorkTicker *time.Ticker) (bool, error) {
-	registrationMsg := &scpb.RegisterAndStreamWorkRequest{
-		RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: r.node},
-	}
+const templateContent = `
+<div>
+  <input type="checkbox" id="paused" {{if .Paused}}checked{{end}}>
+  <label for="paused">Pause scheduling (stop accepting new work)</label>
+  <script>
+     const checkbox = document.getElementById("paused");
+     checkbox.addEventListener('change', (event) => {
+       fetch("/statusz/scheduler_client", {
+           method: "POST",
+	   headers:{
+	       "Content-Type": "application/x-www-form-urlencoded",
+	   },
+	   body: new URLSearchParams({"pause": event.currentTarget.checked ? "true" : "false" }),
+       })
+      .then(response => { window.alert("Changes applied"); console.log(response); })
+      .catch(e => window.alert("Fetch failed: " + String(e)));
+    });
+  </script>
+</div>`
 
+var statusTemplate = template.Must(template.New("scheduler_client").Parse(templateContent))
+
+func (r *Registration) Statusz(ctx context.Context) string {
+	data := struct {
+		Paused bool
+	}{
+		Paused: r.paused.Load(),
+	}
+	buf := &bytes.Buffer{}
+	if err := statusTemplate.Execute(buf, data); err != nil {
+		return fmt.Sprintf("Failed to execute template: %s", err)
+	}
+	return buf.String()
+}
+
+func (r *Registration) ServeStatusz(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := req.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	paused := req.FormValue("pause") == "true"
+	r.updateRunState <- !paused
+	r.paused.Store(paused)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (r *Registration) processWorkStream(ctx context.Context, stream scpb.Scheduler_RegisterAndStreamWorkClient, schedulerMsgs chan *scpb.RegisterAndStreamWorkResponse, schedulerErr chan error, registrationTicker, requestMoreWorkTicker *time.Ticker) (bool, error) {
 	select {
 	case <-ctx.Done():
 		log.Debugf("Context cancelled, cancelling node registration.")
@@ -139,9 +265,13 @@ func (r *Registration) processWorkStream(ctx context.Context, stream scpb.Schedu
 			requestMoreWorkTicker.Reset(moreWorkResponse.GetDelay().AsDuration())
 			return false, nil
 		}
+		if cancellationRequest := msg.GetCancelTaskReservationRequest(); cancellationRequest != nil {
+			r.taskScheduler.CancelTaskReservation(ctx, cancellationRequest.GetTaskId())
+			return false, nil
+		}
 		if msg.EnqueueTaskReservationRequest == nil {
 			out, _ := prototext.Marshal(msg)
-			return false, status.FailedPreconditionErrorf("message from scheduler did not contain a task reservation request:\n%s", string(out))
+			return false, status.FailedPreconditionErrorf("message from scheduler did not contain a supported payload type:\n%s", string(out))
 		}
 		requestMoreWorkTicker.Reset(idleExecutorMoreWorkTimeout)
 		rsp, err := r.taskScheduler.EnqueueTaskReservation(ctx, msg.GetEnqueueTaskReservationRequest())
@@ -157,7 +287,9 @@ func (r *Registration) processWorkStream(ctx context.Context, stream scpb.Schedu
 	case err := <-schedulerErr:
 		return false, status.WrapError(err, "failed to receive message from scheduler")
 	case <-registrationTicker.C:
-		if err := stream.Send(registrationMsg); err != nil {
+		if err := stream.Send(&scpb.RegisterAndStreamWorkRequest{
+			RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: r.nodeWithStats()},
+		}); err != nil {
 			return false, status.UnavailableErrorf("could not send registration message: %s", err)
 		}
 	case <-requestMoreWorkTicker.C:
@@ -198,10 +330,6 @@ func (r *Registration) monitorExcessCapacity(ctx context.Context) {
 // maintainRegistrationAndStreamWork maintains registration with a scheduler server using the newer
 // RegisterAndStreamWork API which supports both registration and task reservations.
 func (r *Registration) maintainRegistrationAndStreamWork(ctx context.Context) {
-	registrationMsg := &scpb.RegisterAndStreamWorkRequest{
-		RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: r.node},
-	}
-
 	defer r.setConnected(false)
 
 	registrationTicker := time.NewTicker(schedulerCheckInInterval)
@@ -219,7 +347,9 @@ func (r *Registration) maintainRegistrationAndStreamWork(ctx context.Context) {
 			}
 			continue
 		}
-		if err := stream.Send(registrationMsg); err != nil {
+		if err := stream.Send(&scpb.RegisterAndStreamWorkRequest{
+			RegisterExecutorRequest: &scpb.RegisterExecutorRequest{Node: r.nodeWithStats()},
+		}); err != nil {
 			log.Errorf("error registering node with scheduler: %s, will retry...", err)
 			continue
 		}
@@ -264,6 +394,16 @@ func (r *Registration) maintainRegistrationAndStreamWork(ctx context.Context) {
 	}
 }
 
+func (r *Registration) nodeWithStats() *scpb.ExecutionNode {
+	n := proto.Clone(r.node).(*scpb.ExecutionNode)
+	n.CurrentQueueLength = int32(r.taskScheduler.QueueLength())
+	n.ActiveActionCount = int32(r.taskScheduler.ActiveTaskCount())
+	if flags := configuredFlagsCache.Load(); flags != nil {
+		n.ConfiguredFlags = *flags
+	}
+	return n
+}
+
 // Start registers the executor with the scheduler and maintains that registration until the context is cancelled.
 func (r *Registration) Start(ctx context.Context) {
 	if r.apiKey != "" {
@@ -271,8 +411,41 @@ func (r *Registration) Start(ctx context.Context) {
 	}
 
 	go func() {
-		r.maintainRegistrationAndStreamWork(ctx)
+		r.watchRunState(ctx)
 	}()
+
+	r.updateRunState <- true
+}
+
+func (r *Registration) watchRunState(rootContext context.Context) {
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(rootContext)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			cancel()
+			return
+		case running := <-r.updateRunState:
+			// Always cancel first
+			cancel()
+			wg.Wait()
+			ctx, cancel = context.WithCancel(rootContext)
+
+			// Restart if it should be running
+			if running {
+				wg.Go(func() {
+					r.maintainRegistrationAndStreamWork(ctx)
+				})
+			}
+		}
+	}
+}
+
+func refreshConfiguredFlags() {
+	flags := redact.GetConfiguredFlags()
+	configuredFlagsCache.Store(&flags)
 }
 
 // NewRegistration creates a handle to maintain registration with a scheduler server.
@@ -284,14 +457,19 @@ func NewRegistration(env environment.Env, taskScheduler *priority_task_scheduler
 	} else if resources.GetPoolName() != "" {
 		log.Fatal("Only one of the `MY_POOL` environment variable and `executor.pool` config option may be set")
 	}
-	node, err := makeExecutionNode(poolName, executorID, executorHostID, options)
+	node, err := makeExecutionNode(poolName, executorID, executorHostID, env.GetXcodeLocator(), options)
 	if err != nil {
 		return nil, status.InternalErrorf("Error determining node properties: %s", err)
 	}
-	apiKey := task_leaser.APIKey()
+	apiKey := executor_auth.APIKey()
 	if options.APIKeyOverride != "" {
 		apiKey = options.APIKeyOverride
 	}
+	// Register the config-reload hook and parse the current flags.
+	registerReloadHookOnce.Do(func() {
+		config.OnReload(refreshConfiguredFlags)
+	})
+	refreshConfiguredFlags()
 
 	shutdownSignal := make(chan struct{})
 	env.GetHealthChecker().RegisterShutdownFunction(func(ctx context.Context) error {
@@ -305,7 +483,9 @@ func NewRegistration(env environment.Env, taskScheduler *priority_task_scheduler
 		node:            node,
 		apiKey:          apiKey,
 		shutdownSignal:  shutdownSignal,
+		updateRunState:  make(chan bool),
 	}
 	env.GetHealthChecker().AddHealthCheck("registered_to_scheduler", registration)
+	statusz.AddSection("scheduler_client", "Remote execution scheduler client", registration)
 	return registration, nil
 }

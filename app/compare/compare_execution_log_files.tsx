@@ -1,15 +1,12 @@
+import { ArrowRight, File, FileSymlink } from "lucide-react";
 import React from "react";
-import Select, { Option } from "../components/select/select";
-import rpcService from "../service/rpc_service";
-import { OutlinedButton } from "../components/button/button";
-import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import { tools } from "../../proto/spawn_ts_proto";
-import format from "../format/format";
-import error_service from "../errors/error_service";
-import * as varint from "varint";
-import { ArrowRight, File } from "lucide-react";
+import { OutlinedButton } from "../components/button/button";
 import DigestComponent from "../components/digest/digest";
 import Link from "../components/link/link";
+import Select, { Option } from "../components/select/select";
+import error_service from "../errors/error_service";
+import format from "../format/format";
 import InvocationModel from "../invocation/invocation_model";
 
 interface Props {
@@ -48,15 +45,6 @@ export default class CompareExecutionLogFilesComponent extends React.Component<P
     }
   }
 
-  getExecutionLogFile(model: InvocationModel): build_event_stream.File | undefined {
-    return model.buildToolLogs?.log.find(
-      (log: build_event_stream.File) =>
-        (log.name == "execution.log" || log.name == "execution_log.binpb.zst") &&
-        log.uri &&
-        Boolean(log.uri.startsWith("bytestream://"))
-    );
-  }
-
   fetchLogs() {
     if (!this.state.logA) {
       this.fetchLog(this.props.modelA)
@@ -75,47 +63,26 @@ export default class CompareExecutionLogFilesComponent extends React.Component<P
   fetchLog(model?: InvocationModel) {
     if (!model) return Promise.resolve(undefined);
 
-    if (!this.getExecutionLogFile(model)) {
+    if (!model.hasExecutionLog()) {
       this.setState({ loading: false });
     }
 
-    let logFile = this.getExecutionLogFile(model);
-    if (!logFile?.uri) return Promise.resolve(undefined);
-
-    const init = {
-      // Set the stored encoding header to prevent the server from double-compressing.
-      headers: { "X-Stored-Encoding-Hint": "zstd" },
-    };
-
     this.setState({ loading: true });
-    return rpcService
-      .fetchBytestreamFile(logFile.uri, model.getInvocationId(), "arraybuffer", { init })
-      .then(async (body) => {
-        let entries: tools.protos.ExecLogEntry[] = [];
-        let byteArray = new Uint8Array(body);
-        for (var offset = 0; offset < body.byteLength; ) {
-          let length = varint.decode(byteArray, offset);
-          let bytes = varint.decode.bytes || 0;
-          offset += bytes;
-          entries.push(tools.protos.ExecLogEntry.decode(byteArray.subarray(offset, offset + length)));
-          offset += length;
-        }
-        return entries;
-      });
+    return model.getExecutionLog();
   }
 
   sort(
-    a: { a: tools.protos.ExecLogEntry; b: tools.protos.ExecLogEntry },
-    b: { a: tools.protos.ExecLogEntry; b: tools.protos.ExecLogEntry }
+    a: { a: tools.protos.ExecLogEntry.File; b: tools.protos.ExecLogEntry.File },
+    b: { a: tools.protos.ExecLogEntry.File; b: tools.protos.ExecLogEntry.File }
   ): number {
     let first = this.state.direction == "asc" ? a : b;
     let second = this.state.direction == "asc" ? b : a;
 
     switch (this.state.sort) {
       case "size":
-        return +(first.a.file?.digest?.sizeBytes || 0) - +(second.a.file?.digest?.sizeBytes || 0);
+        return +(first.a.digest?.sizeBytes || 0) - +(second.a.digest?.sizeBytes || 0);
       case "path":
-        return (first.a.file?.path || "").localeCompare(second.a.file?.path || "");
+        return (first.a.path || "").localeCompare(second.a.path || "");
     }
     return 0;
   }
@@ -179,33 +146,84 @@ export default class CompareExecutionLogFilesComponent extends React.Component<P
       return <div className="invocation-execution-empty-state">No execution log actions for this invocation.</div>;
     }
 
-    const filesA = this.state.logA?.filter((l) => l.type == "file") || [];
-    const filesB = this.state.logB?.filter((l) => l.type == "file") || [];
+    const filesA = this.state.logA?.filter((l) => l.type == "file" && l.file).map((l) => l.file!) || [];
+    const filesB = this.state.logB?.filter((l) => l.type == "file" && l.file).map((l) => l.file!) || [];
 
-    let newFiles: tools.protos.ExecLogEntry[] = [];
-    let unchangdFiles: tools.protos.ExecLogEntry[] = [];
-    let deletedFiles: tools.protos.ExecLogEntry[] = [];
-    let changedFiles: { a: tools.protos.ExecLogEntry; b: tools.protos.ExecLogEntry }[] = [];
+    const dirsA = this.state.logA?.filter((l) => l.type == "directory" && l.directory).map((l) => l.directory!) || [];
+    const dirsB = this.state.logB?.filter((l) => l.type == "directory" && l.directory).map((l) => l.directory!) || [];
 
-    let fileMap = new Map<string, tools.protos.ExecLogEntry>();
+    for (let dir of dirsA) {
+      for (let file of dir.files) {
+        if (!file.path.startsWith(dir.path + "/")) {
+          file.path = dir.path + "/" + file.path;
+        }
+        filesA.push(file);
+      }
+    }
+
+    for (let dir of dirsB) {
+      for (let file of dir.files) {
+        if (!file.path.startsWith(dir.path + "/")) {
+          file.path = dir.path + "/" + file.path;
+        }
+        filesB.push(file);
+      }
+    }
+
+    const symlinksA =
+      this.state.logA
+        ?.filter((l) => l.type == "unresolvedSymlink" && l.unresolvedSymlink)
+        .map((l) => l.unresolvedSymlink!) || [];
+
+    const symlinksB =
+      this.state.logB
+        ?.filter((l) => l.type == "unresolvedSymlink" && l.unresolvedSymlink)
+        .map((l) => l.unresolvedSymlink!) || [];
+
+    for (let symlink of symlinksA) {
+      filesA.push(
+        new tools.protos.ExecLogEntry.File({
+          path: symlink.path,
+          // Little hack to make symlinks comparable in the existing UI.
+          digest: new tools.protos.Digest({ hash: symlink.targetPath, hashFunctionName: "symlink" }),
+        })
+      );
+    }
+
+    for (let symlink of symlinksB) {
+      filesB.push(
+        new tools.protos.ExecLogEntry.File({
+          path: symlink.path,
+          // Little hack to make symlinks comparable in the existing UI.
+          digest: new tools.protos.Digest({ hash: symlink.targetPath, hashFunctionName: "symlink" }),
+        })
+      );
+    }
+
+    let newFiles: tools.protos.ExecLogEntry.File[] = [];
+    let unchangdFiles: tools.protos.ExecLogEntry.File[] = [];
+    let deletedFiles: tools.protos.ExecLogEntry.File[] = [];
+    let changedFiles: { a: tools.protos.ExecLogEntry.File; b: tools.protos.ExecLogEntry.File }[] = [];
+
+    let fileMap = new Map<string, tools.protos.ExecLogEntry.File>();
     for (let a of filesA) {
-      fileMap.set(a.file?.path || "", a);
+      fileMap.set(a.path || "", a);
     }
 
     for (let b of filesB) {
-      let a = fileMap.get(b.file?.path || "");
+      let a = fileMap.get(b.path || "");
       if (!a) {
         newFiles.push(b);
         continue;
       }
-      if (a && a.file?.digest?.hash != b.file?.digest?.hash) {
+      if (a && a.digest?.hash != b.digest?.hash) {
         changedFiles.push({ a, b });
-        fileMap.delete(b.file?.path || "");
+        fileMap.delete(b.path || "");
         continue;
       }
-      if (a && a.file?.digest?.hash == b.file?.digest?.hash) {
+      if (a && a.digest?.hash == b.digest?.hash) {
         unchangdFiles.push(b);
-        fileMap.delete(b.file?.path || "");
+        fileMap.delete(b.path || "");
         continue;
       }
     }
@@ -259,24 +277,24 @@ export default class CompareExecutionLogFilesComponent extends React.Component<P
                 .slice(0, this.state.limit)
                 .map((diff) => (
                   <Link
-                    key={diff.a.id}
+                    key={diff.a.path}
                     className="invocation-execution-row invocation-execution-row-file"
                     href={this.getCompareUrl(
                       this.props.modelA,
-                      diff.a.file?.digest!,
-                      diff.a.file?.path!,
+                      diff.a.digest!,
+                      diff.a.path!,
                       this.props.modelB,
-                      diff.b.file?.digest!,
-                      diff.b.file?.path!
+                      diff.b.digest!,
+                      diff.b.path!
                     )}>
                     <div className="invocation-execution-row-image">
-                      <File className="icon" />
+                      {diff.a.digest?.hashFunctionName == "symlink" ? <FileSymlink /> : <File />}
                     </div>
                     <div className="invocation-execution-row-header">
-                      <span className="invocation-execution-row-header-status">{diff.a.file?.path}</span>
-                      {diff.a.file?.digest && <DigestComponent digest={diff.a.file.digest} expanded={false} />}
-                      <ArrowRight className="icon" />
-                      {diff.b.file?.digest && <DigestComponent digest={diff.b.file.digest} expanded={false} />}
+                      <span className="invocation-execution-row-header-status">{diff.a.path}</span>
+                      {diff.a.digest && <DigestComponent digest={diff.a.digest} expanded={false} />}
+                      <ArrowRight />
+                      {diff.b.digest && <DigestComponent digest={diff.b.digest} expanded={false} />}
                     </div>
                   </Link>
                 ))}

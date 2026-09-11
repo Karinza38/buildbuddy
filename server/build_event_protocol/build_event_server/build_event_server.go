@@ -8,6 +8,7 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -79,6 +80,9 @@ func closeForwardingStreams(clients []pepb.PublishBuildEvent_PublishBuildToolEve
 // decide to re-send every build event for which an ACK has not been received. If so, it
 // adds an OPEN_STREAM event.
 func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.PublishBuildEvent_PublishBuildToolEventStreamServer) error {
+	metrics.InvocationOpenStreams.Inc()
+	defer metrics.InvocationOpenStreams.Dec()
+
 	ctx := stream.Context()
 	// Semantically, the protocol requires we ack events in order.
 	acks := make([]int, 0)
@@ -104,11 +108,15 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 			for {
 				_, err := fwdStream.Recv()
 				if err == io.EOF {
+					log.CtxInfof(ctx, "Build event forwarding stream closed by upstream")
 					break
 				}
 				if err != nil {
-					log.CtxWarningf(ctx, "Got error while getting response from proxy: %s", err)
-					return err
+					log.CtxWarningf(ctx, "Build event forwarding stream failed while receiving: %s", err)
+					if !s.synchronous {
+						return nil
+					}
+					return status.WrapError(err, "recv from proxy stream")
 				}
 			}
 			return nil
@@ -130,7 +138,7 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 		return e
 	}
 
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 	inCh := make(chan *pepb.PublishBuildToolEventStreamRequest)
 
 	// Listen on request stream in the background
@@ -141,15 +149,23 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 				errCh <- err
 				return
 			}
-			inCh <- in
+			// Recv can return multiple messages back to back so rather than
+			// worrying about buffering the messages bail out if the context
+			// is done.
+			select {
+			case inCh <- in:
+			case <-stream.Context().Done():
+				return
+			}
+
 		}
 	}()
 
-	var channelDone <-chan struct{}
+	channelCtx := ctx
 	for {
 		select {
-		case <-channelDone:
-			return disconnectWithErr(status.FromContextError(channel.Context()))
+		case <-channelCtx.Done():
+			return disconnectWithErr(status.FromContextError(channelCtx))
 		case err := <-errCh:
 			if err == io.EOF {
 				if s.synchronous {
@@ -169,12 +185,21 @@ func (s *BuildEventProtocolServer) PublishBuildToolEventStream(stream pepb.Publi
 			log.CtxWarningf(ctx, "Error receiving build event stream %+v: %s", streamID, err)
 			return disconnectWithErr(err)
 		case in := <-inCh:
-			if streamID == nil && in.GetOrderedBuildEvent().GetStreamId().GetInvocationId() != "" {
+			if streamID == nil {
+				if in.GetOrderedBuildEvent().GetStreamId().GetInvocationId() == "" {
+					return status.FailedPreconditionError("Missing invocation ID")
+				}
+
 				streamID = in.GetOrderedBuildEvent().GetStreamId()
 				ctx = log.EnrichContext(ctx, log.InvocationIDKey, streamID.GetInvocationId())
-				channel = s.env.GetBuildEventHandler().OpenChannel(ctx, streamID.GetInvocationId())
+				newChannel, err := s.env.GetBuildEventHandler().OpenChannel(ctx, streamID.GetInvocationId())
+				if err != nil {
+					log.CtxWarningf(ctx, "Failed to open invocation channel: %s", err)
+					return err
+				}
 				log.CtxInfo(ctx, "Opened invocation channel")
-				channelDone = channel.Context().Done()
+				channel = newChannel
+				channelCtx = channel.Context()
 				defer channel.Close()
 			}
 

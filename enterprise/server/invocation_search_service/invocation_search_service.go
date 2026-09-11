@@ -142,21 +142,11 @@ func (s *InvocationSearchService) IndexInvocation(ctx context.Context, invocatio
 	return nil
 }
 
-func (s *InvocationSearchService) checkPreconditions(req *inpb.SearchInvocationRequest) error {
-	if req.Query == nil {
-		return status.InvalidArgumentError("The query field is required")
-	}
-	if req.Query.Host == "" && req.Query.User == "" && req.Query.CommitSha == "" && req.Query.RepoUrl == "" && req.Query.GroupId == "" {
-		return status.InvalidArgumentError("At least one search atom must be set")
-	}
-	return nil
-}
-
 // TODO(tylerw): move this to a common place -- we'll use it a bunch.
 func addPermissionsCheckToQuery(u interfaces.UserInfo, q *query_builder.Query) {
 	o := query_builder.OrClauses{}
 	o.AddOr("(perms & ? != 0)", perms.OTHERS_READ)
-	groupArgs := []interface{}{
+	groupArgs := []any{
 		perms.GROUP_READ,
 	}
 	groupParams := make([]string, 0)
@@ -241,7 +231,7 @@ func addOrderBy(sort *inpb.InvocationSort, q *query_builder.Query) {
 	}
 }
 
-func (s *InvocationSearchService) buildPrimaryQuery(ctx context.Context, fields string, offset int64, limit int64, req *inpb.SearchInvocationRequest, isOlapQuery bool) (string, []interface{}, error) {
+func (s *InvocationSearchService) buildPrimaryQuery(ctx context.Context, fields string, offset int64, limit int64, req *inpb.SearchInvocationRequest, isOlapQuery bool) (string, []any, error) {
 	if req.GetQuery().GetRepoUrl() != "" {
 		norm, err := git.NormalizeRepoURL(req.GetQuery().GetRepoUrl())
 		if err == nil { // if we normalized successfully
@@ -249,9 +239,6 @@ func (s *InvocationSearchService) buildPrimaryQuery(ctx context.Context, fields 
 		}
 	}
 
-	if err := s.checkPreconditions(req); err != nil {
-		return "", nil, err
-	}
 	u, err := s.env.GetAuthenticator().AuthenticatedUser(ctx)
 	if err != nil {
 		return "", nil, err
@@ -338,16 +325,11 @@ func (s *InvocationSearchService) buildPrimaryQuery(ctx context.Context, fields 
 		q.AddWhereClause(fmt.Sprintf("(%s)", statusQuery), statusArgs...)
 	}
 
-	// The underlying data is not precise enough to accurately support nanoseconds and there's no use case for it yet.
-	if req.GetQuery().GetMinimumDuration().GetNanos() != 0 || req.GetQuery().GetMaximumDuration().GetNanos() != 0 {
-		return "", nil, status.InvalidArgumentError("InvocationSearchService does not support nanoseconds in duration queries")
+	if minDuration := req.GetQuery().GetMinimumDuration().AsDuration(); minDuration > 0 {
+		q.AddWhereClause(`duration_usec >= ?`, minDuration.Microseconds())
 	}
-
-	if req.GetQuery().GetMinimumDuration().GetSeconds() != 0 {
-		q.AddWhereClause(`duration_usec >= ?`, req.GetQuery().GetMinimumDuration().GetSeconds()*1000*1000)
-	}
-	if req.GetQuery().GetMaximumDuration().GetSeconds() != 0 {
-		q.AddWhereClause(`duration_usec <= ?`, req.GetQuery().GetMaximumDuration().GetSeconds()*1000*1000)
+	if maxDuration := req.GetQuery().GetMaximumDuration().AsDuration(); maxDuration > 0 {
+		q.AddWhereClause(`duration_usec <= ?`, maxDuration.Microseconds())
 	}
 
 	for _, f := range req.GetQuery().GetFilter() {
@@ -583,6 +565,25 @@ func (s *InvocationSearchService) QueryInvocations(ctx context.Context, req *inp
 		req.Sort = defaultSortParams()
 	} else if req.Sort.SortField == inpb.InvocationSort_UNKNOWN_SORT_FIELD {
 		req.Sort.SortField = defaultSortParams().SortField
+	}
+
+	// Default the query group_id to the authenticated group ID.
+	if req.GetQuery().GetGroupId() == "" {
+		req = req.CloneVT()
+		if req.Query == nil {
+			req.Query = &inpb.InvocationQuery{}
+		}
+		u, err := s.env.GetAuthenticator().AuthenticatedUser(ctx)
+		// Note: the two cases below should not happen in practice because
+		// capabilities_filter requires that the user is authenticated and that
+		// they are a member of a group.
+		if err != nil {
+			return nil, status.InternalErrorf("user is unexpectedly unauthenticated: %v", err)
+		}
+		if u.GetGroupID() == "" {
+			return nil, status.InternalError("user is unexpectedly missing group ID")
+		}
+		req.Query.GroupId = u.GetGroupID()
 	}
 
 	var invocations []*inpb.Invocation

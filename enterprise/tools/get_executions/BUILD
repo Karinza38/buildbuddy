@@ -1,5 +1,7 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
+package(default_visibility = ["//enterprise:__subpackages__"])
+
 go_library(
     name = "get_executions_lib",
     srcs = ["get_executions.go"],
@@ -7,7 +9,9 @@ go_library(
     visibility = ["//visibility:private"],
     deps = [
         "//proto:buildbuddy_service_go_proto",
+        "//proto:context_go_proto",
         "//proto:execution_stats_go_proto",
+        "//proto:scheduler_go_proto",
         "//server/util/flag",
         "//server/util/grpc_client",
         "//server/util/log",
@@ -21,5 +25,3 @@ go_binary(
     embed = [":get_executions_lib"],
     visibility = ["//visibility:public"],
 )
-
-package(default_visibility = ["//enterprise:__subpackages__"])

@@ -14,18 +14,23 @@ import (
 	ispb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
 )
 
-func executionMetricToDbField(m stat_filter.ExecutionMetricType) (string, error) {
+func rectifiedDurationValue(start string, end string) string {
+	// start is before end, start is not zero.
+	return fmt.Sprintf("IF(%s < %s OR %s = 0, 0, (%s - %s))", end, start, start, end, start)
+}
+
+func ExecutionMetricToDbField(m stat_filter.ExecutionMetricType) (string, error) {
 	switch m {
 	case stat_filter.ExecutionMetricType_UPDATED_AT_USEC_EXECUTION_METRIC:
 		return "updated_at_usec", nil
 	case stat_filter.ExecutionMetricType_QUEUE_TIME_USEC_EXECUTION_METRIC:
-		return "IF(worker_start_timestamp_usec < queued_timestamp_usec, 0, (worker_start_timestamp_usec - queued_timestamp_usec))", nil
+		return rectifiedDurationValue("queued_timestamp_usec", "worker_start_timestamp_usec"), nil
 	case stat_filter.ExecutionMetricType_INPUT_DOWNLOAD_TIME_EXECUTION_METRIC:
-		return "(input_fetch_completed_timestamp_usec - input_fetch_start_timestamp_usec)", nil
+		return rectifiedDurationValue("input_fetch_start_timestamp_usec", "input_fetch_completed_timestamp_usec"), nil
 	case stat_filter.ExecutionMetricType_REAL_EXECUTION_TIME_EXECUTION_METRIC:
-		return "(execution_completed_timestamp_usec - execution_start_timestamp_usec)", nil
+		return rectifiedDurationValue("execution_start_timestamp_usec", "execution_completed_timestamp_usec"), nil
 	case stat_filter.ExecutionMetricType_OUTPUT_UPLOAD_TIME_EXECUTION_METRIC:
-		return "(output_upload_completed_timestamp_usec - output_upload_start_timestamp_usec)", nil
+		return rectifiedDurationValue("output_upload_start_timestamp_usec", "output_upload_completed_timestamp_usec"), nil
 	case stat_filter.ExecutionMetricType_PEAK_MEMORY_EXECUTION_METRIC:
 		return "peak_memory_bytes", nil
 	case stat_filter.ExecutionMetricType_INPUT_DOWNLOAD_SIZE_EXECUTION_METRIC:
@@ -33,7 +38,11 @@ func executionMetricToDbField(m stat_filter.ExecutionMetricType) (string, error)
 	case stat_filter.ExecutionMetricType_OUTPUT_UPLOAD_SIZE_EXECUTION_METRIC:
 		return "file_upload_size_bytes", nil
 	case stat_filter.ExecutionMetricType_EXECUTION_WALL_TIME_EXECUTION_METRIC:
-		return "IF(worker_completed_timestamp_usec < queued_timestamp_usec, 0, (worker_completed_timestamp_usec - queued_timestamp_usec))", nil
+		return rectifiedDurationValue("queued_timestamp_usec", "worker_completed_timestamp_usec"), nil
+	case stat_filter.ExecutionMetricType_EXECUTION_CPU_NANOS_EXECUTION_METRIC:
+		return "cpu_nanos", nil
+	case stat_filter.ExecutionMetricType_EXECUTION_AVERAGE_MILLICORES_EXECUTION_METRIC:
+		return "IF(cpu_nanos <= 0 OR (execution_completed_timestamp_usec - execution_start_timestamp_usec) <= 0, 0, intDivOrZero(cpu_nanos*1000, (execution_completed_timestamp_usec - execution_start_timestamp_usec) * 1000))", nil
 	default:
 		return "", status.InvalidArgumentErrorf("Invalid field: %s", m.String())
 	}
@@ -57,6 +66,8 @@ func invocationMetricToDbField(m stat_filter.InvocationMetricType) (string, erro
 		return "upload_throughput_bytes_per_second", nil
 	case stat_filter.InvocationMetricType_ACTION_CACHE_MISSES_INVOCATION_METRIC:
 		return "action_cache_misses", nil
+	case stat_filter.InvocationMetricType_ACTION_CACHE_HITS_INVOCATION_METRIC:
+		return "action_cache_hits", nil
 	case stat_filter.InvocationMetricType_TIME_SAVED_USEC_INVOCATION_METRIC:
 		return "total_cached_action_exec_usec", nil
 	default:
@@ -68,6 +79,14 @@ func executionDimensionToDbField(m stat_filter.ExecutionDimensionType) (string, 
 	switch m {
 	case stat_filter.ExecutionDimensionType_WORKER_EXECUTION_DIMENSION:
 		return "worker", nil
+	case stat_filter.ExecutionDimensionType_TARGET_LABEL_EXECUTION_DIMENSION:
+		return "target_label", nil
+	case stat_filter.ExecutionDimensionType_ACTION_MNEMONIC_EXECUTION_DIMENSION:
+		return "action_mnemonic", nil
+	case stat_filter.ExecutionDimensionType_EFFECTIVE_POOL_EXECUTION_DIMENSION:
+		return "effective_pool", nil
+	case stat_filter.ExecutionDimensionType_EXIT_CODE_EXECUTION_DIMENSION:
+		return "exit_code", nil
 	default:
 		return "", status.InvalidArgumentErrorf("Invalid field: %s", m.String())
 	}
@@ -89,12 +108,12 @@ func MetricToDbField(m *stat_filter.Metric) (string, error) {
 	if m.Invocation != nil {
 		return invocationMetricToDbField(m.GetInvocation())
 	} else if m.Execution != nil {
-		return executionMetricToDbField(m.GetExecution())
+		return ExecutionMetricToDbField(m.GetExecution())
 	}
 	return "", status.InvalidArgumentErrorf("Invalid filter: %v", m)
 }
 
-func GenerateFilterStringAndArgs(f *stat_filter.StatFilter) (string, []interface{}, error) {
+func GenerateFilterStringAndArgs(f *stat_filter.StatFilter) (string, []any, error) {
 	metric, err := MetricToDbField(f.GetMetric())
 	if err != nil {
 		return "", nil, err
@@ -103,12 +122,12 @@ func GenerateFilterStringAndArgs(f *stat_filter.StatFilter) (string, []interface
 		return "", nil, status.InvalidArgumentErrorf("No filter bounds specified: %v", f)
 	}
 	if f.Max != nil && f.Min != nil {
-		return fmt.Sprintf("(%s BETWEEN ? AND ?)", metric), []interface{}{f.GetMin(), f.GetMax()}, nil
+		return fmt.Sprintf("(%s BETWEEN ? AND ?)", metric), []any{f.GetMin(), f.GetMax()}, nil
 	}
 	if f.Max != nil {
-		return fmt.Sprintf("(%s <= ?)", metric), []interface{}{f.GetMax()}, nil
+		return fmt.Sprintf("(%s <= ?)", metric), []any{f.GetMax()}, nil
 	}
-	return fmt.Sprintf("(%s >= ?)", metric), []interface{}{f.GetMin()}, nil
+	return fmt.Sprintf("(%s >= ?)", metric), []any{f.GetMin()}, nil
 }
 
 func DimensionToDbField(m *stat_filter.Dimension) (string, error) {
@@ -123,17 +142,17 @@ func DimensionToDbField(m *stat_filter.Dimension) (string, error) {
 	return "", status.InvalidArgumentErrorf("Invalid filter: %v", m)
 }
 
-func GenerateDimensionFilterStringAndArgs(f *stat_filter.DimensionFilter) (string, []interface{}, error) {
+func GenerateDimensionFilterStringAndArgs(f *stat_filter.DimensionFilter) (string, []any, error) {
 	metric, err := DimensionToDbField(f.GetDimension())
 	if err != nil {
 		return "", nil, err
 	}
-	return fmt.Sprintf("(%s = ?)", metric), []interface{}{f.GetValue()}, nil
+	return fmt.Sprintf("(%s = ?)", metric), []any{f.GetValue()}, nil
 }
 
-func getStringAndArgs(databaseQueryTemplate string, v interface{}, columnName string) (string, []interface{}) {
+func getStringAndArgs(databaseQueryTemplate string, v any, columnName string) (string, []any) {
 	str := strings.ReplaceAll(databaseQueryTemplate, "?field", columnName)
-	var args []interface{}
+	var args []any
 	for strings.Contains(str, "?value") {
 		str = strings.Replace(str, "?value", "?", 1)
 		args = append(args, v)
@@ -141,7 +160,7 @@ func getStringAndArgs(databaseQueryTemplate string, v interface{}, columnName st
 	return str, args
 }
 
-func generateStatusFilterQueryStringAndArgs(f *stat_filter.GenericFilter) (string, []interface{}, error) {
+func generateStatusFilterQueryStringAndArgs(f *stat_filter.GenericFilter) (string, []any, error) {
 	// Currently, we only support IN queries for status.
 	if f.GetOperand() != stat_filter.FilterOperand_IN_OPERAND {
 		return "", nil, status.InvalidArgumentErrorf("Status filters only support the IN operand.")
@@ -171,7 +190,7 @@ func generateStatusFilterQueryStringAndArgs(f *stat_filter.GenericFilter) (strin
 	return out, outArgs, nil
 }
 
-func generateArrayContainsQueryStringAndArgs(column string, args []string, dialect string) (string, []interface{}, error) {
+func generateArrayContainsQueryStringAndArgs(column string, args []string, dialect string) (string, []any, error) {
 	if dialect == "clickhouse" {
 		qStr, qArgs := getStringAndArgs("hasAny(?field, array(?value))", args, column)
 		return qStr, qArgs, nil
@@ -188,7 +207,7 @@ func generateArrayContainsQueryStringAndArgs(column string, args []string, diale
 	return out, outArgs, nil
 }
 
-func ValidateAndGenerateGenericFilterQueryStringAndArgs(f *stat_filter.GenericFilter, qType stat_filter.ObjectTypes, dialect string) (string, []interface{}, error) {
+func ValidateAndGenerateGenericFilterQueryStringAndArgs(f *stat_filter.GenericFilter, qType stat_filter.ObjectTypes, dialect string) (string, []any, error) {
 	if f == nil {
 		return "", nil, status.InvalidArgumentError("invalid nil entry in filter list")
 	}
@@ -225,12 +244,12 @@ func ValidateAndGenerateGenericFilterQueryStringAndArgs(f *stat_filter.GenericFi
 
 	v := f.GetValue()
 	var qStr string
-	var qArgs []interface{}
+	var qArgs []any
 	var err error
 
 	// Normal cases (ints, strings).
 	if typeOptions.GetCategory() == stat_filter.FilterCategory_INT_FILTER_CATEGORY {
-		var arg interface{}
+		var arg any
 		if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_ONE_FILTER_ARGUMENT_COUNT && len(v.GetIntValue()) == 1 {
 			arg = v.GetIntValue()[0]
 		} else if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_MANY_FILTER_ARGUMENT_COUNT && len(v.GetIntValue()) > 0 {
@@ -240,7 +259,7 @@ func ValidateAndGenerateGenericFilterQueryStringAndArgs(f *stat_filter.GenericFi
 		}
 		qStr, qArgs = getStringAndArgs(operandOptions.GetDatabaseQueryString(), arg, typeOptions.GetDatabaseColumnName())
 	} else if typeOptions.GetCategory() == stat_filter.FilterCategory_STRING_FILTER_CATEGORY {
-		var arg interface{}
+		var arg any
 		if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_ONE_FILTER_ARGUMENT_COUNT && len(v.GetStringValue()) == 1 {
 			arg = v.GetStringValue()[0]
 		} else if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_MANY_FILTER_ARGUMENT_COUNT && len(v.GetStringValue()) > 0 {
@@ -250,7 +269,7 @@ func ValidateAndGenerateGenericFilterQueryStringAndArgs(f *stat_filter.GenericFi
 		}
 		qStr, qArgs = getStringAndArgs(operandOptions.GetDatabaseQueryString(), arg, typeOptions.GetDatabaseColumnName())
 	} else if typeOptions.GetCategory() == stat_filter.FilterCategory_STRING_ARRAY_FILTER_CATEGORY {
-		var arg interface{}
+		var arg any
 		if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_ONE_FILTER_ARGUMENT_COUNT && len(v.GetStringValue()) == 1 {
 			arg = v.GetStringValue()[0]
 		} else if operandOptions.GetArgumentCount() == stat_filter.FilterArgumentCount_MANY_FILTER_ARGUMENT_COUNT && len(v.GetStringValue()) > 0 {

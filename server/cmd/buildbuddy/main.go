@@ -3,15 +3,20 @@ package main
 import (
 	"flag"
 
+	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
+
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/janitor"
 	"github.com/buildbuddy-io/buildbuddy/server/libmain"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/capabilities_server"
 	"github.com/buildbuddy-io/buildbuddy/server/telemetry"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/version"
 
 	app_bundle "github.com/buildbuddy-io/buildbuddy/app"
+
+	_ "google.golang.org/grpc/xds" // registers xds:// resolver.
 )
 
 var (
@@ -49,5 +54,9 @@ func main() {
 	defer cleanupService.Stop()
 
 	libmain.StartMonitoringHandler(env)
-	libmain.StartAndRunServices(env) // Does not return
+	libmain.RegisterLocalServersAndClients(env)
+	if err := capabilities_server.Register(env); err != nil {
+		log.Fatalf("%v", err)
+	}
+	libmain.StartAndRunServices(env, grpc_server.GRPCServerConfig{}) // Does not return
 }

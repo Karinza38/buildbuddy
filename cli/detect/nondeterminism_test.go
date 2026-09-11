@@ -1,0 +1,232 @@
+package detect
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/buildbuddy-io/buildbuddy/cli/arg"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/bazel_command"
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/test_data"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	spawn_diff "github.com/buildbuddy-io/buildbuddy/proto/spawn_diff"
+)
+
+func init() {
+	parser.SetBazelHelpForTesting(test_data.BazelHelpFlagsAsProtoOutput)
+}
+
+func TestAddBazelFlags(t *testing.T) {
+	args, err := addBazelFlags(
+		bazelArgsForTest(t, "--bazelrc=/tmp/bazelrc", "test", "//foo:bar"),
+		"/tmp/output-base",
+		"/tmp/log.pb.zst",
+		"test-invocation-id",
+		"grpcs://bes.example.com",
+		"https://example.com/invocation/",
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"--bazelrc=/tmp/bazelrc",
+		"--output_base=/tmp/output-base",
+		"test",
+		"--bes_backend=grpcs://bes.example.com",
+		"--bes_results_url=https://example.com/invocation/",
+		"--noremote_accept_cached",
+		"--repo_contents_cache=",
+		"--disk_cache=",
+		"--noexperimental_convenience_symlinks",
+		"--execution_log_compact_file=/tmp/log.pb.zst",
+		"--invocation_id=test-invocation-id",
+		"//foo:bar",
+	}, args)
+}
+
+func TestAddBazelFlags_DoesNotMutateBaseArgs(t *testing.T) {
+	baseArgs := bazelArgsForTest(t, "build", "//foo:bar")
+
+	_, err := addBazelFlags(baseArgs, "/tmp/output-base", "/tmp/log.pb.zst", "test-invocation-id", defaultBESBackend, defaultBESResultsURL)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"build", "//foo:bar"}, baseArgs.Forwarded())
+}
+
+func TestParseBazelCommand(t *testing.T) {
+	bazelArgs, err := parseBazelCommand(`--bazelrc=/tmp/bazelrc test //foo:bar --test_output=errors`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"--bazelrc=/tmp/bazelrc", "test", "--test_output=errors", "//foo:bar"}, bazelArgs.Forwarded())
+
+	_, err = parseBazelCommand("//foo:bar")
+	require.Error(t, err)
+}
+
+func TestRunReturnsDetectionError(t *testing.T) {
+	diff := &spawn_diff.DiffResult{SpawnDiffs: []*spawn_diff.SpawnDiff{nondeterministicSpawnDiff("//foo:bar")}}
+	explainer := &fakeExplainer{diff: diff}
+	runner := &fakeRunner{}
+	c := &checker{
+		opts: options{
+			bazelArgs:     bazelArgsForTest(t, "build", "//foo:bar"),
+			besBackend:    defaultBESBackend,
+			besResultsURL: defaultBESResultsURL,
+		},
+		runner:    runner,
+		explainer: explainer,
+	}
+
+	err := c.Run(context.Background())
+	require.ErrorIs(t, err, errNondeterminismDetected)
+
+	require.Equal(t, []string{"build", "shutdown", "clean", "build", "shutdown", "clean"}, bazelCommands(runner.runs))
+	assert.True(t, explainer.nondeterministicOnly, "detector should request only non-deterministic spawns")
+	assert.Equal(t, 1, explainer.writeCalls)
+	assert.Same(t, diff, explainer.wroteDiff)
+}
+
+// nondeterministicSpawnDiff returns a representative non-deterministic spawn
+// diff, i.e. what explain.Diff returns for --nondeterministic_only: an exit code
+// change despite unchanged inputs. The classification itself is tested in the
+// cli/explain package; the detector just reports whatever explain.Diff surfaces.
+func nondeterministicSpawnDiff(label string) *spawn_diff.SpawnDiff {
+	return &spawn_diff.SpawnDiff{
+		TargetLabel: label,
+		Diff: &spawn_diff.SpawnDiff_Modified{Modified: &spawn_diff.Modified{
+			Diffs: []*spawn_diff.Diff{{
+				Diff: &spawn_diff.Diff_ExitCode{ExitCode: &spawn_diff.IntDiff{Old: 0, New: 1}},
+			}},
+		}},
+	}
+}
+
+func TestRunReturnsNilWhenNoDiffs(t *testing.T) {
+	explainer := &fakeExplainer{diff: &spawn_diff.DiffResult{}}
+	runner := &fakeRunner{}
+	c := &checker{
+		opts: options{
+			bazelArgs:     bazelArgsForTest(t, "build", "//foo:bar"),
+			besBackend:    defaultBESBackend,
+			besResultsURL: defaultBESResultsURL,
+		},
+		runner:    runner,
+		explainer: explainer,
+	}
+
+	require.NoError(t, c.Run(context.Background()))
+
+	require.Equal(t, []string{"build", "shutdown", "clean", "build", "shutdown", "clean"}, bazelCommands(runner.runs))
+	assert.Equal(t, 0, explainer.writeCalls)
+}
+
+func TestRemovesOutputBaseAfterEachRun(t *testing.T) {
+	m, err := newBuildMetadata()
+	require.NoError(t, err)
+	defer os.RemoveAll(m.tempDir)
+
+	var runner fakeRunner
+	var buildRuns int
+	runner.onRun = func(ctx context.Context, call commandCall) error {
+		command, _ := bazel_command.GetCommandAndIndex(call.args)
+		if command == "shutdown" {
+			return nil
+		}
+		outputBase := outputBaseFromArgs(t, call.args)
+		if command == "clean" {
+			return os.RemoveAll(outputBase)
+		}
+
+		buildRuns++
+		require.NoError(t, os.MkdirAll(filepath.Join(outputBase, "execroot"), 0755))
+		if buildRuns == 2 {
+			require.NoDirExists(t, filepath.Join(m.tempDir, "output_base_1"))
+		}
+		return nil
+	}
+	c := &checker{
+		opts: options{
+			bazelArgs:     bazelArgsForTest(t, "build", "//foo:bar"),
+			besBackend:    defaultBESBackend,
+			besResultsURL: defaultBESResultsURL,
+		},
+		runner: &runner,
+	}
+
+	require.NoError(t, c.runBuilds(context.Background(), m))
+
+	require.Equal(t, []string{"build", "shutdown", "clean", "build", "shutdown", "clean"}, bazelCommands(runner.runs))
+	require.NoDirExists(t, filepath.Join(m.tempDir, "output_base_1"))
+	require.NoDirExists(t, filepath.Join(m.tempDir, "output_base_2"))
+}
+
+func bazelArgsForTest(t *testing.T, args ...string) *arg.BazelArgs {
+	t.Helper()
+	parsedArgs, err := arg.NewBazelArgsNoResolve(args)
+	require.NoError(t, err)
+	return parsedArgs
+}
+
+func outputBaseFromArgs(t *testing.T, args []string) string {
+	t.Helper()
+	for _, arg := range args {
+		if value, ok := strings.CutPrefix(arg, "--output_base="); ok {
+			return value
+		}
+	}
+	require.FailNow(t, "missing --output_base arg", "args: %v", args)
+	return ""
+}
+
+func bazelCommands(calls []commandCall) []string {
+	var commands []string
+	for _, call := range calls {
+		command, _ := bazel_command.GetCommandAndIndex(call.args)
+		commands = append(commands, command)
+	}
+	return commands
+}
+
+type commandCall struct {
+	name string
+	args []string
+}
+
+type fakeRunner struct {
+	runs   []commandCall
+	runErr error
+	onRun  func(context.Context, commandCall) error
+}
+
+func (r *fakeRunner) Run(ctx context.Context, name string, args ...string) error {
+	call := commandCall{name: name, args: append([]string(nil), args...)}
+	r.runs = append(r.runs, call)
+	if r.onRun != nil {
+		if err := r.onRun(ctx, call); err != nil {
+			return err
+		}
+	}
+	return r.runErr
+}
+
+type fakeExplainer struct {
+	diff                 *spawn_diff.DiffResult
+	diffErr              error
+	nondeterministicOnly bool
+	writeCalls           int
+	wroteDiff            *spawn_diff.DiffResult
+}
+
+func (e *fakeExplainer) Diff(oldLog, newLog string, nondeterministicOnly bool) (*spawn_diff.DiffResult, error) {
+	e.nondeterministicOnly = nondeterministicOnly
+	return e.diff, e.diffErr
+}
+
+func (e *fakeExplainer) WriteText(w io.Writer, diff *spawn_diff.DiffResult, verbose bool) {
+	e.writeCalls++
+	e.wroteDiff = diff
+}

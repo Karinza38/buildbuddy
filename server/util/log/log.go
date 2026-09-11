@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
@@ -30,8 +31,7 @@ var (
 	EnableStructuredLogging = flag.Bool("app.enable_structured_logging", false, "If true, log messages will be json-formatted.")
 	IncludeShortFileName    = flag.Bool("app.log_include_short_file_name", false, "If true, log messages will include shortened originating file name.")
 	EnableGCPLoggingFormat  = flag.Bool("app.log_enable_gcp_logging_format", false, "If true, the output structured logs will be compatible with format expected by GCP Logging.")
-	EnableLogGRPCRequest    = flag.Bool("app.log_enable_grpc_request", true, "If true, log grpc request when log level is default")
-	LogErrorStackTraces     = flag.Bool("app.log_error_stack_traces", false, "If true, stack traces will be printed for errors that have them.")
+	EnableLogGRPCRequest    = flag.Bool("app.log_enable_grpc_request", true, "If true, log grpc request when log level is debug")
 )
 
 const (
@@ -85,15 +85,15 @@ func LogGRPCRequest(ctx context.Context, fullMethod string, dur time.Duration, e
 	fullMethod = strings.Replace(fullMethod, "distributed_cache.DistributedCache/", "D", 1)
 	shortPath := "/" + path.Base(fullMethod)
 	CtxDebugf(ctx, "%s %s %s [%s]", "gRPC", shortPath, fmtErr(err), formatDuration(dur))
-	if *LogErrorStackTraces {
+	if *status.LogErrorStackTraces {
 		if se, ok := err.(interface {
 			StackTrace() status.StackTrace
 		}); ok {
-			stackBuf := ""
+			var stackBuf strings.Builder
 			for _, f := range se.StackTrace() {
-				stackBuf += fmt.Sprintf("%+s:%d\n", f, f)
+				stackBuf.WriteString(fmt.Sprintf("%+s:%d\n", f, f))
 			}
-			CtxDebug(ctx, stackBuf)
+			CtxDebug(ctx, stackBuf.String())
 		}
 	}
 }
@@ -116,7 +116,7 @@ func init() {
 func LocalWriter() io.Writer {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 	output := &zerolog.ConsoleWriter{Out: os.Stderr}
-	output.FormatCaller = func(i interface{}) string {
+	output.FormatCaller = func(i any) string {
 		s, ok := i.(string)
 		if !ok {
 			return ""
@@ -196,7 +196,7 @@ func (l *Logger) Debug(message string) {
 }
 
 // Debugf logs to the DEBUG log. Arguments are handled in the manner of fmt.Printf.
-func (l *Logger) Debugf(format string, args ...interface{}) {
+func (l *Logger) Debugf(format string, args ...any) {
 	l.zl.Debug().Msgf(format, args...)
 }
 
@@ -204,8 +204,11 @@ func (l *Logger) Debugf(format string, args ...interface{}) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func (l *Logger) CtxDebugf(ctx context.Context, format string, args ...interface{}) {
+func (l *Logger) CtxDebugf(ctx context.Context, format string, args ...any) {
 	e := l.zl.Debug()
+	if e == nil {
+		return
+	}
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
 }
@@ -216,7 +219,7 @@ func (l *Logger) Info(message string) {
 }
 
 // Infof logs to the INFO log. Arguments are handled in the manner of fmt.Printf.
-func (l *Logger) Infof(format string, args ...interface{}) {
+func (l *Logger) Infof(format string, args ...any) {
 	l.zl.Info().Msgf(format, args...)
 }
 
@@ -224,7 +227,7 @@ func (l *Logger) Infof(format string, args ...interface{}) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func (l *Logger) CtxInfof(ctx context.Context, format string, args ...interface{}) {
+func (l *Logger) CtxInfof(ctx context.Context, format string, args ...any) {
 	e := l.zl.Info()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -239,7 +242,7 @@ func (l *Logger) Warning(message string) {
 }
 
 // Warningf logs to the WARNING log. Arguments are handled in the manner of fmt.Printf.
-func (l *Logger) Warningf(format string, args ...interface{}) {
+func (l *Logger) Warningf(format string, args ...any) {
 	l.zl.Warn().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "warning",
@@ -250,7 +253,7 @@ func (l *Logger) Warningf(format string, args ...interface{}) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func (l *Logger) CtxWarningf(ctx context.Context, format string, args ...interface{}) {
+func (l *Logger) CtxWarningf(ctx context.Context, format string, args ...any) {
 	e := l.zl.Warn()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -268,7 +271,7 @@ func (l *Logger) Error(message string) {
 }
 
 // Errorf logs to the ERROR log. Arguments are handled in the manner of fmt.Printf.
-func (l *Logger) Errorf(format string, args ...interface{}) {
+func (l *Logger) Errorf(format string, args ...any) {
 	l.zl.Error().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "error",
@@ -279,13 +282,20 @@ func (l *Logger) Errorf(format string, args ...interface{}) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func (l *Logger) CtxErrorf(ctx context.Context, format string, args ...interface{}) {
+func (l *Logger) CtxErrorf(ctx context.Context, format string, args ...any) {
 	e := l.zl.Error()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "error",
 	}).Inc()
+}
+
+// Level creates a child logger with the minimum accepted level set to level.
+func (l *Logger) Level(lvl zerolog.Level) Logger {
+	return Logger{
+		zl: l.zl.Level(lvl),
+	}
 }
 
 // Fatal logs to the FATAL log. Arguments are handled in the manner of fmt.Print.
@@ -301,13 +311,68 @@ func (l *Logger) Fatal(message string) {
 
 // Fatalf logs to the FATAL log. Arguments are handled in the manner of fmt.Printf.
 // It calls os.Exit() with exit code 1.
-func (l *Logger) Fatalf(format string, args ...interface{}) {
+func (l *Logger) Fatalf(format string, args ...any) {
 	log.Fatal().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "fatal",
 	}).Inc()
 	// Make sure fatal logs will exit.
 	os.Exit(1)
+}
+
+// EveryN returns a new logger that will only emit a log every N times it is
+// called. This can be used to reduce the frequency of logs that are similar and
+// frequent.
+func (l Logger) EveryN(n uint32) Logger {
+	return Logger{
+		zl: l.zl.Sample(&zerolog.LevelSampler{
+			TraceSampler: &zerolog.BasicSampler{N: n},
+			DebugSampler: &zerolog.BasicSampler{N: n},
+			InfoSampler:  &zerolog.BasicSampler{N: n},
+			WarnSampler:  &zerolog.BasicSampler{N: n},
+			ErrorSampler: &zerolog.BasicSampler{N: n},
+		}),
+	}
+}
+
+// durationSampler is a sampler that will send every time.Duration, regardless
+// of level.
+type durationSampler struct {
+	LastSampleNanos atomic.Int64
+	PeriodNanos     int64
+}
+
+func newDurationSampler(d time.Duration) *durationSampler {
+	return &durationSampler{
+		PeriodNanos: d.Nanoseconds(),
+	}
+}
+
+// Sample implements the Sampler interface.
+func (s *durationSampler) Sample(lvl zerolog.Level) bool {
+	lastSampleNanos := s.LastSampleNanos.Load()
+	nowNanos := time.Now().UnixNano()
+
+	if nowNanos-s.PeriodNanos > lastSampleNanos {
+		s.LastSampleNanos.Store(nowNanos)
+		return true
+	}
+	return false
+}
+
+// EveryDuration returns a new logger that will only log anew after every
+// duration d has passed. This can be useful if you want to limit the
+// frequency of some logging to once per second or something.
+func (l Logger) EveryDuration(d time.Duration) Logger {
+	return Logger{
+		zl: l.zl.Sample(&zerolog.LevelSampler{
+			TraceSampler: newDurationSampler(d),
+			DebugSampler: newDurationSampler(d),
+			InfoSampler:  newDurationSampler(d),
+			WarnSampler:  newDurationSampler(d),
+			ErrorSampler: newDurationSampler(d),
+		}),
+	}
 }
 
 func NamedSubLogger(name string) Logger {
@@ -349,7 +414,7 @@ func Print(message string) {
 }
 
 // DEPRECATED: use log.Infof instead!
-func Printf(format string, v ...interface{}) {
+func Printf(format string, v ...any) {
 	log.Info().Msgf(format, v...)
 }
 
@@ -359,7 +424,7 @@ func Debug(message string) {
 }
 
 // Debugf logs to the DEBUG log. Arguments are handled in the manner of fmt.Printf.
-func Debugf(format string, args ...interface{}) {
+func Debugf(format string, args ...any) {
 	log.Debug().Msgf(format, args...)
 }
 
@@ -368,6 +433,9 @@ func Debugf(format string, args ...interface{}) {
 // (e.g. invocation_id, request_id)
 func CtxDebug(ctx context.Context, message string) {
 	e := log.Debug()
+	if e == nil {
+		return
+	}
 	enrichEventFromContext(ctx, e)
 	e.Msg(message)
 }
@@ -376,8 +444,11 @@ func CtxDebug(ctx context.Context, message string) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func CtxDebugf(ctx context.Context, format string, args ...interface{}) {
+func CtxDebugf(ctx context.Context, format string, args ...any) {
 	e := log.Debug()
+	if e == nil {
+		return
+	}
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
 }
@@ -388,7 +459,7 @@ func Info(message string) {
 }
 
 // Infof logs to the INFO log. Arguments are handled in the manner of fmt.Printf.
-func Infof(format string, args ...interface{}) {
+func Infof(format string, args ...any) {
 	log.Info().Msgf(format, args...)
 }
 
@@ -405,7 +476,7 @@ func CtxInfo(ctx context.Context, message string) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func CtxInfof(ctx context.Context, format string, args ...interface{}) {
+func CtxInfof(ctx context.Context, format string, args ...any) {
 	e := log.Info()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -420,7 +491,7 @@ func Warning(message string) {
 }
 
 // Warningf logs to the WARNING log. Arguments are handled in the manner of fmt.Printf.
-func Warningf(format string, args ...interface{}) {
+func Warningf(format string, args ...any) {
 	log.Warn().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "warning",
@@ -443,7 +514,7 @@ func CtxWarning(ctx context.Context, message string) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func CtxWarningf(ctx context.Context, format string, args ...interface{}) {
+func CtxWarningf(ctx context.Context, format string, args ...any) {
 	e := log.Warn()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -461,7 +532,7 @@ func Error(message string) {
 }
 
 // Errorf logs to the ERROR log. Arguments are handled in the manner of fmt.Printf.
-func Errorf(format string, args ...interface{}) {
+func Errorf(format string, args ...any) {
 	log.Error().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "error",
@@ -484,7 +555,7 @@ func CtxError(ctx context.Context, message string) {
 // fmt.Printf.
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
-func CtxErrorf(ctx context.Context, format string, args ...interface{}) {
+func CtxErrorf(ctx context.Context, format string, args ...any) {
 	e := log.Error()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -506,7 +577,7 @@ func Fatal(message string) {
 
 // Fatalf logs to the FATAL log. Arguments are handled in the manner of fmt.Printf.
 // It calls os.Exit() with exit code 1.
-func Fatalf(format string, args ...interface{}) {
+func Fatalf(format string, args ...any) {
 	log.Fatal().Msgf(format, args...)
 	metrics.Logs.With(prometheus.Labels{
 		metrics.StatusHumanReadableLabel: "fatal",
@@ -520,7 +591,7 @@ func Fatalf(format string, args ...interface{}) {
 // Logs are enriched with information from the context
 // (e.g. invocation_id, request_id)
 // It calls os.Exit() with exit code 1.
-func CtxFatalf(ctx context.Context, format string, args ...interface{}) {
+func CtxFatalf(ctx context.Context, format string, args ...any) {
 	e := log.Fatal()
 	enrichEventFromContext(ctx, e)
 	e.Msgf(format, args...)
@@ -537,8 +608,8 @@ type logWriter struct {
 }
 
 func (w *logWriter) Write(b []byte) (int, error) {
-	lines := strings.Split(string(b), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(b), "\n")
+	for line := range lines {
 		if line == "" {
 			continue
 		}

@@ -1,4 +1,6 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+package(default_visibility = ["//enterprise:__subpackages__"])
 
 go_library(
     name = "auditlog",
@@ -7,10 +9,13 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//proto:auditlog_go_proto",
+        "//proto:capability_go_proto",
         "//server/environment",
         "//server/interfaces",
         "//server/real_environment",
         "//server/util/authutil",
+        "//server/util/capabilities",
+        "//server/util/claims",
         "//server/util/clickhouse/schema",
         "//server/util/clientip",
         "//server/util/db",
@@ -24,4 +29,38 @@ go_library(
     ],
 )
 
-package(default_visibility = ["//enterprise:__subpackages__"])
+go_test(
+    name = "auditlog_test",
+    srcs = ["auditlog_test.go"],
+    exec_properties = {
+        "test.workload-isolation-type": "firecracker",
+        "test.container-image": "docker://gcr.io/flame-public/rbe-ubuntu20-04@sha256:09261f2019e9baa7482f7742cdee8e9972a3971b08af27363a61816b2968f622",
+        "test.init-dockerd": "true",
+        "test.recycle-runner": "true",
+        "test.runner-recycling-key": "clickhouse25.3",
+    },
+    tags = ["docker"],
+    deps = [
+        ":auditlog",
+        "//enterprise/server/testutil/enterprise_testauth",
+        "//enterprise/server/testutil/enterprise_testenv",
+        "//proto:auditlog_go_proto",
+        "//proto:capability_go_proto",
+        "//proto:context_go_proto",
+        "//proto:group_go_proto",
+        "//proto:user_id_go_proto",
+        "//server/environment",
+        "//server/interfaces",
+        "//server/tables",
+        "//server/testutil/testauth",
+        "//server/util/authutil",
+        "//server/util/claims",
+        "//server/util/request_context",
+        "//server/util/status",
+        "//server/util/testing/flags",
+        "@com_github_google_go_cmp//cmp",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_protobuf//testing/protocmp",
+        "@org_golang_google_protobuf//types/known/timestamppb",
+    ],
+)

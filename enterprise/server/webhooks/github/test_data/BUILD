@@ -9,9 +9,12 @@ go_library(
     name = "test_data",
     srcs = ["test_data.go"],
     embedsrcs = [
+        "delete_tag_event.json",
         "pull_request_event.json",
         "pull_request_approved_review_event.json",
+        "push_annotated_tag_event.json",
         "push_event.json",
+        "push_tag_event.json",
     ],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/webhooks/github/test_data",
 )

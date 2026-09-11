@@ -8,37 +8,52 @@ go_library(
         "containeropts.go",
         "firecracker.go",
     ],
-    data = [
-        "//enterprise/vmsupport/bin:initrd.cpio",
-        "//enterprise/vmsupport/bin:vmlinux",
-    ],
+    data = select({
+        "//platforms/configs:linux_x86_64": [
+            "//enterprise/vmsupport/bin:initrd.cpio",
+            "//enterprise/vmsupport/bin:vmlinux",
+            "//enterprise/vmsupport/bin:vmlinux_6.1",
+        ],
+        "//platforms/configs:linux_arm64": [
+            "//enterprise/vmsupport/bin:initrd.cpio",
+            "//enterprise/vmsupport/bin:vmlinux",
+        ],
+    }),
     embedsrcs = ["guest_api_hash.sha256"],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/containers/firecracker",
     target_compatible_with = [
         "@platforms//os:linux",
     ],
-    x_defs = {
-        "initrdRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:initrd.cpio)",
-        "vmlinuxRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux)",
-    },
+    x_defs = select({
+        "//platforms/configs:linux_x86_64": {
+            "initrdRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:initrd.cpio)",
+            "vmlinuxRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux)",
+            "vmlinux6_1RunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux_6.1)",
+        },
+        "//platforms/configs:linux_arm64": {
+            "initrdRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:initrd.cpio)",
+            "vmlinuxRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux)",
+        },
+    }),
     deps = [
+        "//enterprise/server/oci/ociconv",
         "//enterprise/server/remote_execution/block_io",
         "//enterprise/server/remote_execution/cgroup",
         "//enterprise/server/remote_execution/commandutil",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/copy_on_write",
-        "//enterprise/server/remote_execution/platform",
         "//enterprise/server/remote_execution/snaploader",
         "//enterprise/server/remote_execution/snaputil",
         "//enterprise/server/remote_execution/uffd",
         "//enterprise/server/remote_execution/vbd",
         "//enterprise/server/remote_execution/vmexec_client",
+        "//enterprise/server/util/cpuset",
         "//enterprise/server/util/ext4",
         "//enterprise/server/util/oci",
-        "//enterprise/server/util/ociconv",
         "//enterprise/server/util/vfs_server",
         "//enterprise/server/util/vsock",
         "//enterprise/vmsupport:bundle",
+        "//proto:execution_stats_go_proto",
         "//proto:firecracker_go_proto",
         "//proto:remote_execution_go_proto",
         "//proto:scheduler_go_proto",
@@ -48,25 +63,29 @@ go_library(
         "//server/interfaces",
         "//server/metrics",
         "//server/remote_cache/digest",
-        "//server/util/alert",
         "//server/util/background",
         "//server/util/disk",
+        "//server/util/error_util",
+        "//server/util/flag",
         "//server/util/log",
         "//server/util/networking",
-        "//server/util/proto",
+        "//server/util/platform",
+        "//server/util/retry",
         "//server/util/status",
         "//server/util/tracing",
+        "//server/util/uuid",
         "@com_github_armon_circbuf//:circbuf",
         "@com_github_firecracker_microvm_firecracker_go_sdk//:firecracker-go-sdk",
         "@com_github_firecracker_microvm_firecracker_go_sdk//client/models",
         "@com_github_firecracker_microvm_firecracker_go_sdk//client/operations",
-        "@com_github_google_uuid//:uuid",
         "@com_github_klauspost_cpuid_v2//:cpuid",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_github_sirupsen_logrus//:logrus",
-        "@io_bazel_rules_go//go/runfiles:go_default_library",
+        "@io_bazel_rules_go//go/runfiles",
+        "@io_opentelemetry_go_otel//attribute",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//health/grpc_health_v1",
+        "@org_golang_google_protobuf//types/known/timestamppb",
         "@org_golang_x_sync//errgroup",
         "@org_golang_x_sys//unix",
     ],
@@ -95,22 +114,18 @@ genrule(
 
 # NOTE: to run this test locally, use `test.sh` or `bench.sh`
 #
-# To remotely execute this test, a couple of tag_filters are needed:
-# bazel test --config=remote --test_tag_filters=+bare \
+# To remotely execute this test, select the bare test suite:
+# bazel test --config=remote --config=tests-bare \
 # //enterprise/server/remote_execution/containers/firecracker:firecracker_test
 go_test(
     name = "firecracker_test",
     timeout = "long",
-    srcs = [
-        "firecracker_performance_test.go",
-        "firecracker_test.go",
-    ],
+    srcs = ["firecracker_test.go"],
     args = [
-        "--executor.firecracker_enable_vbd=true",
-        "--executor.firecracker_enable_merged_rootfs=true",
-        "--executor.firecracker_enable_uffd=true",
-        "--executor.enable_local_snapshot_sharing=true",
         "--executor.enable_remote_snapshot_sharing=true",
+        # Uncomment to test the 6.1 kernel.
+        # TODO: turn this on by default once the 6.1 kernel is used everywhere
+        # "--executor.firecracker_enable_linux_6_1=true",
     ],
     exec_properties = {
         "test.Pool": "bare",
@@ -120,26 +135,31 @@ go_test(
         # because of OCI image conversion. Size the task manually to avoid OOM.
         # TODO: include test ext4 images as deps to avoid conversion.
         "test.EstimatedComputeUnits": "10",
+        "test.no-sandbox": "",  # Firecracker is not compatible with Bazel's sandbox environment
     },
     shard_count = 30,
     tags = [
         "bare",  # Firecracker tests must be run with bare execution so they aren't nested within another container
-        "no-sandbox",  # Firecracker is not compatible with Bazel's sandbox environment
     ],
     target_compatible_with = [
         "@platforms//os:linux",
     ],
     deps = [
         ":firecracker",
+        "//enterprise/server/action_cache_server_proxy",
+        "//enterprise/server/byte_stream_server_proxy",
+        "//enterprise/server/clientidentity",
+        "//enterprise/server/oci/ociregistry",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/copy_on_write",
         "//enterprise/server/remote_execution/filecache",
-        "//enterprise/server/remote_execution/platform",
         "//enterprise/server/remote_execution/snaploader",
         "//enterprise/server/remote_execution/snaputil",
-        "//enterprise/server/remote_execution/vbd",
         "//enterprise/server/remote_execution/workspace",
+        "//enterprise/server/tasksize",
         "//enterprise/server/testutil/testcontainer",
+        "//enterprise/server/testutil/testregistry",
+        "//enterprise/server/util/cpuset",
         "//enterprise/server/util/ext4",
         "//enterprise/server/util/oci",
         "//proto:firecracker_go_proto",
@@ -150,21 +170,25 @@ go_test(
         "//server/remote_cache/action_cache_server",
         "//server/remote_cache/byte_stream_server",
         "//server/remote_cache/content_addressable_storage_server",
-        "//server/remote_cache/digest",
         "//server/resources",
+        "//server/rpc/interceptors",
         "//server/testutil/testauth",
         "//server/testutil/testdigest",
         "//server/testutil/testenv",
         "//server/testutil/testfs",
         "//server/testutil/testmetrics",
         "//server/testutil/testnetworking",
+        "//server/testutil/testport",
         "//server/util/disk",
         "//server/util/log",
         "//server/util/networking",
+        "//server/util/platform",
+        "//server/util/prefix",
+        "//server/util/random",
         "//server/util/status",
         "//server/util/testing/flags",
-        "//server/util/tracing",
         "@com_github_google_go_cmp//cmp",
+        "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",

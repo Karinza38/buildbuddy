@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/accumulator"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	cmnpb "github.com/buildbuddy-io/buildbuddy/proto/api/v1/common"
@@ -13,10 +14,10 @@ import (
 	api_common "github.com/buildbuddy-io/buildbuddy/server/api/common"
 )
 
-const (
+var (
 	// Only index up to this many non-important events as a safeguard against
 	// excessive memory / CPU consumption.
-	maxEventCount = 2_000_000
+	maxEventCount = flag.Int("app.max_indexed_event_count", 2_000_000, "Maximum number of non-important build events to index. Events beyond this limit are dropped to prevent excessive memory/CPU consumption.")
 )
 
 // Index holds a few data structures to make it easier to aggregate data from
@@ -35,8 +36,9 @@ type Index struct {
 	// top-level invocation proto.
 	TopLevelEvents []*inpb.InvocationEvent
 
-	eventCount      int
-	rootCauseLabels map[string]bool
+	eventCount            int
+	rootCauseLabels       map[string]bool
+	fullyCachedTestLabels map[string]bool
 }
 
 func New() *Index {
@@ -48,13 +50,14 @@ func New() *Index {
 		TestResultEventsByLabel:    map[string][]*bespb.BuildEvent{},
 		NamedSetOfFilesByID:        map[string]*bespb.NamedSetOfFiles{},
 		rootCauseLabels:            map[string]bool{},
+		fullyCachedTestLabels:      map[string]bool{},
 	}
 }
 
 // Add adds a single event to the index.
 // Don't forget to call Finalize once all events are added.
 func (idx *Index) Add(event *inpb.InvocationEvent) {
-	if idx.eventCount >= maxEventCount && !accumulator.IsImportantEvent(event.GetBuildEvent()) {
+	if idx.eventCount >= *maxEventCount && !accumulator.IsImportantEvent(event.GetBuildEvent()) {
 		return
 	}
 	idx.eventCount++
@@ -141,6 +144,9 @@ func (idx *Index) Add(event *inpb.InvocationEvent) {
 			Timing:      api_common.TestTimingFromSummary(summary),
 			TestSummary: summary,
 		}
+		if summary.GetTotalNumCached() == summary.GetTotalRunCount() {
+			idx.fullyCachedTestLabels[label] = true
+		}
 	case *bespb.BuildEvent_TestResult:
 		label := event.GetBuildEvent().GetId().GetTestResult().GetLabel()
 		idx.TestResultEventsByLabel[label] = append(idx.TestResultEventsByLabel[label], event.GetBuildEvent())
@@ -172,6 +178,14 @@ func (idx *Index) Add(event *inpb.InvocationEvent) {
 		if target != nil && reason == bespb.Aborted_SKIPPED {
 			target.Status = cmnpb.Status_SKIPPED
 		}
+
+		// INCOMPLETE means "incomplete due to an earlier build failure" and
+		// it's not very useful to show these in the UI (the earlier build
+		// failure itself is more useful), so don't return these to the UI.
+		if reason == bespb.Aborted_INCOMPLETE {
+			return
+		}
+
 		// TODO: the UI might rely on the Aborted event to render the invocation
 		// pattern in some cases. Remove this dependency and then stop adding
 		// Aborted events to the TopLevelEvents list, since these may appear a
@@ -227,23 +241,18 @@ func (idx *Index) Finalize() {
 	// Sort TargetsByStatus list values.
 	for _, targets := range idx.TargetsByStatus {
 		sort.Slice(targets, func(i, j int) bool {
-			// Root cause targets should be sorted first. Compute a ranking
-			// that's 0 if root cause, 1 otherwise, and compare that ranking
-			// first.
-			ri := boolToInt(!targets[i].RootCause)
-			rj := boolToInt(!targets[j].RootCause)
+			// Root cause targets should be sorted first, then non-cached
+			// targets, then cached targets. Within each group, sort by label.
+			ri, rj := targets[i].RootCause, targets[j].RootCause
 			if ri != rj {
-				return ri < rj
+				return ri
 			}
-
-			return targets[i].GetMetadata().GetLabel() < targets[j].GetMetadata().GetLabel()
+			li, lj := targets[i].GetMetadata().GetLabel(), targets[j].GetMetadata().GetLabel()
+			ci, cj := idx.fullyCachedTestLabels[li], idx.fullyCachedTestLabels[lj]
+			if ci != cj {
+				return !ci
+			}
+			return li < lj
 		})
 	}
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

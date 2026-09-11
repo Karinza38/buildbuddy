@@ -18,7 +18,7 @@ go_library(
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:windows": [
-            "//server/util/status",
+            "@org_golang_x_sys//windows",
         ],
         "//conditions:default": [],
     }),
@@ -26,7 +26,13 @@ go_library(
 
 go_test(
     name = "fastcopy_test",
-    srcs = ["fastcopy_test.go"],
+    srcs = [
+        "fastcopy_test.go",
+        "fastcopy_windows_test.go",
+    ],
+    args = [
+        "-test.skip=^Benchmark",
+    ],
     exec_properties = {
         "test.workload-isolation-type": "firecracker",
         "test.recycle-runner": "true",
@@ -43,5 +49,31 @@ go_test(
         "//server/testutil/testshell",
         "//server/util/testing/flags",
         "@com_github_stretchr_testify//require",
+    ] + select({
+        "@io_bazel_rules_go//go/platform:windows": [
+            "@org_golang_x_sys//windows",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+go_test(
+    name = "fastcopy_benchmark_test",
+    srcs = ["fastcopy_windows_test.go"],
+    args = [
+        "-test.skip=^Test",
+        "-test.bench=BenchmarkWindowsFastCopy",
+        "-test.benchtime=1x",
+    ],
+    tags = ["performance"],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":fastcopy",
+        "//proto:remote_execution_go_proto",
+        "//server/remote_cache/digest",
+        "//server/testutil/testfs",
+        "//server/util/testing/flags",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_x_sys//windows",
     ],
 )

@@ -3,12 +3,14 @@ package leasekeeper
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/client"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/events"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/keys"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/listener"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/nodeliveness"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/rangelease"
@@ -16,6 +18,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/boundedstack"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lib/set"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/lni/dragonboat/v4"
@@ -62,18 +65,17 @@ func (l leaseInstruction) String() string {
 
 type LeaseKeeper struct {
 	nodeHost  *dragonboat.NodeHost
+	zone      string
 	log       log.Logger
 	liveness  *nodeliveness.Liveness
 	session   *client.Session
 	listener  *listener.RaftListener
 	broadcast chan<- events.Event
 
-	// map rangeID -> leaseAgent
-	leases sync.Map
-
 	mu      sync.Mutex
-	leaders map[rangeID]bool
-	open    map[rangeID]bool
+	leases  map[rangeID]*leaseAgent
+	leaders set.Set[rangeID]
+	open    set.Set[rangeID]
 
 	eg       *errgroup.Group
 	egCtx    context.Context
@@ -82,23 +84,26 @@ type LeaseKeeper struct {
 	quitAll chan struct{}
 
 	leaderUpdates       <-chan raftio.LeaderInfo
+	nodeUnloaded        <-chan raftio.NodeInfo
 	nodeLivenessUpdates <-chan *rfpb.NodeLivenessRecord
 }
 
-func New(nodeHost *dragonboat.NodeHost, log log.Logger, liveness *nodeliveness.Liveness, listener *listener.RaftListener, broadcast chan<- events.Event, session *client.Session) *LeaseKeeper {
+func New(nodeHost *dragonboat.NodeHost, zone string, log log.Logger, liveness *nodeliveness.Liveness, listener *listener.RaftListener, broadcast chan<- events.Event, session *client.Session) *LeaseKeeper {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	eg, gctx := errgroup.WithContext(ctx)
 	return &LeaseKeeper{
 		nodeHost:            nodeHost,
+		zone:                zone,
 		log:                 log,
 		liveness:            liveness,
 		session:             session,
 		listener:            listener,
 		broadcast:           broadcast,
-		leases:              sync.Map{},
-		leaders:             make(map[rangeID]bool),
-		open:                make(map[rangeID]bool),
+		leases:              make(map[rangeID]*leaseAgent),
+		leaders:             make(set.Set[rangeID]),
+		open:                make(set.Set[rangeID]),
 		leaderUpdates:       listener.AddLeaderChangeListener(listenerID),
+		nodeUnloaded:        listener.AddNodeUnloadedListener(listenerID),
 		nodeLivenessUpdates: liveness.AddListener(),
 
 		eg:       eg,
@@ -130,15 +135,39 @@ func (lk *LeaseKeeper) Stop() {
 // and created via LoadOrStore(), a leaseAgent's goroutine is not started until
 // the first instruction is enqueued.
 type leaseAgent struct {
+	replicaID uint64
 	log       log.Logger
 	l         *rangelease.Lease
 	ctx       context.Context
 	cancel    context.CancelFunc
 	eg        *errgroup.Group
-	once      *sync.Once
 	broadcast chan<- events.Event
 
+	// labels is the standard per-range metric labelset (range, nodehost,
+	// partition, zone) for this lease agent's range. Computed once at
+	// creation and immutable thereafter, so it can be read without locking.
+	labels prometheus.Labels
+
 	updates *boundedstack.BoundedStack[*leaseInstruction]
+}
+
+func (la *leaseAgent) isStopped() bool {
+	select {
+	case <-la.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// setLeaderGauge records whether this node is the raft leader for the agent's
+// range, keyed by the full per-range labelset.
+func (la *leaseAgent) setLeaderGauge(leader bool) {
+	v := 0.0
+	if leader {
+		v = 1.0
+	}
+	metrics.RaftLeaders.With(la.labels).Set(v)
 }
 
 func (la *leaseAgent) sendRangeEvent(eventType events.EventType) {
@@ -149,7 +178,11 @@ func (la *leaseAgent) sendRangeEvent(eventType events.EventType) {
 	case la.broadcast <- ev:
 		break
 	default:
-		la.log.Warningf("Dropping range event: %+v", ev)
+		metrics.RaftStoreEventBroadcastDropped.With(prometheus.Labels{
+			metrics.RaftEventBroadcaster: "leasekeeper",
+			metrics.RaftEventType:        ev.EventType().String(),
+		}).Inc()
+		la.log.Warningf("leaseAgent dropped range event: %+v", ev)
 	}
 }
 
@@ -157,38 +190,56 @@ func (la *leaseAgent) doSingleInstruction(ctx context.Context, instruction *leas
 	valid := la.l.Valid(ctx)
 	start := time.Now()
 
+	rangeID := la.l.GetRangeID()
+
 	switch instruction.action {
 	case Acquire:
+		// If the lease is already valid, early-return here.
+		if valid {
+			return
+		}
 		err := la.l.Lease(ctx)
+		dur := time.Since(start)
+		leaseAction := "Acquire"
 		metrics.RaftLeaseActionCount.With(prometheus.Labels{
-			metrics.RaftRangeIDLabel:         strconv.Itoa(int(la.l.GetRangeDescriptor().GetRangeId())),
-			metrics.RaftLeaseActionLabel:     "Acquire",
+			metrics.RaftRangeIDLabel:         strconv.Itoa(int(rangeID)),
+			metrics.RaftLeaseActionLabel:     leaseAction,
 			metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
 		}).Inc()
 		if err != nil {
-			la.log.Errorf("Error acquiring rangelease (%s): %s %s", la.l.Desc(ctx), err, instruction)
+			la.log.Errorf("Error acquiring rangelease (%s): %s %s after %s", la.l.Desc(ctx), err, instruction, dur)
 			return
 		}
-		if !valid {
-			la.log.Debugf("Acquired lease [%s] %s after callback (%s)", la.l.Desc(ctx), time.Since(start), instruction)
-			la.sendRangeEvent(events.EventRangeLeaseAcquired)
-		}
+		la.log.Debugf("Acquired lease [%s] %s after callback (%s)", la.l.Desc(ctx), dur, instruction)
+		metrics.RaftLeases.With(la.labels).Set(1.0)
+		metrics.RaftLeaseActionDurationMsec.With(prometheus.Labels{
+			metrics.RaftLeaseActionLabel: leaseAction,
+		}).Observe(float64(dur.Milliseconds()))
+		la.sendRangeEvent(events.EventRangeLeaseAcquired)
 	case Drop:
+		// If the lease is already invalid, early-return here.
+		if !valid {
+			return
+		}
+		leaseAction := "Drop"
 		// This is a no-op if we don't have the lease.
 		err := la.l.Release(ctx)
+		dur := time.Since(start)
 		metrics.RaftLeaseActionCount.With(prometheus.Labels{
-			metrics.RaftRangeIDLabel:         strconv.Itoa(int(la.l.GetRangeDescriptor().GetRangeId())),
-			metrics.RaftLeaseActionLabel:     "Drop",
+			metrics.RaftRangeIDLabel:         strconv.Itoa(int(rangeID)),
+			metrics.RaftLeaseActionLabel:     leaseAction,
 			metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
 		}).Inc()
 		if err != nil {
 			la.log.Errorf("Error dropping rangelease (%s): %s (%s)", la.l.Desc(ctx), err, instruction)
 			return
 		}
-		if valid {
-			la.log.Debugf("Dropped lease [%s] %s after callback (%s)", la.l.Desc(ctx), time.Since(start), instruction)
-			la.sendRangeEvent(events.EventRangeLeaseDropped)
-		}
+		la.log.Debugf("Dropped lease [%s] %s after callback (%s)", la.l.Desc(ctx), dur, instruction)
+		metrics.RaftLeases.With(la.labels).Set(0.0)
+		metrics.RaftLeaseActionDurationMsec.With(prometheus.Labels{
+			metrics.RaftLeaseActionLabel: leaseAction,
+		}).Observe(float64(dur.Milliseconds()))
+		la.sendRangeEvent(events.EventRangeLeaseDropped)
 	}
 }
 
@@ -211,32 +262,35 @@ func (la *leaseAgent) runloop() {
 }
 
 func (la *leaseAgent) queueInstruction(instruction *leaseInstruction) {
-	la.once.Do(func() {
-		la.eg.Go(func() error {
-			la.runloop()
-			return nil
-		})
-	})
+	if la.isStopped() {
+		return
+	}
 	la.updates.Push(instruction)
 }
 
-func (lk *LeaseKeeper) newLeaseAgent(rd *rfpb.RangeDescriptor, r *replica.Replica) leaseAgent {
+func (lk *LeaseKeeper) newLeaseAgent(rd *rfpb.RangeDescriptor, r *replica.Replica) *leaseAgent {
 	ctx, cancel := context.WithCancel(context.TODO())
 	updates, err := boundedstack.New[*leaseInstruction](1)
 	eg, gctx := errgroup.WithContext(ctx)
 	if err != nil {
 		alert.UnexpectedEvent("unexpected_boundedstack_error", err)
 	}
-	return leaseAgent{
+	la := &leaseAgent{
+		replicaID: r.ReplicaID(),
 		log:       lk.log,
-		l:         rangelease.New(lk.nodeHost, lk.session, lk.log, lk.liveness, rd, r),
+		l:         rangelease.New(lk.nodeHost, lk.session, lk.log, lk.liveness, rd.GetRangeId(), r),
 		ctx:       gctx,
 		cancel:    cancel,
 		eg:        eg,
-		once:      &sync.Once{},
 		broadcast: lk.broadcast,
+		labels:    keys.RangeMetricLabels(rd, lk.nodeHost.ID(), lk.zone),
 		updates:   updates,
 	}
+	la.eg.Go(func() error {
+		la.runloop()
+		return nil
+	})
+	return la
 }
 
 func (lk *LeaseKeeper) watchLeases() {
@@ -251,16 +305,24 @@ func (lk *LeaseKeeper) watchLeases() {
 			rangeID := rangeID(info.ShardID)
 
 			lk.mu.Lock()
-			open := lk.open[rangeID]
-			lk.leaders[rangeID] = leader
+			open := lk.open.Contains(rangeID)
+			if leader {
+				lk.leaders.Add(rangeID)
+			} else {
+				lk.leaders.Remove(rangeID)
+			}
+			la := lk.leases[rangeID]
 			lk.mu.Unlock()
 
-			laI, ok := lk.leases.Load(rangeID)
-			if !ok {
+			if la == nil {
+				// We don't have a lease agent for this range yet, so we
+				// can't build the full RaftLeaders labelset. The gauge is
+				// emitted once the range is added (see setLeaderGauge in
+				// AddRange) and on subsequent leader updates.
 				lk.log.Debugf("Range %d has not been opened yet (ignoring leader update)", rangeID)
 				continue
 			}
-			la := laI.(leaseAgent)
+			la.setLeaderGauge(leader)
 			action := Drop
 			if open && leader {
 				action = Acquire
@@ -271,21 +333,26 @@ func (lk *LeaseKeeper) watchLeases() {
 				action:  action,
 			})
 		case <-lk.egCtx.Done():
-			lk.leases.Range(func(key, val any) bool {
-				la := val.(leaseAgent)
+			lk.mu.Lock()
+			leases := make([]*leaseAgent, 0, len(lk.leases))
+			for _, la := range lk.leases {
+				leases = append(leases, la)
+			}
+			lk.mu.Unlock()
+			for _, la := range leases {
 				la.stop()
-				return true // continue iterating
-			})
+			}
 			lk.listener.RemoveLeaderChangeListener(listenerID)
+			lk.listener.RemoveNodeUnloadedListener(listenerID)
 			return
 		case <-lk.nodeLivenessUpdates:
-			lk.leases.Range(func(key, val any) bool {
-				rangeID := key.(rangeID)
-				la := val.(leaseAgent)
-
+			lk.mu.Lock()
+			leases := maps.Clone(lk.leases)
+			lk.mu.Unlock()
+			for rangeID, la := range leases {
 				action := Drop
 				lk.mu.Lock()
-				if lk.open[rangeID] && lk.leaders[rangeID] {
+				if lk.open.Contains(rangeID) && lk.leaders.Contains(rangeID) {
 					action = Acquire
 				}
 				lk.mu.Unlock()
@@ -295,19 +362,54 @@ func (lk *LeaseKeeper) watchLeases() {
 					reason:  "node liveness update",
 					action:  action,
 				})
-				return true // continue iterating
-			})
+			}
+		case nodeInfo, ok := <-lk.nodeUnloaded:
+			if !ok {
+				// channel was closed and drained
+				continue
+			}
+			rangeID := rangeID(nodeInfo.ShardID)
+			lk.mu.Lock()
+			la := lk.leases[rangeID]
+			delete(lk.leases, rangeID)
+			lk.mu.Unlock()
+			if la != nil {
+				if la.replicaID == nodeInfo.ReplicaID {
+					// This is the terminal teardown for the range's replica
+					// on this node. Remove its RaftLeaders/RaftLeases series
+					// so a stale leader=1 or lease=1 value doesn't linger:
+					// once the lease agent is gone, later callbacks find no
+					// agent and are dropped, so nothing else would reset the
+					// gauges. (stop() does not process a lease Drop.)
+					metrics.RaftLeaders.Delete(la.labels)
+					metrics.RaftLeases.Delete(la.labels)
+					la.stop()
+				}
+			}
 		}
 	}
 }
 
 func (lk *LeaseKeeper) isStopped() bool {
-	select {
-	case <-lk.egCtx.Done():
-		return true
-	default:
-		return false
+	return lk.egCtx.Err() != nil
+}
+
+func (lk *LeaseKeeper) loadOrStoreNewLeaseAgent(rd *rfpb.RangeDescriptor, r *replica.Replica) *leaseAgent {
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
+	rangeID := rangeID(rd.GetRangeId())
+	la := lk.leases[rangeID]
+	if la != nil {
+		if la.replicaID == r.ReplicaID() {
+			// the store lease agent is for the same replica id, we don't need to create a new lease agent.
+			return la
+		}
+		lk.log.Warningf("stored leaseAgent is for c%dn%d, but the current replica is c%dn%d, overwriting", rangeID, la.replicaID, rangeID, r.ReplicaID())
 	}
+	la = lk.newLeaseAgent(rd, r)
+	lk.leases[rangeID] = la
+	lk.log.Infof("create new lease agent for c%dn%d", rangeID, la.replicaID)
+	return la
 }
 
 func (lk *LeaseKeeper) AddRange(rd *rfpb.RangeDescriptor, r *replica.Replica) {
@@ -319,25 +421,26 @@ func (lk *LeaseKeeper) AddRange(rd *rfpb.RangeDescriptor, r *replica.Replica) {
 	if len(rd.GetReplicas()) == 0 {
 		return
 	}
-	rangeID := rangeID(rd.GetRangeId())
-	laI, _ := lk.leases.LoadOrStore(rangeID, lk.newLeaseAgent(rd, r))
+	la := lk.loadOrStoreNewLeaseAgent(rd, r)
 
+	rangeID := rangeID(rd.GetRangeId())
 	// When a range is added via AddRange(), the raft leader may already
 	// have been chosen, meaning that `watchLeases` will not receive
 	// additional callbacks that would trigger range lease acquisition. So
 	// for newly added ranges, check if this node is the leader and trigger
 	// lease acquisition here.
 	lk.mu.Lock()
-	lk.open[rangeID] = true
-	leader := lk.leaders[rangeID]
+	lk.open.Add(rangeID)
+	leader := lk.leaders.Contains(rangeID)
 	lk.mu.Unlock()
+
+	la.setLeaderGauge(leader)
 
 	action := Drop
 	if leader {
 		action = Acquire
 	}
 
-	la := laI.(leaseAgent)
 	la.queueInstruction(&leaseInstruction{
 		rangeID: rangeID,
 		reason:  "Add range",
@@ -357,11 +460,11 @@ func (lk *LeaseKeeper) RemoveRange(rd *rfpb.RangeDescriptor, r *replica.Replica)
 	rangeID := rangeID(rd.GetRangeId())
 
 	lk.mu.Lock()
-	lk.open[rangeID] = false
+	lk.open.Remove(rangeID)
+	la := lk.leases[rangeID]
 	lk.mu.Unlock()
 
-	if laI, ok := lk.leases.Load(rangeID); ok {
-		la := laI.(leaseAgent)
+	if la != nil {
 		la.queueInstruction(&leaseInstruction{
 			rangeID: rangeID,
 			reason:  "remove range",
@@ -372,28 +475,39 @@ func (lk *LeaseKeeper) RemoveRange(rd *rfpb.RangeDescriptor, r *replica.Replica)
 
 func (lk *LeaseKeeper) LeaseCount(ctx context.Context) int64 {
 	leaseCount := int64(0)
-	lk.leases.Range(func(key, value any) bool {
-		la := value.(leaseAgent)
+	lk.mu.Lock()
+	leases := make([]*leaseAgent, 0, len(lk.leases))
+	for _, la := range lk.leases {
+		leases = append(leases, la)
+	}
+	lk.mu.Unlock()
+
+	for _, la := range leases {
 		if la.l.Valid(ctx) {
 			leaseCount += 1
 		}
-		return true
-	})
+	}
 	return leaseCount
 }
 
 func (lk *LeaseKeeper) HaveLease(ctx context.Context, rid uint64) bool {
 	rangeID := rangeID(rid)
-	if lacI, ok := lk.leases.Load(rangeID); ok {
-		la := lacI.(leaseAgent)
-		valid := la.l.Valid(ctx)
+	lk.mu.Lock()
+	la := lk.leases[rangeID]
+	lk.mu.Unlock()
 
-		lk.mu.Lock()
-		leader := lk.leaders[rangeID]
-		open := lk.open[rangeID]
-		lk.mu.Unlock()
+	if la == nil {
+		return false
+	}
+	valid := la.l.Valid(ctx)
 
-		shouldHaveLease := leader && open
+	lk.mu.Lock()
+	leader := lk.leaders.Contains(rangeID)
+	open := lk.open.Contains(rangeID)
+	lk.mu.Unlock()
+
+	shouldHaveLease := leader && open
+	if !lk.isStopped() {
 		if shouldHaveLease && !valid {
 			lk.log.CtxWarningf(ctx, "HaveLease range: %d valid: %t, should have lease: %t", rangeID, valid, shouldHaveLease)
 			la.queueInstruction(&leaseInstruction{
@@ -409,7 +523,6 @@ func (lk *LeaseKeeper) HaveLease(ctx context.Context, rid uint64) bool {
 				action:  Drop,
 			})
 		}
-		return valid
 	}
-	return false
+	return valid && shouldHaveLease
 }

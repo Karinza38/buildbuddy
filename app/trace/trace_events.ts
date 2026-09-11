@@ -5,6 +5,8 @@
  * https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview#heading=h.yr4qxyxotyw
  */
 
+import { nextAnimationFrame } from "../util/async";
+
 /** Represents the profile data for an invocation. */
 export interface Profile {
   traceEvents: TraceEvent[];
@@ -46,43 +48,122 @@ export type TimeSeriesEvent = TraceEvent & {
 export type TimeSeries = {
   name: string;
   events: TimeSeriesEvent[];
+  unit?: string;
 };
 
-// Matches strings like "skyframe evaluator 1", "grpc-command-0", etc., splitting the
-// non-numeric prefix and numeric suffix into separate match groups.
-const NUMBERED_THREAD_NAME_PATTERN = /^(?<prefix>[^\d]+)(?<number>\d+)$/;
+export type SeriesMetadata = {
+  argKey: string;
+  displayName?: string;
+  unit?: string;
+};
 
-// A list of names of events that contain a timestamp and a value in args.
+// Per-series overrides for counter events that contain a timestamp and a value
+// in args.
+//
+// The names from Bazel profiles will be displayed as-is, unless a displayName
+// is provided in the seriesMetadata object.
+//
+// Unknown counter events with numeric args are also rendered automatically.
+// The order of the entries in this list determines the order in which known
+// timeseries are displayed in the trace viewer panel.
+//
 // An example event for Bazel CPU usage looks like this:
-// {"name": "CPU usage (bazel)", ..., "args": {"cpu": 0.84}}
-const TIME_SERIES_EVENT_NAMES_AND_ARG_KEYS: Map<string, string> = new Map([
+// {
+//   "name": "CPU usage (bazel)",
+//   ...,
+//   "args": {"cpu": 0.84}
+// }
+export const TIME_SERIES_METADATA = new Map<string, SeriesMetadata[]>([
   // Event names/arg keys from Bazel profiles.
   // These are defined by bazel / not controlled by us.
-  ["action count", "action"],
-  ["CPU usage (Bazel)", "cpu"],
-  ["Memory usage (Bazel)", "memory"],
-  ["CPU usage (total)", "system cpu"],
-  ["Memory usage (total)", "system memory"],
-  ["System load average", "load"],
-  ["Network Up usage (total)", "system network up (Mbps)"],
-  ["Network Down usage (total)", "system network down (Mbps)"],
+  [
+    "action count",
+    [
+      { argKey: "action", displayName: "Action count" },
+      { argKey: "local action cache", displayName: "Local action cache hits" },
+    ],
+  ],
+  ["action count (local)", [{ argKey: "local action", displayName: "Action count (local)" }]],
+  ["CPU usage (Bazel)", [{ argKey: "cpu", unit: "cores" }]],
+  ["Memory usage (Bazel)", [{ argKey: "memory", unit: "MB" }]],
+  ["CPU usage (total)", [{ argKey: "system cpu", displayName: "CPU usage (System)", unit: "cores" }]],
+  ["Memory usage (total)", [{ argKey: "system memory", unit: "MB" }]],
+  ["System load average", [{ argKey: "load" }]],
+  [
+    "Network Up usage (total)",
+    [{ argKey: "system network up (Mbps)", displayName: "Network Up usage (System)", unit: "Mbps" }],
+  ],
+  [
+    "Network Down usage (total)",
+    [{ argKey: "system network down (Mbps)", displayName: "Network Down usage (System)", unit: "Mbps" }],
+  ],
 
   // Event names/arg keys from executor profiles.
   // These are controlled by us, and defined in
   // enterprise/server/execution_service/execution_service.go
-  ["CPU usage (cores)", "cpu"],
-  ["Memory usage (KB)", "memory"],
+  ["CPU usage (cores)", [{ argKey: "cpu" }]],
+  ["Memory usage (KB)", [{ argKey: "memory" }]],
+  ["GPU memory usage (KB)", [{ argKey: "gpu-memory" }]],
+  ["Disk read bandwidth (MB/s)", [{ argKey: "disk-read-bw" }]],
+  ["Disk read IOPS", [{ argKey: "disk-read-iops" }]],
+  ["Disk write bandwidth (MB/s)", [{ argKey: "disk-write-bw" }]],
+  ["Disk write IOPS", [{ argKey: "disk-write-iops" }]],
+
+  // Event names/arg keys are from ninja. These are controlled
+  // by us.
+  ["CPU usage (ninja)", [{ argKey: "cpu", unit: "cores" }]],
+  ["Memory usage (ninja)", [{ argKey: "memory", unit: "MB" }]],
 ]);
 
-export async function readProfile(
-  body: ReadableStream<Uint8Array>,
-  progress?: (numBytesLoaded: number) => void
-): Promise<Profile> {
+export const TIME_SERIES_EVENT_ORDER = new Map(Array.from(TIME_SERIES_METADATA).map(([name], index) => [name, index]));
+const GZIP_MAGIC_BYTE_0 = 0x1f;
+const GZIP_MAGIC_BYTE_1 = 0x8b;
+
+export type ProfileInput = Blob | ReadableStream<Uint8Array<ArrayBuffer>>;
+export type ProfileProgressCallback = (numBytesLoaded: number, done?: boolean) => void;
+export type TraceEventBatchCallback = (events: TraceEvent[]) => void;
+
+async function isGzipCompressed(blob: Blob): Promise<boolean> {
+  const header = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+  return header[0] === GZIP_MAGIC_BYTE_0 && header[1] === GZIP_MAGIC_BYTE_1;
+}
+
+export async function readProfile(input: ProfileInput, progress?: ProfileProgressCallback): Promise<Profile> {
+  const profile: Profile = { traceEvents: [] };
+  await readProfileEvents(
+    input,
+    (events) => {
+      for (const event of events) {
+        profile.traceEvents.push(event);
+      }
+    },
+    progress
+  );
+  return profile;
+}
+
+export async function readProfileEvents(
+  input: ProfileInput,
+  consumeEventBatch: TraceEventBatchCallback,
+  progress?: ProfileProgressCallback
+): Promise<void> {
+  let body: ReadableStream<Uint8Array<ArrayBuffer>>;
+  if (input instanceof Blob) {
+    body = input.stream();
+    if (await isGzipCompressed(input)) {
+      if (typeof DecompressionStream === "undefined") {
+        throw new Error("This browser can't read gzipped timing profiles from local files.");
+      }
+      body = body.pipeThrough(new DecompressionStream("gzip"));
+    }
+  } else {
+    body = input;
+  }
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
   let n = 0;
   let buffer = "";
-  let profile: Profile | null = null;
+  let foundTraceEvents = false;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -96,39 +177,42 @@ export async function readProfile(
     // Keep accumulating into the buffer until we see the "traceEvents" array.
     // Each entry in this array is newline-delimited (a special property of
     // Google's trace event JSON format).
-    if (!profile) {
+    if (!foundTraceEvents) {
       const beginMarker = '"traceEvents":[\n';
       const index = buffer.indexOf(beginMarker);
       if (index < 0) continue;
 
-      const before = buffer.substring(0, index + beginMarker.length);
-      const after = buffer.substring(before.length);
-
-      const outerJSON = before + "]}";
-      profile = JSON.parse(outerJSON) as Profile;
-      buffer = after;
+      buffer = buffer.substring(index + beginMarker.length);
+      foundTraceEvents = true;
     }
-    if (profile) {
-      buffer = consumeEvents(buffer, profile);
-    }
+    buffer = consumeEvents(buffer, consumeEventBatch);
   }
+  if (progress) {
+    progress(n, true);
+    // Allow drawing the final progress frame. Some heavy CPU work happens while
+    // finalizing the profile, so this helps the UI not appear "stuck" while
+    // this happens.
+    await nextAnimationFrame();
+  }
+
+  buffer += decoder.decode();
+  if (!foundTraceEvents) {
+    throw new Error("failed to parse timing profile JSON");
+  }
+
   // Consume last event, which isn't guaranteed to end with ",\n"
   if (buffer) {
     const { chars, suffix } = trailingNonWhitespaceChars(buffer, 2);
     if (chars === "]}") {
       buffer = buffer.substring(0, buffer.length - suffix.length);
     }
-    if (buffer) {
-      const event = JSON.parse(buffer);
-      profile?.traceEvents.push(event);
-      buffer = "";
+    if (buffer.trim()) {
+      const eventJSON = buffer.trim();
+      consumeEventBatch([
+        JSON.parse(eventJSON.endsWith(",") ? eventJSON.substring(0, eventJSON.length - 1) : eventJSON),
+      ]);
     }
   }
-
-  if (!profile) {
-    throw new Error("failed to parse timing profile JSON");
-  }
-  return profile;
 }
 
 /**
@@ -148,12 +232,16 @@ function trailingNonWhitespaceChars(text: string, count: number) {
   return { chars: out, suffix: text.substring(i + 1) };
 }
 
-function consumeEvents(buffer: string, profile: Profile): string {
+function consumeEvents(buffer: string, consumeEventBatch: TraceEventBatchCallback): string {
   // Each event entry looks like "   { ... },\n"
   const parts = buffer.split(",\n");
   const completeEvents = parts.slice(0, parts.length - 1);
+  const events: TraceEvent[] = [];
   for (const rawEvent of completeEvents) {
-    profile!.traceEvents.push(JSON.parse(rawEvent));
+    events.push(JSON.parse(rawEvent));
+  }
+  if (events.length) {
+    consumeEventBatch(events);
   }
   // If there's a partial event at the end, that partial event becomes the new
   // buffer value.
@@ -177,50 +265,54 @@ function eventComparator(a: TraceEvent, b: TraceEvent) {
 }
 
 function timeSeriesEventComparator(a: TraceEvent, b: TraceEvent) {
-  // Group by name.
+  // Group by name, respecting sort order if defined.
+  const aOrder = TIME_SERIES_EVENT_ORDER.get(a.name);
+  const bOrder = TIME_SERIES_EVENT_ORDER.get(b.name);
+  if (aOrder !== undefined || bOrder !== undefined) {
+    if (aOrder === undefined) return 1;
+    if (bOrder === undefined) return -1;
+    const orderDiff = aOrder - bOrder;
+    if (orderDiff !== 0) return orderDiff;
+  }
   const nameDiff = a.name.localeCompare(b.name);
   if (nameDiff !== 0) return nameDiff;
 
-  // Sort in increasing order of start time;
+  // Sort in increasing order of start time.
   const tsDiff = a.ts - b.ts;
   return tsDiff;
 }
 
-const threadOrder: { [key: string]: number } = {
-  "critical path": 1,
-  "main thread": 2,
-  "notification thread": 3,
-  "skyframe evaluator execution": 4,
-  "skyframe evaluator": 5,
-  "skyframe evaluator cpu heavy": 6,
-  "remote executor": 7,
-};
-
-function normalizeThreadName(name: string) {
-  return name.toLowerCase().replaceAll("-", " ").trim();
+/** Returns whether a trace event arg value can be plotted as a time series value. */
+export function isNumericTimeSeriesValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
-function timelineComparator(a: ThreadTimeline, b: ThreadTimeline) {
-  // Within numbered thread names (e.g. "skyframe evaluator 0", "grpc-command-0"), sort
-  // numerically.
-  const matchA = a.threadName.match(NUMBERED_THREAD_NAME_PATTERN)?.groups;
-  const matchB = b.threadName.match(NUMBERED_THREAD_NAME_PATTERN)?.groups;
-  if (matchA && matchB && matchA["prefix"] === matchB["prefix"]) {
-    return Number(matchA["number"]) - Number(matchB["number"]);
+function inferTimeSeriesMetadata(events: TraceEvent[]): Map<string, SeriesMetadata[]> {
+  const numericArgKeysByName = new Map<string, Set<string>>();
+  for (const event of events) {
+    if (TIME_SERIES_METADATA.has(event.name) || event.ph !== "C") continue;
+
+    const numericArgKeys = Object.entries(event.args ?? {})
+      .filter(([, value]) => isNumericTimeSeriesValue(value))
+      .map(([key]) => key);
+    if (!numericArgKeys.length) continue;
+
+    const keys = numericArgKeysByName.get(event.name) ?? new Set<string>();
+    numericArgKeys.forEach((key) => keys.add(key));
+    numericArgKeysByName.set(event.name, keys);
   }
 
-  // For known threads, show the most interesting ones first.
-  if (
-    matchA &&
-    matchB &&
-    threadOrder[normalizeThreadName(matchA["prefix"])] &&
-    threadOrder[normalizeThreadName(matchB["prefix"])]
-  ) {
-    return threadOrder[normalizeThreadName(matchA["prefix"])] - threadOrder[normalizeThreadName(matchB["prefix"])];
-  }
-
-  // Sort other timelines lexicographically by thread name.
-  return a.threadName.localeCompare(b.threadName);
+  return new Map(
+    Array.from(numericArgKeysByName.entries()).map(([name, argKeys]) => {
+      const keys = Array.from(argKeys).sort((a, b) => a.localeCompare(b));
+      return [
+        name,
+        keys.length === 1
+          ? [{ argKey: keys[0] }]
+          : keys.map((argKey) => ({ argKey, displayName: `${name}: ${argKey}` })),
+      ];
+    })
+  );
 }
 
 function getThreadNames(events: TraceEvent[]) {
@@ -237,36 +329,68 @@ function normalizeThreadNames(events: TraceEvent[]) {
   for (const event of events as ThreadEvent[]) {
     if (event.name === "thread_name") {
       // Job threads ("skyframe evaluators") will sometimes have inconsistent dashes.
-      if (event.args.name.startsWith("skyframe")) {
-        event.args.name = event.args.name.replace(/^skyframe[ \-]evaluator[ \-]/, "skyframe evaluator ");
-      }
+      event.args.name = normalizeThreadName(event.args.name);
     }
   }
 }
 
+/** Normalizes known variants of trace thread names for display and grouping. */
+export function normalizeThreadName(name: string) {
+  if (name.startsWith("skyframe")) {
+    return name.replace(/^skyframe[ \-]evaluator[ \-]/, "skyframe evaluator ");
+  }
+  return name;
+}
+
 export function buildTimeSeries(events: TraceEvent[]): TimeSeries[] {
-  events = events.filter((event) => TIME_SERIES_EVENT_NAMES_AND_ARG_KEYS.has(event.name));
+  const inferredMetadata = inferTimeSeriesMetadata(events);
+  events = events.filter((event) => TIME_SERIES_METADATA.has(event.name) || inferredMetadata.has(event.name));
   events.sort(timeSeriesEventComparator);
 
   const timelines: TimeSeries[] = [];
   let name = null;
-  let timeSeries: TimeSeries | null = null;
+  let currentSeries = new Map<string, TimeSeries>();
+  let currentMetadata: SeriesMetadata[] = [];
   for (const event of events as TimeSeriesEvent[]) {
     if (name === null || event.name !== name) {
       // Encountered new type of time series data
       name = event.name;
-      timeSeries = {
-        name,
-        events: [],
-      };
-      timelines.push(timeSeries);
-    }
-    for (const key in event.args) {
-      if (key == TIME_SERIES_EVENT_NAMES_AND_ARG_KEYS.get(event.name)) {
-        event.value = event.args[key];
+      currentSeries.clear();
+
+      currentMetadata = TIME_SERIES_METADATA.get(name) || inferredMetadata.get(name) || [];
+      if (!currentMetadata.length) {
+        // Should not happen because we already filtered events above.
+        continue;
+      }
+      for (const m of currentMetadata) {
+        const timeSeries = {
+          name: m.displayName || name,
+          events: [],
+          unit: m.unit,
+        };
+        timelines.push(timeSeries);
+        currentSeries.set(m.argKey, timeSeries);
       }
     }
-    timeSeries!.events.push(event);
+    for (const m of currentMetadata) {
+      const argVal = event.args[m.argKey];
+      if (argVal === undefined) {
+        continue; // Skip events that don't have the expected argKey
+      }
+      const timeSeries = currentSeries.get(m.argKey);
+      if (event.value !== undefined) {
+        // If the event already has a value, clone it to avoid modifying the original event.
+        const tsEvent = {
+          ...event,
+          value: argVal,
+        };
+        timeSeries?.events.push(tsEvent);
+      } else {
+        // Otherwise, add the value to the event to avoid additiona allocation.
+        event.value = argVal;
+        timeSeries?.events.push(event);
+      }
+    }
   }
   return timelines;
 }
@@ -349,7 +473,7 @@ export function buildThreadTimelines(events: TraceEvent[], { visibilityThreshold
     timeline.threadName = threadNameByTid.get(timeline.tid) || "";
   }
 
-  timelines.sort(timelineComparator);
+  timelines.sort((t1, t2) => t1.tid - t2.tid);
 
   return timelines;
 }

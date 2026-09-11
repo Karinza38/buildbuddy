@@ -104,6 +104,22 @@ build:ci --build_metadata=ROLE=CI
 
 This role will automatically be populated if the environment variable `CI` is set, which it is in most CI systems like Github Actions, CircleCI, Travis, Gitlab CI, BuildKite, Bitrise, and others.
 
+## Commit statuses
+
+By default, BuildBuddy names the commit status for a CI invocation after the Bazel command and target pattern, such as `bazel test //...`. Set `COMMIT_STATUS_LABEL` to use a name that reflects the logical CI step instead:
+
+```bash
+bazel test //... --build_metadata=COMMIT_STATUS_LABEL="Unit tests"
+```
+
+This is useful when a CI workflow runs multiple Bazel invocations. The label only changes the name of the commit status; its details link still points to the BuildBuddy invocation.
+
+To prevent BuildBuddy from publishing a commit status for a particular invocation, set `DISABLE_COMMIT_STATUS_REPORTING`:
+
+```bash
+bazel test //... --build_metadata=DISABLE_COMMIT_STATUS_REPORTING=true
+```
+
 ## Test groups
 
 If using Github commit status reporting, you can use the test groups metadata field to specify how tests are grouped in your Github commit statuses. Test groups are specified as a comma separated list of test path prefixes that should be grouped together.
@@ -235,6 +251,28 @@ Example:
 ```bash
 --build_metadata=TAGS="foo,bar,baz"
 ```
+
+### Using TAG\_ prefix for automatic tag creation
+
+As an alternative to using the `TAGS` field with comma-separated values, you can use build metadata flags piecemeal with a `TAG_` prefix. These will automatically be converted to tags by removing the prefix.
+
+Examples:
+
+```bash
+# Creates a tag "ENV=production"
+--build_metadata=TAG_ENV=production
+
+# Creates a tag "VERSION=v1.2.3"
+--build_metadata=TAG_VERSION=v1.2.3
+
+# Creates a tag "FEATURE" (no value)
+--build_metadata=TAG_FEATURE=
+
+# Multiple TAG_ prefixed flags can be used together
+--build_metadata=TAG_ENV=staging --build_metadata=TAG_REGION=us-west-1
+```
+
+The TAG\_ prefix method can be combined with the regular TAGS field - all tags will be merged together.
 
 You can filter by these tags on build history pages and the trends page. Note that when filtering by tags, you will not see in-progress and disconnected builds.
 

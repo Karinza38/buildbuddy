@@ -1,18 +1,4 @@
-import React from "react";
-import ReactDOM from "react-dom";
 import Long from "long";
-import moment from "moment";
-import rpcService, { CancelablePromise } from "../../../app/service/rpc_service";
-import { User } from "../../../app/auth/auth_service";
-import { api } from "../../../proto/api/v1/common_ts_proto";
-import { target } from "../../../proto/target_ts_proto";
-import { Subscription } from "rxjs";
-import router from "../../../app/router/router";
-import { google as google_duration } from "../../../proto/duration_ts_proto";
-import format from "../../../app/format/format";
-import { clamp } from "../../../app/util/math";
-import { FilterInput } from "../../../app/components/filter_input/filter_input";
-import Spinner from "../../../app/components/spinner/spinner";
 import {
   Activity,
   AlarmClock,
@@ -28,9 +14,23 @@ import {
   Wrench,
   X,
 } from "lucide-react";
+import moment from "moment";
+import React from "react";
+import ReactDOM from "react-dom";
+import { Subscription } from "rxjs";
+import { User } from "../../../app/auth/auth_service";
 import capabilities from "../../../app/capabilities/capabilities";
 import FilledButton from "../../../app/components/button/button";
+import { FilterInput } from "../../../app/components/filter_input/filter_input";
+import Spinner from "../../../app/components/spinner/spinner";
 import errorService from "../../../app/errors/error_service";
+import format from "../../../app/format/format";
+import router from "../../../app/router/router";
+import rpcService, { CancelablePromise } from "../../../app/service/rpc_service";
+import { clamp } from "../../../app/util/math";
+import { api } from "../../../proto/api/v1/common_ts_proto";
+import { google as google_duration } from "../../../proto/duration_ts_proto";
+import { target } from "../../../proto/target_ts_proto";
 import {
   COLOR_MODE_PARAM,
   ColorMode,
@@ -76,6 +76,7 @@ interface Stat {
   maxDuration: number;
   avgDuration: number;
   flake: number;
+  cached: number;
 }
 
 const Status = api.v1.Status;
@@ -106,8 +107,6 @@ export default class TestGridComponent extends React.Component<Props, State> {
   targetsRPC?: CancelablePromise;
 
   componentWillMount() {
-    document.title = `Tests | BuildBuddy`;
-
     this.fetchTargets(/*initial=*/ true);
 
     this.subscription = rpcService.events.subscribe({
@@ -120,8 +119,8 @@ export default class TestGridComponent extends React.Component<Props, State> {
   }
 
   componentDidUpdate(prevProps: Props) {
-    if (this.props.repo !== prevProps.repo) {
-      // Repo-changed; re-fetch targets starting from scratch.
+    if (this.props.repo !== prevProps.repo || this.props.search.get("branch") !== prevProps.search.get("branch")) {
+      // Repo or branch filter changed; re-fetch targets starting from scratch.
       this.fetchTargets(/*initial=*/ true);
     }
   }
@@ -140,6 +139,7 @@ export default class TestGridComponent extends React.Component<Props, State> {
       this.updateState(new target.GetTargetHistoryResponse(), initial);
       return;
     }
+    const branchName = this.props.search.get("branch") || "";
 
     let request = new target.GetTargetHistoryRequest();
 
@@ -148,7 +148,7 @@ export default class TestGridComponent extends React.Component<Props, State> {
     request.serverSidePagination = this.isV2;
     request.pageToken = initial ? "" : this.state.nextPageToken;
     if (this.isV2) {
-      request.query = target.TargetQuery.create({ repoUrl });
+      request.query = target.TargetQuery.create({ repoUrl, branchName });
     }
 
     this.setState({ loading: true });
@@ -172,7 +172,7 @@ export default class TestGridComponent extends React.Component<Props, State> {
     let maxInvocations = 0;
     let maxDuration = 1;
     for (let targetHistory of histories) {
-      let stats: Stat = { count: 0, pass: 0, totalDuration: 0, maxDuration: 0, avgDuration: 0, flake: 0 };
+      let stats: Stat = { count: 0, pass: 0, totalDuration: 0, maxDuration: 0, avgDuration: 0, flake: 0, cached: 0 };
       for (let status of targetHistory.targetStatus) {
         stats.count += 1;
         let duration = this.durationToNum(status.timing?.duration || undefined);
@@ -182,6 +182,9 @@ export default class TestGridComponent extends React.Component<Props, State> {
           stats.pass += 1;
         } else if (status.status == Status.FLAKY) {
           stats.flake += 1;
+        }
+        if (isCached(status)) {
+          stats.cached += 1;
         }
       }
       stats.avgDuration = stats.totalDuration / stats.count;
@@ -400,6 +403,8 @@ export default class TestGridComponent extends React.Component<Props, State> {
         return firstStats!.maxDuration - secondStats!.maxDuration;
       case "flake":
         return firstStats!.flake / firstStats!.count - secondStats!.flake / secondStats!.count;
+      case "cached":
+        return firstStats!.cached / firstStats!.count - secondStats!.cached / secondStats!.count;
     }
     return 0;
   }
@@ -447,7 +452,7 @@ export default class TestGridComponent extends React.Component<Props, State> {
             onClick={this.loadMoreInvocations.bind(this)}
             disabled={this.state.loading}>
             <span>Load more</span>
-            {this.state.loading ? <Spinner className="white" /> : <ChevronsRight className="icon white" />}
+            {this.state.loading ? <Spinner className="white" /> : <ChevronsRight className="white" />}
           </FilledButton>
         )}
       </>
@@ -489,6 +494,7 @@ export default class TestGridComponent extends React.Component<Props, State> {
                   <span className="tap-target-stats">
                     ({format.formatWithCommas(stats?.count || 0)} invocations,{" "}
                     {format.percent((stats?.pass || 0) / (stats?.count || Number.MAX_VALUE))}% pass,{" "}
+                    {format.percent((stats?.cached || 0) / (stats?.count || Number.MAX_VALUE))}% cached,{" "}
                     {format.percent((stats?.flake || 0) / (stats?.count || Number.MAX_VALUE))}% flaky,{" "}
                     {format.durationSec(stats?.avgDuration || 0)} avg, {format.durationSec(stats?.maxDuration || 0)}{" "}
                     max)
@@ -523,12 +529,16 @@ export default class TestGridComponent extends React.Component<Props, State> {
                               target: targetHistory.target?.label || "",
                               targetStatus: String(status),
                             })}`;
-                            let title =
-                              this.getColorMode() == "timing"
-                                ? `${this.durationToNum(status.timing?.duration || undefined).toFixed(2)}s`
-                                : this.statusToString(status.status || Status.STATUS_UNSPECIFIED);
+                            let title = `${this.statusToString(
+                              status.status || Status.STATUS_UNSPECIFIED
+                            )} in ${this.durationToNum(status.timing?.duration || undefined).toFixed(2)}s`;
                             if (this.isV2 && commitStatus.commitSha) {
                               title += ` at commit ${commitStatus.commitSha}`;
+                            }
+
+                            let cached = isCached(status);
+                            if (cached) {
+                              title += ` (cached)`;
                             }
 
                             return (
@@ -549,7 +559,9 @@ export default class TestGridComponent extends React.Component<Props, State> {
                                 }}
                                 className={`tap-block ${
                                   this.getColorMode() == "status" ? `status-${status.status}` : "timing"
-                                } clickable`}>
+                                }
+                                ${cached ? `cached` : ""}
+                                clickable`}>
                                 {this.statusToIcon(status.status || Status.STATUS_UNSPECIFIED)}
                               </a>
                             );
@@ -570,6 +582,13 @@ export default class TestGridComponent extends React.Component<Props, State> {
       </>
     );
   }
+}
+
+function isCached(status: target.ITargetStatus) {
+  return (
+    +(status.timing?.startTime?.seconds || 0) > 0 &&
+    Math.floor(+(status.invocationCreatedAtUsec || 0) / 1000000) > +(status.timing?.startTime?.seconds || 0)
+  );
 }
 
 interface InnerTopBarProps {

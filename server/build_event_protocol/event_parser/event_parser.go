@@ -74,7 +74,7 @@ func parseCommandLine(commandLine *command_line.CommandLine) cmdOptions {
 		if !ok {
 			continue
 		}
-		for _, option := range p.OptionList.Option {
+		for _, option := range p.OptionList.GetOption() {
 			if option.OptionName == envVarOptionName {
 				parts := strings.Split(option.OptionValue, envVarSeparator)
 				if len(parts) == 2 {
@@ -148,7 +148,7 @@ func (sep *StreamingEventParser) ParseEvent(event *build_event_stream.BuildEvent
 				switch c := child.Id.(type) {
 				case *build_event_stream.BuildEventId_Pattern:
 					{
-						sep.setPattern(c.Pattern.Pattern, priority)
+						sep.setPattern(c.Pattern.GetPattern(), priority)
 					}
 				}
 			}
@@ -209,7 +209,7 @@ func (sep *StreamingEventParser) ParseEvent(event *build_event_stream.BuildEvent
 		}
 	case *build_event_stream.BuildEvent_BuildMetrics:
 		{
-			sep.invocation.ActionCount = p.BuildMetrics.ActionSummary.ActionsExecuted
+			sep.invocation.ActionCount = p.BuildMetrics.GetActionSummary().GetActionsExecuted()
 		}
 	case *build_event_stream.BuildEvent_WorkspaceInfo:
 		{
@@ -238,7 +238,7 @@ func (sep *StreamingEventParser) ParseEvent(event *build_event_stream.BuildEvent
 }
 
 func (sep *StreamingEventParser) fillInvocationFromStructuredCommandLine(commandLine *command_line.CommandLine) {
-	if commandLine.CommandLineLabel != StructuredCommandLineLabelCanonical {
+	if commandLine.GetCommandLineLabel() != StructuredCommandLineLabelCanonical {
 		return
 	}
 
@@ -373,31 +373,31 @@ func (sep *StreamingEventParser) fillInvocationFromStructuredCommandLine(command
 
 func (sep *StreamingEventParser) fillInvocationFromWorkspaceStatus(workspaceStatus *build_event_stream.WorkspaceStatus) {
 	priority := workspaceStatusPriority
-	for _, item := range workspaceStatus.Item {
-		if item.Value == "" {
+	for _, item := range workspaceStatus.GetItem() {
+		if item.GetValue() == "" {
 			continue
 		}
-		switch item.Key {
+		switch item.GetKey() {
 		case "BUILD_USER":
-			sep.setUser(item.Value, priority)
+			sep.setUser(item.GetValue(), priority)
 		case "USER":
-			sep.setUser(item.Value, priority)
+			sep.setUser(item.GetValue(), priority)
 		case "BUILD_HOST":
-			sep.setHost(item.Value, priority)
+			sep.setHost(item.GetValue(), priority)
 		case "HOST":
-			sep.setHost(item.Value, priority)
+			sep.setHost(item.GetValue(), priority)
 		case "PATTERN":
-			sep.setPattern(strings.Split(item.Value, " "), priority)
+			sep.setPattern(strings.Split(item.GetValue(), " "), priority)
 		case "ROLE":
-			sep.setRole(item.Value, priority)
+			sep.setRole(item.GetValue(), priority)
 		case "REPO_URL":
-			sep.setRepoUrl(item.Value, priority)
+			sep.setRepoUrl(item.GetValue(), priority)
 		case "GIT_BRANCH":
-			sep.setBranchName(item.Value, priority)
+			sep.setBranchName(item.GetValue(), priority)
 		case "COMMIT_SHA":
-			sep.setCommitSha(item.Value, priority)
+			sep.setCommitSha(item.GetValue(), priority)
 		case "TAGS":
-			sep.setTags(item.Value, priority)
+			sep.setTags(item.GetValue(), priority)
 		}
 	}
 }
@@ -428,17 +428,36 @@ func (sep *StreamingEventParser) fillInvocationFromBuildMetadata(metadata map[st
 	if visibility, ok := metadata["VISIBILITY"]; ok && visibility == "PUBLIC" {
 		sep.setReadPermission(inpb.InvocationPermission_PUBLIC, priority)
 	}
-	if tags, ok := metadata["TAGS"]; ok && tags != "" {
-		if err := sep.setTags(tags, priority); err != nil {
-			return err
-		}
-	}
 	if parentRunId, ok := metadata["PARENT_RUN_ID"]; ok && parentRunId != "" {
 		sep.setParentRunId(parentRunId, priority)
 	}
 	if runId, ok := metadata["RUN_ID"]; ok && runId != "" {
 		sep.setRunId(runId, priority)
 	}
+
+	var tagValues []string
+	if existingTags, ok := metadata["TAGS"]; ok && existingTags != "" {
+		tagValues = append(tagValues, existingTags)
+	}
+
+	// Support TAG_ prefixed metadata
+	for key, value := range metadata {
+		if after, ok := strings.CutPrefix(key, "TAG_"); ok {
+			tagKey := after
+			if value != "" {
+				tagValues = append(tagValues, tagKey+"="+value)
+			} else {
+				tagValues = append(tagValues, tagKey)
+			}
+		}
+	}
+
+	if len(tagValues) > 0 {
+		if err := sep.setTags(strings.Join(tagValues, ","), priority); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -508,13 +527,19 @@ func (sep *StreamingEventParser) setPattern(value []string, priority int) {
 	}
 }
 func (sep *StreamingEventParser) setTags(value string, priority int) error {
-	if *tagsEnabled && sep.priority.Tags <= priority {
+	if *tagsEnabled {
 		tags, err := invocation_format.SplitAndTrimAndDedupeTags(value, true)
 		if err != nil {
 			return err
 		}
+
+		if sep.priority.Tags <= priority {
+			sep.invocation.Tags = append(sep.invocation.Tags, tags...)
+		} else {
+			sep.invocation.Tags = append(tags, sep.invocation.Tags...)
+		}
+
 		sep.priority.Tags = priority
-		sep.invocation.Tags = tags
 	}
 	return nil
 }

@@ -1,19 +1,21 @@
-import { Check, ChevronsDown, ExternalLink } from "lucide-react";
+import { Check, ChevronsDown, Download, ExternalLink, RefreshCw } from "lucide-react";
 import React from "react";
 import alertService from "../../../app/alert/alert_service";
 import { User } from "../../../app/auth/user";
 import Banner from "../../../app/components/banner/banner";
+import Breadcrumbs from "../../../app/components/breadcrumbs/breadcrumbs";
 import FilledButton, { OutlinedButton } from "../../../app/components/button/button";
 import LinkButton from "../../../app/components/button/link_button";
 import { FilterInput } from "../../../app/components/filter_input/filter_input";
+import { TextLink } from "../../../app/components/link/link";
 import Select, { Option } from "../../../app/components/select/select";
 import Spinner from "../../../app/components/spinner/spinner";
 import errorService from "../../../app/errors/error_service";
 import router from "../../../app/router/router";
 import rpcService, { CancelablePromise } from "../../../app/service/rpc_service";
 import { normalizeRepoURL } from "../../../app/util/git";
+import { linkReadOnlyGitHubAppURL, linkReadWriteGitHubAppURL } from "../../../app/util/github";
 import { github } from "../../../proto/github_ts_proto";
-import { TextLink } from "../../../app/components/link/link";
 
 type GitHubAppImportProps = {
   user: User;
@@ -22,6 +24,8 @@ type GitHubAppImportProps = {
 type State = {
   installationsResponse: github.GetAppInstallationsResponse | null;
   installationsLoading: boolean;
+  installationsFromGitHubResponse: github.GetGithubUserInstallationsResponse | null;
+  installationsFromGitHubLoading: boolean;
 
   accessibleReposResponse: github.GetAccessibleReposResponse | null;
   accessibleReposLoading: boolean;
@@ -35,6 +39,9 @@ type State = {
 
   linkRequest: github.ILinkRepoRequest | null;
   linkLoading: boolean;
+
+  importInstallationRequest: github.UserInstallation | null;
+  importInstallationLoading: boolean;
 };
 
 const SEARCH_DEBOUNCE_DURATION_MS = 250;
@@ -48,6 +55,8 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
   state: State = {
     installationsLoading: false,
     installationsResponse: null,
+    installationsFromGitHubLoading: false,
+    installationsFromGitHubResponse: null,
 
     accessibleReposResponse: null,
     accessibleReposLoading: false,
@@ -61,9 +70,13 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
 
     linkLoading: false,
     linkRequest: null,
+
+    importInstallationLoading: false,
+    importInstallationRequest: null,
   };
 
   private fetchInstallationsRPC?: CancelablePromise;
+  private fetchInstallationsFromGitHubRPC?: CancelablePromise;
   private linkedReposRPC?: CancelablePromise;
   private searchRPC?: CancelablePromise;
 
@@ -79,9 +92,12 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
   /** Fetches installations from GitHub as well as BB-linked repos. */
   private fetch() {
     this.fetchInstallationsRPC?.cancel();
+    this.fetchInstallationsFromGitHubRPC?.cancel();
     this.setState({
       installationsLoading: false,
       installationsResponse: null,
+      installationsFromGitHubLoading: false,
+      installationsFromGitHubResponse: null,
       linkedReposLoading: false,
       linkedReposResponse: null,
     });
@@ -91,16 +107,33 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
     this.fetchInstallationsRPC = rpcService.service
       .getGitHubAppInstallations(new github.GetAppInstallationsRequest())
       .then((response) => {
-        this.setState({
-          installationsResponse: response,
-          selectedInstallation:
-            response.installations.find(
-              (installation) => installation.owner === this.state.selectedInstallation?.owner
-            ) || response.installations[0],
-        });
-        if (response.installations?.length) this.search();
+        const selectedInstallation =
+          response.installations.find(
+            (installation) => installation.owner === this.state.selectedInstallation?.owner
+          ) ||
+          response.installations[0] ||
+          null;
+        this.setState(
+          {
+            installationsResponse: response,
+            selectedInstallation,
+          },
+          () => {
+            if (selectedInstallation) {
+              this.search();
+            } else {
+              // If no app installations have been imported to BuildBuddy,
+              // query GitHub (through a BB API) to fetch installations that the user has installed,
+              // and prompt the user to import them to BuildBuddy.
+              this.fetchInstallationsFromGitHub();
+            }
+          }
+        );
       })
-      .catch((e) => errorService.handleError(e))
+      .catch((e) => {
+        errorService.handleError(e);
+        this.fetchInstallationsFromGitHub();
+      })
       .finally(() => this.setState({ installationsLoading: false }));
 
     this.setState({ linkedReposLoading: true });
@@ -110,6 +143,23 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
       .then((response) => this.setState({ linkedReposResponse: response }))
       .catch((e) => errorService.handleError(e))
       .finally(() => this.setState({ linkedReposLoading: false }));
+  }
+
+  private fetchInstallationsFromGitHub() {
+    this.fetchInstallationsFromGitHubRPC?.cancel();
+    this.setState({
+      installationsFromGitHubLoading: true,
+      installationsFromGitHubResponse: null,
+    });
+    this.fetchInstallationsFromGitHubRPC = rpcService.service
+      .getGithubUserInstallations(new github.GetGithubUserInstallationsRequest())
+      .then((response) => {
+        this.setState({
+          installationsFromGitHubResponse: response,
+        });
+      })
+      .catch((e) => errorService.handleError(e))
+      .finally(() => this.setState({ installationsFromGitHubLoading: false }));
   }
 
   private search() {
@@ -163,23 +213,99 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
       .finally(() => this.setState({ linkRequest: null, linkLoading: false }));
   }
   private getLinkedRepoUrls(): Set<string> {
-    return new Set(this.state.linkedReposResponse?.repoUrls || []);
+    return new Set(this.state.linkedReposResponse?.repos?.map((repo) => repo.repoUrl) || []);
   }
 
-  private githubLinkURL(): string {
-    return `/auth/github/app/link/?${new URLSearchParams({
-      user_id: this.props.user?.displayUser?.userId?.id || "",
-      group_id: this.props.user?.selectedGroup?.id || "",
-      redirect_url: window.location.href,
-    })}`;
+  private onClickInstallApp() {
+    rpcService.service
+      .getGitHubAppInstallPath(new github.GetGithubAppInstallPathRequest())
+      .then((response) => {
+        const path = `${response.installPath}?${new URLSearchParams({
+          user_id: this.props.user?.displayUser?.userId?.id || "",
+          group_id: this.props.user?.selectedGroup?.id || "",
+          redirect_url: window.location.href,
+          install: "true",
+        })}`;
+        window.location.href = path;
+      })
+      .catch((e) => errorService.handleError(e));
   }
-  private appInstallURL(): string {
-    return `/auth/github/app/link/?${new URLSearchParams({
-      user_id: this.props.user?.displayUser?.userId?.id || "",
-      group_id: this.props.user?.selectedGroup?.id || "",
-      redirect_url: window.location.href,
-      install: "true",
-    })}`;
+
+  private onClickImportInstallation(installation: github.UserInstallation) {
+    this.setState({ importInstallationRequest: installation, importInstallationLoading: true });
+    rpcService.service
+      .linkGitHubAppInstallation(
+        github.LinkAppInstallationRequest.create({
+          installationId: installation.id,
+          appId: installation.appId,
+        })
+      )
+      .then(() => {
+        alertService.success(`Successfully imported github.com/${installation.login}`);
+        this.fetch();
+      })
+      .catch((e) => errorService.handleError(e))
+      .finally(() => this.setState({ importInstallationRequest: null, importInstallationLoading: false }));
+  }
+
+  private renderImportInstallation() {
+    if (this.state.installationsFromGitHubLoading) {
+      return (
+        <Banner type="info" className="install-app-banner">
+          <div>Checking GitHub for BuildBuddy app installations...</div>
+          <Spinner />
+        </Banner>
+      );
+    }
+
+    const installationsFromGitHub = this.state.installationsFromGitHubResponse?.installations || [];
+    if (!installationsFromGitHub.length) {
+      return (
+        <Banner type="info" className="install-app-banner">
+          <div>To link a repository, install the BuildBuddy app on GitHub.</div>
+          <div className="installation-import-actions">
+            <LinkButton className="big-button" onClick={this.onClickInstallApp.bind(this)}>
+              Install
+            </LinkButton>
+            <OutlinedButton className="big-button" onClick={this.fetchInstallationsFromGitHub.bind(this)}>
+              <RefreshCw className="icon" />
+              Check GitHub
+            </OutlinedButton>
+          </div>
+        </Banner>
+      );
+    }
+
+    return (
+      <Banner type="info" className="install-app-banner">
+        <div>BuildBuddy found GitHub app installations. Import an installation to continue linking a repository.</div>
+        {!this.props.user.canCall("linkGitHubAppInstallation") && (
+          <div>You need admin access to import a GitHub app installation.</div>
+        )}
+        <div className="github-installation-import-list">
+          {installationsFromGitHub.map((installation) => {
+            const isImporting = this.state.importInstallationRequest?.id.toString() === installation.id.toString();
+            return (
+              <div className="github-installation-import-item" key={installation.id.toString()}>
+                <div className="github-installation-import-owner">{installation.login}</div>
+                {isImporting ? (
+                  <Spinner />
+                ) : (
+                  <FilledButton
+                    disabled={
+                      this.state.importInstallationLoading || !this.props.user.canCall("linkGitHubAppInstallation")
+                    }
+                    onClick={this.onClickImportInstallation.bind(this, installation)}>
+                    <Download className="icon" />
+                    Import
+                  </FilledButton>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Banner>
+    );
   }
 
   private renderRepos() {
@@ -204,7 +330,7 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
                 </div>
                 {alreadyLinkedUrls.has(repoUrl) ? (
                   <div className="created-indicator" title="Already added">
-                    <Check className="icon green" />
+                    <Check className="green" />
                   </div>
                 ) : this.state.linkRequest?.repoUrl === repoUrl ? (
                   <Spinner />
@@ -226,8 +352,8 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
           </div>
         )}
         <div className="create-other-container">
-          <a className="create-other clickable" href={this.appInstallURL()}>
-            Don't see a repo in this list? Configure repo permissions <ExternalLink className="icon" />
+          <a className="create-other clickable" onClick={this.onClickInstallApp.bind(this)}>
+            Don't see a repo in this list? Configure repo permissions <ExternalLink />
           </a>
         </div>
       </>
@@ -242,32 +368,47 @@ export default class GitHubAppImport extends React.Component<GitHubAppImportProp
       <div className="workflows-github-import">
         <div className="shelf">
           <div className="container">
-            <div className="breadcrumbs">
+            <Breadcrumbs>
               <span>
                 <TextLink href="/workflows/">Workflows</TextLink>
               </span>
               <span>Link GitHub repo</span>
-            </div>
+            </Breadcrumbs>
             <div className="title">Link GitHub repo</div>
           </div>
         </div>
         <div className="container content-container">
           {!this.props.user.githubLinked && (
             <Banner type="info" className="install-app-banner">
-              <div>To get started, link a GitHub account to your BuildBuddy account.</div>
-              <LinkButton className="big-button" href={this.githubLinkURL()}>
-                Link GitHub account
+              <div>
+                To get started, link a GitHub account to your BuildBuddy account through one of the BuildBuddy GitHub
+                apps.
+              </div>
+              <div>
+                To see requested permissions for each app, click through the install flow. There will be a final
+                confirmation screen before any permissions are granted.
+              </div>
+              <LinkButton
+                className="big-button"
+                href={linkReadWriteGitHubAppURL(
+                  this.props.user?.displayUser?.userId?.id || "",
+                  this.props.user?.selectedGroup?.id || ""
+                )}>
+                Link via the read-write app
+              </LinkButton>
+              <LinkButton
+                className="big-button"
+                href={linkReadOnlyGitHubAppURL(
+                  this.props.user?.displayUser?.userId?.id || "",
+                  this.props.user?.selectedGroup?.id || ""
+                )}>
+                Link via the read-only app
               </LinkButton>
             </Banner>
           )}
-          {this.props.user.githubLinked && !this.state.installationsResponse?.installations?.length && (
-            <Banner type="info" className="install-app-banner">
-              <div>To link a repository, install the BuildBuddy app on GitHub.</div>
-              <LinkButton className="big-button" href={this.appInstallURL()}>
-                Install
-              </LinkButton>
-            </Banner>
-          )}
+          {this.props.user.githubLinked &&
+            !this.state.installationsResponse?.installations?.length &&
+            this.renderImportInstallation()}
           {Boolean(this.state.installationsResponse?.installations?.length) && (
             <>
               <div className="repo-search">

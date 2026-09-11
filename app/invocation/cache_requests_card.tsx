@@ -1,43 +1,44 @@
-import React from "react";
-import router from "../router/router";
-import InvocationModel from "./invocation_model";
 import {
-  X,
-  ArrowUp,
   ArrowDown,
   ArrowLeftRight,
-  ChevronRight,
+  ArrowUp,
   Check,
+  ChevronRight,
+  DownloadIcon,
+  ShieldClose,
   SortAsc,
   SortDesc,
-  DownloadIcon,
-  HelpCircle,
-  ShieldClose,
+  X,
 } from "lucide-react";
+import React from "react";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import { cache } from "../../proto/cache_ts_proto";
-import { invocation_status } from "../../proto/invocation_status_ts_proto";
-import { resource } from "../../proto/resource_ts_proto";
-import rpc_service from "../service/rpc_service";
-import DigestComponent from "../components/digest/digest";
-import { TextLink } from "../components/link/link";
-import { durationToMillis, timestampToDate } from "../util/proto";
-import error_service from "../errors/error_service";
-import Button, { FilledButton, OutlinedButton } from "../components/button/button";
-import Spinner from "../components/spinner/spinner";
-import Select, { Option } from "../components/select/select";
-import { FilterInput } from "../components/filter_input/filter_input";
-import * as format from "../format/format";
-import * as proto from "../util/proto";
 import { google as google_field_mask } from "../../proto/field_mask_ts_proto";
-import { pinBottomMiddleToMouse, Tooltip } from "../components/tooltip/tooltip";
-import { BuildBuddyError } from "../util/errors";
-import { subtractTimestamp } from "./invocation_execution_util";
-import capabilities from "../capabilities/capabilities";
-import { commandWithRemoteRunnerFlags, supportsRemoteRun, triggerRemoteRun } from "../util/remote_runner";
-import LinkGithubRepoModal from "./link_github_repo_modal";
-import Popup from "../components/popup/popup";
-import TextInput from "../components/input/input";
+import { invocation_status } from "../../proto/invocation_status_ts_proto";
 import { invocation } from "../../proto/invocation_ts_proto";
+import { resource } from "../../proto/resource_ts_proto";
+import capabilities from "../capabilities/capabilities";
+import Button, { FilledButton, OutlinedButton } from "../components/button/button";
+import DigestComponent from "../components/digest/digest";
+import { FilterInput } from "../components/filter_input/filter_input";
+import TextInput from "../components/input/input";
+import { TextLink } from "../components/link/link";
+import Popup from "../components/popup/popup";
+import Select, { Option } from "../components/select/select";
+import Spinner from "../components/spinner/spinner";
+import HelpTooltip from "../components/tooltip/help_tooltip";
+import { pinBottomMiddleToMouse, Tooltip } from "../components/tooltip/tooltip";
+import error_service from "../errors/error_service";
+import * as format from "../format/format";
+import router from "../router/router";
+import rpcService from "../service/rpc_service";
+import { BuildBuddyError } from "../util/errors";
+import * as proto from "../util/proto";
+import { durationToMillis, timestampToDate } from "../util/proto";
+import { commandWithRemoteRunnerFlags, supportsRemoteRun, triggerRemoteRun } from "../util/remote_runner";
+import { subtractTimestamp } from "./invocation_execution_util";
+import InvocationModel from "./invocation_model";
+import LinkGithubRepoModal from "./link_github_repo_modal";
 
 export interface CacheRequestsCardProps {
   model: InvocationModel;
@@ -95,6 +96,10 @@ const filters: PresetFilter[] = [
     values: { cache: resource.CacheType.AC, request: cache.RequestType.READ, response: cache.ResponseType.NOT_FOUND },
   },
   {
+    label: "AC Writes",
+    values: { cache: resource.CacheType.AC, request: cache.RequestType.WRITE, response: cache.ResponseType.OK },
+  },
+  {
     label: "CAS Hits",
     values: { cache: resource.CacheType.CAS, request: cache.RequestType.READ, response: cache.ResponseType.OK },
   },
@@ -109,6 +114,8 @@ const filters: PresetFilter[] = [
 ];
 
 const defaultFilterIndex = 0; // All
+const CASHitsFilterIndex = 4;
+const CASWritesFilterIndex = 5;
 
 /**
  * CacheRequestsCardComponent shows all BuildBuddy cache requests for an invocation in a tabular form.
@@ -150,7 +157,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
   }
 
   private fetchResults(pageToken = this.state.nextPageToken) {
-    this.setState({ loading: true });
+    this.setState({ loading: true, nextPageToken: pageToken });
 
     const filterFields: string[] = [];
 
@@ -163,7 +170,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
 
     const isInitialFetch = !this.state.didInitialFetch;
 
-    rpc_service.service
+    rpcService.service
       .getCacheScoreCard(
         cache.GetCacheScoreCardRequest.create({
           invocationId: this.props.model.getInvocationId(),
@@ -296,6 +303,15 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
       this.props.search.get("groupBy") || this.props.groupBy || cache.GetCacheScoreCardRequest.GroupBy.GROUP_BY_TARGET
     ) as cache.GetCacheScoreCardRequest.GroupBy;
   }
+  private isOriginColumnVisible() {
+    const filterIndex = this.getFilterIndex();
+    // Hide origin column unless the backend records origin metadata and we're not in CAS-only views.
+    return (
+      capabilities.config.actionResultOriginEnabled &&
+      filterIndex !== CASHitsFilterIndex &&
+      filterIndex !== CASWritesFilterIndex
+    );
+  }
   private getSearch() {
     return this.props.search.get("search") || this.props.query || "";
   }
@@ -351,7 +367,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
             <Option value={cache.GetCacheScoreCardRequest.OrderBy.ORDER_BY_CPU_SAVINGS}>CPU Savings</Option>
           </Select>
           <OutlinedButton className="icon-button" onClick={this.onToggleDescending.bind(this)}>
-            {this.getDescending() ? <SortDesc className="icon" /> : <SortAsc className="icon" />}
+            {this.getDescending() ? <SortDesc /> : <SortAsc />}
           </OutlinedButton>
           {/* Filtering controls */}
           <div className="separator" />
@@ -427,7 +443,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
 
   private handleDownloadClicked(result: cache.ScoreCard.Result) {
     if (result.digest?.hash) {
-      rpc_service.downloadBytestreamFile(
+      rpcService.downloadBytestreamFile(
         result.digest.hash,
         this.props.model.getBytestreamURL(result.digest),
         this.props.model.getInvocationId()
@@ -449,20 +465,54 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
         renderContent={() => this.renderResultHovercard(result, startTimeMillis)}>
         {(groupTarget === null || groupActionId === null) && (
           <div className="name-column" title={result.targetId ? `${result.targetId} › ${result.actionMnemonic}` : ""}>
-            {/* bes-upload events don't have a target ID or action mnemonic. */}
-            {result.targetId || result.actionMnemonic ? (
-              <TextLink className="name-content" href={this.getActionUrl(result.actionId)}>
-                {groupTarget === null && result.targetId}
-                {groupTarget === null && groupActionId === null && " › "}
-                {groupActionId === null && result.actionMnemonic}
-              </TextLink>
-            ) : (
-              <span className="name-content">{result.name ? result.name : result.actionId}</span>
-            )}
+            {(() => {
+              let name = "";
+              /*
+                 If the action ID looks like a digest, it's clearly attributed to an action.
+                 If it is a special prefetcher action ID, it refers to a local action that
+                 triggered the download of its input files ("input") or an action whose outputs
+                 were explicitly requested ("output"). Older versions of Bazel used "prefetcher"
+                 in both cases.
+                 https://github.com/bazelbuild/bazel/blob/998e7624093422bee06e65965f8a575d05d57c27/src/main/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcher.java#L91-L99
+                 https://github.com/bazelbuild/bazel/blob/13a1ceccd9672fc9d55c716aae6e5119891e4b9b/src/main/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcher.java#L91
+                 In all other cases, this is a special cache access (e.g. for BES purposes) with
+                 no link to an action.
+                */
+              if (
+                looksLikeDigest(result.actionId) ||
+                result.actionId === "input" ||
+                result.actionId === "output" ||
+                result.actionId === "prefetcher"
+              ) {
+                if (groupTarget === null) {
+                  name = result.targetId;
+                  if (groupActionId === null) {
+                    name += " › ";
+                  }
+                }
+                if (groupActionId === null) {
+                  name += result.actionMnemonic;
+                }
+                if (result.actionId === "input") {
+                  name += " (local)";
+                } else if (result.actionId === "output") {
+                  name += " (requested)";
+                }
+              } else {
+                name = result.name ? result.name : result.actionId;
+              }
+              return looksLikeDigest(result.actionId) ? (
+                <TextLink className="name-content" href={this.getActionUrl(result.actionId)}>
+                  {name}
+                </TextLink>
+              ) : (
+                <span className="name-content">{name}</span>
+              );
+            })()}
             <div title="Download">
               <DownloadIcon
                 onClick={this.handleDownloadClicked.bind(this, result)}
-                className="download-button icon"
+                className="download-button"
                 role="button"
               />
             </div>
@@ -472,6 +522,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
           {renderCacheType(result.cacheType)}
         </div>
         <div className="status-column column-with-icon">{renderStatus(result)}</div>
+        {this.isOriginColumnVisible() && <div className="origin-column">{this.renderOriginInvocation(result)}</div>}
         {result.digest && (
           <div>
             <DigestComponent hashWidth="96px" sizeWidth="72px" digest={result.digest} expandOnHover={false} />
@@ -479,7 +530,7 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
         )}
         {this.isCompressedSizeColumnVisible() && (
           <div className={`compressed-size-column ${!result.compressor ? "uncompressed" : ""}`}>
-            {(console.log(result), result.compressor) ? (
+            {result.compressor ? (
               <>
                 <span>{renderCompressionSavings(result)}</span>
               </>
@@ -497,6 +548,23 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
     ));
   }
 
+  private renderOriginInvocation(result: cache.ScoreCard.Result) {
+    if (!capabilities.config.actionResultOriginEnabled) {
+      return <span />;
+    }
+    const isACHit =
+      result.cacheType === resource.CacheType.AC &&
+      result.requestType === cache.RequestType.READ &&
+      result.status?.code === 0;
+
+    if (!isACHit || !result.originInvocationId) {
+      return <span />;
+    }
+
+    const redacted = redactInvocationId(result.originInvocationId);
+    return <TextLink href={`/invocation/${result.originInvocationId}`}>{redacted}</TextLink>;
+  }
+
   private getCacheMetadata(scorecardResult: cache.ScoreCard.Result) {
     const digest = scorecardResult.digest;
     if (!digest?.hash) {
@@ -508,7 +576,8 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
     // or if there is an invalid result
     this.state.digestToCacheMetadata.set(digest.hash, null);
 
-    const service = rpc_service.getRegionalServiceOrDefault(this.props.model.stringCommandLineOption("remote_cache"));
+    // TODO(https://github.com/buildbuddy-io/buildbuddy-internal/issues/6146): This metadata request should be routed to the cache client for the cache proxy if applicable.
+    const service = rpcService.getRegionalServiceOrDefault(this.props.model.stringCommandLineOption("remote_cache"));
 
     service
       .getCacheMetadata(
@@ -517,6 +586,8 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
             digest: digest,
             cacheType: scorecardResult.cacheType,
             instanceName: remoteInstanceName,
+            compressor: scorecardResult.compressor,
+            digestFunction: this.props.model.getDigestFunction(),
           }),
         })
       )
@@ -571,7 +642,13 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
         {result.actionId && (
           <>
             <b>Action ID</b>
-            <span>{result.actionId}</span>
+            <span>
+              {result.actionId === "input"
+                ? "input (to local execution of this action)"
+                : result.actionId === "output"
+                  ? "output (explicitly requested)"
+                  : result.actionId}{" "}
+            </span>
           </>
         )}
         {result.name ? (
@@ -580,6 +657,19 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
             <span>
               {result.pathPrefix ? result.pathPrefix + "/" : ""}
               {result.name}
+            </span>
+          </>
+        ) : null}
+        {/* Show full origin invocation for AC hits */}
+        {capabilities.config.actionResultOriginEnabled &&
+        result.cacheType === resource.CacheType.AC &&
+        result.requestType === cache.RequestType.READ &&
+        result.status?.code === 0 &&
+        result.originInvocationId ? (
+          <>
+            <b>Origin invocation</b>
+            <span>
+              <TextLink href={`/invocation/${result.originInvocationId}`}>{result.originInvocationId}</TextLink>
             </span>
           </>
         ) : null}
@@ -632,6 +722,44 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
     );
   }
 
+  private durationTooltip() {
+    return (
+      <HelpTooltip>
+        <p>
+          <b>Duration</b>
+        </p>
+        <p>
+          The time difference between when the server started processing the request and finished sending all requested
+          bytes.
+        </p>
+        <p>This time is measured by the server, and may not include load balancer or client processing time.</p>
+      </HelpTooltip>
+    );
+  }
+
+  private savingsTooltip() {
+    return (
+      <HelpTooltip>
+        <p>
+          <b>Savings</b>
+        </p>
+        <p>Action Cache (AC) items only. The amount of wall time that was saved by using this cached action.</p>
+        <p>Determined by looking at how long the action took to build when it was originally written to the cache.</p>
+      </HelpTooltip>
+    );
+  }
+
+  private waterfallTooltip() {
+    return (
+      <HelpTooltip>
+        <p>
+          <b>Waterfall</b>
+        </p>
+        <p>When this cache request took place in the overall timeline of the build.</p>
+      </HelpTooltip>
+    );
+  }
+
   async executeRemoteBazelQuery(target: string) {
     const isSupported = await supportsRemoteRun(this.props.model.getRepo());
     if (!isSupported) {
@@ -641,21 +769,37 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
     const command = commandWithRemoteRunnerFlags(
       `bazel query "allpaths(${this.props.model.invocation.pattern}, ${target})" --output=graph`
     );
-    triggerRemoteRun(this.props.model, command, true /*autoOpenChild*/, null);
+    triggerRemoteRun(this.props.model, command, true /*autoOpenChild*/, null, [], "query");
   }
 
   private async runBbExplain() {
-    const isSupported = await supportsRemoteRun(this.props.model.getRepo());
+    const repoURL = this.props.model.getRepo();
+    if (repoURL.length == 0) {
+      alert("Repo URL required.");
+      return;
+    }
+
+    const isSupported = await supportsRemoteRun(repoURL);
     if (!isSupported) {
       this.setState({ isLinkRepoModalOpen: true });
       return;
     }
 
     const currentCommand = this.props.model.explicitCommandLine();
-    const cmd1 = commandWithRemoteRunnerFlags(currentCommand + " --experimental_execution_log_compact_file=inv1");
+    let generateExecLogCmd1: string;
+    let execLogOrInvocationId1: string;
+    if (CacheRequestsCardComponent.hasExecLog(this.props.model)) {
+      execLogOrInvocationId1 = this.props.model.getInvocationId();
+      generateExecLogCmd1 = "";
+    } else {
+      execLogOrInvocationId1 = "inv1.log";
+      generateExecLogCmd1 = commandWithRemoteRunnerFlags(
+        currentCommand + " --experimental_execution_log_compact_file=" + execLogOrInvocationId1
+      );
+    }
 
-    let compareCommit = this.props.model.getCommit();
-    let cmd2 = currentCommand + " --experimental_execution_log_compact_file=inv2";
+    let generateExecLogCmd2: string;
+    let execLogOrInvocationId2: string;
     if (this.state.selectedDebugCacheMissOption == "compare") {
       const compareInvocationId = (document.getElementById("debug-cache-miss-invocation-input") as HTMLInputElement)
         .value;
@@ -666,36 +810,61 @@ export default class CacheRequestsCardComponent extends React.Component<CacheReq
       const compareInv = await this.fetchInvocation(compareInvocationId);
       const compareModel = new InvocationModel(compareInv);
 
-      if (this.props.model.getRepo() != compareModel.getRepo()) {
-        alert("The GitHub repo of the comparison invocation must match the current invocation's repo.");
-        return;
-      }
+      if (CacheRequestsCardComponent.hasExecLog(compareModel)) {
+        generateExecLogCmd2 = "";
+        execLogOrInvocationId2 = compareModel.getInvocationId();
+      } else {
+        if (compareModel.getRepo().length == 0) {
+          alert("Repo URL for comparison invocation required.");
+          return;
+        }
+        if (repoURL != compareModel.getRepo()) {
+          alert("The GitHub repo of the comparison invocation must match the current invocation's repo.");
+          return;
+        }
 
-      compareCommit = compareModel.getCommit();
-      cmd2 = compareModel.explicitCommandLine() + " --experimental_execution_log_compact_file=inv2";
-    }
-    cmd2 = commandWithRemoteRunnerFlags(cmd2);
-
-    const command = `
-curl -fsSL install.buildbuddy.io | bash
-${cmd1}
+        const compareCommit = compareModel.getCommit();
+        execLogOrInvocationId2 = "inv2.log";
+        generateExecLogCmd2 = `
 git fetch origin ${compareCommit}
 git checkout ${compareCommit}
-${cmd2}
-output=$(bb explain --old inv1 --new inv2)
+${commandWithRemoteRunnerFlags(compareModel.explicitCommandLine() + " --experimental_execution_log_compact_file=" + execLogOrInvocationId2)}`;
+      }
+    } else {
+      // Force a rerun of the identical invocation to detect non-reproducibility.
+      execLogOrInvocationId2 = "inv2.log";
+      generateExecLogCmd2 = commandWithRemoteRunnerFlags(
+        currentCommand + " --experimental_execution_log_compact_file=" + execLogOrInvocationId2
+      );
+    }
+
+    const command = `
+curl -fsSL https://install.buildbuddy.io | bash
+${generateExecLogCmd1}
+${generateExecLogCmd2}
+output=$(bb explain --old ${execLogOrInvocationId1} --new ${execLogOrInvocationId2})
 if [ -z "$output" ]; then
     echo "There are no differences between the compact execution logs of the two invocations."
 else
-  printf "%s\n" "$output"
+  printf "%s\\n" "$output"
 fi
 `;
     let platformProps = new Map([["EstimatedComputeUnits", "3"]]);
-    triggerRemoteRun(this.props.model, command, false /*autoOpenChild*/, platformProps);
+    triggerRemoteRun(this.props.model, command, false /*autoOpenChild*/, platformProps, [], "bb explain");
     this.setState({ showDebugCacheMissDropdown: false });
   }
 
+  private static hasExecLog(invocation: InvocationModel): boolean {
+    return Boolean(
+      invocation.buildToolLogs?.log.some(
+        (log: build_event_stream.File) =>
+          log.name == "execution_log.binpb.zst" && log.uri && Boolean(log.uri.startsWith("bytestream://"))
+      )
+    );
+  }
+
   private async fetchInvocation(invocationId: string): Promise<invocation.Invocation> {
-    const response = await rpc_service.service.getInvocation(
+    const response = await rpcService.service.getInvocation(
       new invocation.GetInvocationRequest({
         lookup: new invocation.InvocationLookup({
           invocationId,
@@ -746,17 +915,39 @@ fi
           onRequestClose={() => this.setState({ isLinkRepoModalOpen: false })}
         />
         <div debug-id="cache-results-table" className="results-table">
+          {/* When the results are being replaced, show an overlay indicating that the
+              current results are stale. */}
+          {this.state.loading && !this.state.nextPageToken && (
+            <>
+              <div className="loading-overlay" />
+              <div className="loading loading-slim results-updating" />
+            </>
+          )}
+
           <div className="row column-headers">
             {this.getGroupBy() !== cache.GetCacheScoreCardRequest.GroupBy.GROUP_BY_ACTION && (
               <div className="name-column">Name</div>
             )}
             <div className="cache-type-column">Cache</div>
             <div className="status-column">Status</div>
+            {this.isOriginColumnVisible() && (
+              <div className="origin-column">
+                <span>Origin</span>
+                <HelpTooltip>
+                  <p>
+                    <b>Origin</b>
+                  </p>
+                  <p>The invocation that originally wrote the Action Cache entry.</p>
+                </HelpTooltip>
+              </div>
+            )}
             <div className="digest-column">Digest (hash/size)</div>
             {this.isCompressedSizeColumnVisible() && <div className="compressed-size-column">Compression</div>}
-            <div className="duration-column">Duration</div>
-            {capabilities.config.trendsSummaryEnabled && <div className="duration-column">Savings</div>}
-            <div className="waterfall-column">Waterfall</div>
+            <div className="duration-column">Duration {this.durationTooltip()}</div>
+            {capabilities.config.trendsSummaryEnabled && (
+              <div className="duration-column">Savings {this.savingsTooltip()}</div>
+            )}
+            <div className="waterfall-column">Waterfall {this.waterfallTooltip()}</div>
           </div>
           {groups === null && (
             <div className="results-list column">
@@ -772,7 +963,7 @@ fi
                   {/* Then if grouping by action, show a chevron (">") followed by the action name. */}
                   {this.getGroupBy() === cache.GetCacheScoreCardRequest.GroupBy.GROUP_BY_ACTION && (
                     <>
-                      <ChevronRight className="icon chevron" />
+                      <ChevronRight className="chevron" />
                       {/* If we have an action ID that looks like a digest, render it as a link
                           to the action page. */}
                       {group.actionId && looksLikeDigest(group.actionId) && (
@@ -793,22 +984,12 @@ fi
                   {capabilities.config.bazelButtonsEnabled &&
                     group.results[0]?.targetId &&
                     group.results[0]?.targetId.startsWith("//") && (
-                      <>
-                        <Tooltip
-                          className="row"
-                          pin={pinBottomMiddleToMouse}
-                          renderContent={() => (
-                            <div className="cache-result-hovercard">
-                              <div>Why did this target build?</div>
-                            </div>
-                          )}>
-                          <HelpCircle
-                            onClick={this.executeRemoteBazelQuery.bind(this, group.results[0]?.targetId!)}
-                            className="download-button icon"
-                            role="button"
-                          />
-                        </Tooltip>
-                      </>
+                      <HelpTooltip
+                        aria-label="Run bazel query"
+                        onClick={this.executeRemoteBazelQuery.bind(this, group.results[0]?.targetId!)}
+                        pin={pinBottomMiddleToMouse}>
+                        <p>Why did this target build?</p>
+                      </HelpTooltip>
                     )}
                 </div>
               </div>
@@ -842,7 +1023,7 @@ const RequestsCardContainer: React.FC<JSX.IntrinsicElements["div"]> = ({ classNa
   <div className={`card cache-requests-card ${className || ""}`} {...props}>
     <div className="content">
       <div className="title">
-        <ArrowLeftRight className="icon" />
+        <ArrowLeftRight />
         <span>Cache requests</span>
       </div>
       <div className="details">{children}</div>
@@ -887,7 +1068,7 @@ function renderStatus(result: cache.ScoreCard.Result): React.ReactNode {
     if (result.status?.code !== 0 /*=OK*/) {
       return (
         <>
-          <X className="icon red" />
+          <X className="red" />
           <span>Miss</span>
           {/* TODO: Show "Error" if status code is something other than NotFound */}
         </>
@@ -895,11 +1076,7 @@ function renderStatus(result: cache.ScoreCard.Result): React.ReactNode {
     }
     return (
       <>
-        {result.cacheType === resource.CacheType.AC ? (
-          <Check className="icon green" />
-        ) : (
-          <ArrowDown className="icon green" />
-        )}
+        {result.cacheType === resource.CacheType.AC ? <Check className="green" /> : <ArrowDown className="green" />}
         <span>Hit</span>
       </>
     );
@@ -908,14 +1085,14 @@ function renderStatus(result: cache.ScoreCard.Result): React.ReactNode {
     if (result.status?.code !== 0 /*=OK*/) {
       return (
         <>
-          <X className="icon red" />
+          <X className="red" />
           <span>Error</span>
         </>
       );
     }
     return (
       <>
-        <ArrowUp className="icon red" />
+        <ArrowUp className="red" />
         <span>Write</span>
       </>
     );
@@ -970,4 +1147,9 @@ function groupResults(
  */
 function looksLikeDigest(actionId: string | null) {
   return actionId?.length === 64;
+}
+
+function redactInvocationId(invocationId: string) {
+  if (invocationId.length <= 8) return invocationId;
+  return `${invocationId.slice(0, 4)}…${invocationId.slice(-4)}`;
 }

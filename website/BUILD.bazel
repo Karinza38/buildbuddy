@@ -1,24 +1,23 @@
-load("//rules/yarn:index.bzl", "yarn")
+load("//rules/pnpm:index.bzl", "pnpm")
 
 package(default_visibility = ["//visibility:public"])
 
 SRCS = glob([
     "src/**",
     "static/**",
-    "docs/**",
 ]) + [
     "docusaurus.config.js",
-    "yarn.lock",
+    "pnpm-lock.yaml",
     "sidebars.js",
     "//server/cmd/buildbuddy/yaml_doc:generate_mdx",
-    "//server/metrics:generate_mdx",
+    "//server/metrics/generate_docs:generate_mdx",
     "//enterprise/server/cmd/server/yaml_doc:generate_mdx",
     "//enterprise/server/backends/prom/generate_docs:generate_mdx",
     "//enterprise/server/cmd/executor/yaml_doc:generate_mdx",
 ]
 
 # Builds and bundles static marketing website into a .tar
-yarn(
+pnpm(
     name = "website",
     srcs = SRCS,
     package = "package.json",
@@ -26,7 +25,7 @@ yarn(
 )
 
 # Starts marketing website server in development mode
-yarn(
+pnpm(
     name = "start",
     srcs = SRCS,
     command = "start",
@@ -35,7 +34,7 @@ yarn(
 )
 
 # Serves production marketing website bundle
-yarn(
+pnpm(
     name = "serve",
     srcs = SRCS,
     command = "serve",

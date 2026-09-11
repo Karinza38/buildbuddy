@@ -1,14 +1,14 @@
-import React from "react";
-import format from "../format/format";
-import SetupCodeComponent from "../docs/setup_code";
-import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
-import { TerminalComponent } from "../terminal/terminal";
-import rpcService from "../service/rpc_service";
 import { CheckCircle, Clock, HelpCircle, PauseCircle, XCircle } from "lucide-react";
-import { durationToMillisWithFallback } from "../util/proto";
-import router from "../router/router";
 import moment from "moment";
+import React from "react";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import Link from "../components/link/link";
+import SetupCodeComponent from "../docs/setup_code";
+import format from "../format/format";
+import router from "../router/router";
+import rpcService from "../service/rpc_service";
+import { TerminalComponent } from "../terminal/terminal";
+import { durationToMillisWithFallback } from "../util/proto";
 
 interface Props {
   buildEvent?: build_event_stream.BuildEvent;
@@ -38,13 +38,13 @@ function getStatusClass(status?: build_event_stream.TestStatus) {
 function getStatusIcon(status?: build_event_stream.TestStatus) {
   switch (status) {
     case build_event_stream.TestStatus.PASSED:
-      return <CheckCircle className="icon green" />;
+      return <CheckCircle className="green" />;
     case build_event_stream.TestStatus.FLAKY:
-      return <HelpCircle className="icon orange" />;
+      return <HelpCircle className="orange" />;
     case build_event_stream.TestStatus.TIMEOUT:
-      return <Clock className="icon" />;
+      return <Clock />;
     default:
-      return <XCircle className="icon red" />;
+      return <XCircle className="red" />;
   }
 }
 
@@ -145,7 +145,7 @@ export default class TargetTestLogCardComponent extends React.Component<Props, S
           className={`card ${this.state.cacheEnabled && (this.props.dark ? "dark" : "light-terminal")} ${getStatusClass(
             this.props.buildEvent?.testResult?.status
           )}`}>
-          <PauseCircle className={`icon rotate-90 ${this.props.dark ? "white" : ""}`} />
+          <PauseCircle className={`rotate-90 ${this.props.dark ? "white" : ""}`} />
           <div className="content">
             {!this.state.cacheEnabled && (
               <div className="empty-state">

@@ -1,9 +1,9 @@
+import { CheckCircle, CircleSlash, PlayCircle, XCircle } from "lucide-react";
 import React from "react";
-import format from "../format/format";
-import { invocation } from "../../proto/invocation_ts_proto";
-import { CheckCircle, PlayCircle, XCircle, CircleSlash } from "lucide-react";
-import Link from "../components/link/link";
 import { invocation_status } from "../../proto/invocation_status_ts_proto";
+import { invocation } from "../../proto/invocation_ts_proto";
+import Link from "../components/link/link";
+import format from "../format/format";
 import InvocationModel from "./invocation_model";
 
 type CommandStatus = "failed" | "succeeded" | "in-progress" | "not-run";
@@ -15,6 +15,16 @@ export type ChildInvocationCardProps = {
 export default class ChildInvocationCard extends React.Component<ChildInvocationCardProps> {
   private getStatus(): CommandStatus {
     const inv = this.props.invocation;
+    switch (inv.runStatus) {
+      case invocation_status.OverallStatus.SUCCESS:
+        return "succeeded";
+      case invocation_status.OverallStatus.FAILURE:
+      case invocation_status.OverallStatus.DISCONNECTED:
+        return "failed";
+      case invocation_status.OverallStatus.IN_PROGRESS:
+        return "in-progress";
+      default:
+    }
     switch (inv.invocationStatus) {
       case invocation_status.InvocationStatus.COMPLETE_INVOCATION_STATUS:
       case invocation_status.InvocationStatus.DISCONNECTED_INVOCATION_STATUS:
@@ -40,13 +50,13 @@ export default class ChildInvocationCard extends React.Component<ChildInvocation
   private renderStatusIcon(status: CommandStatus) {
     switch (status) {
       case "succeeded":
-        return <CheckCircle className="icon" />;
+        return <CheckCircle />;
       case "failed":
-        return <XCircle className="icon" />;
+        return <XCircle />;
       case "in-progress":
-        return <PlayCircle className="icon" />;
+        return <PlayCircle />;
       case "not-run":
-        return <CircleSlash className="icon" />;
+        return <CircleSlash />;
       default:
         // Render nothing.
         return undefined;

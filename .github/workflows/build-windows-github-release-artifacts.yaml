@@ -25,10 +25,10 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ inputs.release_branch }}
           # We need to fetch git tags to obtain the latest version tag to report
@@ -39,9 +39,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bazelisk --output_user_root=D:/0 build --config=release-windows --remote_header=x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_ORG_API_KEY }} //enterprise/server/cmd/executor:executor
-          $execution_root = bazelisk --output_user_root=D:/0 info execution_root
-          $artifact_rel_path = bazelisk --output_user_root=D:/0 cquery --config=release-windows --remote_header=x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_ORG_API_KEY }} --output=files //enterprise/server/cmd/executor:executor
-          $artifact_abs_path = "${execution_root}\${artifact_rel_path}"
-          Copy-Item -Path $artifact_abs_path -Destination executor-enterprise-windows-amd64-beta.exe
-          gh release upload ${{ inputs.version_tag }} executor-enterprise-windows-amd64-beta.exe --clobber
+          $commonArgs = @(
+            "--config=release-windows"
+            "--remote_header=x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_ORG_API_KEY }}"
+          )
+          $amd64Target = "//enterprise/server/cmd/executor:executor_windows_amd64"
+          $windows386Target = "//enterprise/server/cmd/executor:executor_windows_386"
+          $windowsArm64Target = "//enterprise/server/cmd/executor:executor_windows_arm64"
+
+          bazelisk --output_user_root=C:/0 build @commonArgs $amd64Target $windows386Target $windowsArm64Target
+          Copy-Item -Path bazel-out/windows_amd64-opt/bin/enterprise/server/cmd/executor/executor_/executor.exe -Destination executor-enterprise-windows-amd64-beta.exe
+          Copy-Item -Path bazel-out/windows_386-opt/bin/enterprise/server/cmd/executor/executor_/executor.exe -Destination executor-enterprise-windows-386-beta.exe
+          Copy-Item -Path bazel-out/windows_arm64-opt/bin/enterprise/server/cmd/executor/executor_/executor.exe -Destination executor-enterprise-windows-arm64-beta.exe
+
+          gh release upload ${{ inputs.version_tag }} executor-enterprise-windows-amd64-beta.exe executor-enterprise-windows-386-beta.exe executor-enterprise-windows-arm64-beta.exe --clobber

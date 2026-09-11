@@ -1,9 +1,8 @@
-import React from "react";
-import InvocationModel from "./invocation_model";
 import { XCircle } from "lucide-react";
+import React from "react";
 import { cache } from "../../proto/cache_ts_proto";
-import router from "../router/router";
 import { TextLink } from "../components/link/link";
+import InvocationModel from "./invocation_model";
 
 interface Props {
   model: InvocationModel;
@@ -38,7 +37,7 @@ export default class ScorecardCardComponent extends React.Component<Props, State
 
     return (
       <div className="card scorecard">
-        <XCircle className="icon" />
+        <XCircle />
         <div className="content">
           <div className="title">Cache Misses</div>
           <div className="details">

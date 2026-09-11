@@ -6,6 +6,10 @@ ts_library(
     name = "filter",
     srcs = ["filter.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/lucide-react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
         "//app/capabilities",
         "//app/components/button",
         "//app/components/checkbox",
@@ -14,53 +18,30 @@ ts_library(
         "//app/components/radio",
         "//app/components/slider",
         "//app/format",
+        "//app/icons:github_lucide",
         "//app/router",
         "//app/router:router_params",
-        "//enterprise/app/filter:date_picker_button",
+        "//enterprise/app/filter:date_range_picker_button",
         "//enterprise/app/filter:filter_util",
         "//proto:invocation_status_ts_proto",
         "//proto:stat_filter_ts_proto",
-        "@npm//@types/react",
-        "@npm//lucide-react",
-        "@npm//react",
-        "@npm//tslib",
     ],
 )
 
 filegroup(
     name = "css",
-    srcs = [
-        ":filter.css",
-        ":react_date_range_base.css",
-        ":react_date_range_default_theme.css",
-    ],
-)
-
-ts_library(
-    name = "date_picker_button",
-    srcs = ["date_picker_button.tsx"],
-    deps = [
-        "//app/components/button",
-        "//app/components/popup",
-        "//app/format",
-        "//app/router",
-        "//app/router:router_params",
-        "//enterprise/app/filter:filter_util",
-        "@npm//@types/moment",
-        "@npm//@types/react",
-        "@npm//@types/react-date-range",
-        "@npm//lucide-react",
-        "@npm//moment",
-        "@npm//react",
-        "@npm//react-date-range",
-        "@npm//tslib",
-    ],
+    srcs = [":filter.css"],
 )
 
 ts_library(
     name = "filter_util",
     srcs = ["filter_util.tsx"],
     deps = [
+        "//:node_modules/@types/long",
+        "//:node_modules/date-fns",
+        "//:node_modules/long",
+        "//:node_modules/moment",
+        "//:node_modules/tslib",
         "//app/capabilities",
         "//app/format",
         "//app/router:router_params",
@@ -69,10 +50,22 @@ ts_library(
         "//proto:invocation_status_ts_proto",
         "//proto:stat_filter_ts_proto",
         "//proto:timestamp_ts_proto",
-        "@npm//@types/long",
-        "@npm//@types/moment",
-        "@npm//long",
-        "@npm//moment",
-        "@npm//tslib",
+    ],
+)
+
+ts_library(
+    name = "date_range_picker_button",
+    srcs = ["date_range_picker_button.tsx"],
+    deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/lucide-react",
+        "//:node_modules/react",
+        "//:node_modules/tslib",
+        "//app/components/button",
+        "//app/components/date_range:date_range_picker",
+        "//app/components/popup",
+        "//app/router",
+        "//app/router:router_params",
+        "//enterprise/app/filter:filter_util",
     ],
 )

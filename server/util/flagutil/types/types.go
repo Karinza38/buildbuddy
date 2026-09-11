@@ -66,7 +66,7 @@ func NewJSONSliceFlag[T any](slice *T) *JSONSliceFlag[T] {
 }
 
 func JSONSlice[T any](flagset *flag.FlagSet, name string, defaultValue T, usage string) *T {
-	value := reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Interface().(*T)
+	value := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
 	JSONSliceVar(flagset, value, name, defaultValue, usage)
 	return value
 }
@@ -78,9 +78,9 @@ func JSONSliceVar[T any](flagset *flag.FlagSet, value *T, name string, defaultVa
 	}
 	v := reflect.ValueOf(value)
 	if src.IsNil() && !v.Elem().IsNil() {
-		v.Elem().Set(reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Elem())
+		v.Elem().Set(reflect.New(reflect.TypeFor[T]()).Elem())
 	} else if v.Elem().Len() != src.Len() || v.Elem().IsNil() {
-		v.Elem().Set(reflect.MakeSlice(reflect.TypeOf((*T)(nil)).Elem(), src.Len(), src.Len()))
+		v.Elem().Set(reflect.MakeSlice(reflect.TypeFor[T](), src.Len(), src.Len()))
 	}
 	reflect.Copy(v.Elem(), src)
 	flagset.Var((*JSONSliceFlag[T])(&v), name, usage)
@@ -105,7 +105,7 @@ func (f *JSONSliceFlag[T]) Set(values string) error {
 	}
 	v := (reflect.Value)(*f).Elem()
 	if _, ok := a.([]any); ok {
-		dst := reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Interface()
+		dst := reflect.New(reflect.TypeFor[T]()).Interface()
 		if err := json.Unmarshal([]byte(values), dst); err != nil {
 			return err
 		}
@@ -113,7 +113,7 @@ func (f *JSONSliceFlag[T]) Set(values string) error {
 		return nil
 	}
 	if _, ok := a.(map[string]any); ok {
-		dst := reflect.New(reflect.TypeOf((*T)(nil)).Elem().Elem()).Interface()
+		dst := reflect.New(reflect.TypeFor[T]().Elem()).Interface()
 		if err := json.Unmarshal([]byte(values), dst); err != nil {
 			return err
 		}
@@ -180,13 +180,13 @@ func (f *JSONSliceFlag[T]) Expand(mapping func(string) (string, error)) error {
 	if err != nil {
 		return err
 	}
-	sl := reflect.MakeSlice(reflect.TypeOf((*T)(nil)).Elem(), 0, 0)
+	sl := reflect.MakeSlice(reflect.TypeFor[T](), 0, 0)
 	v := (reflect.Value)(*f)
 	v.Elem().Set(sl)
 	return f.Set(string(exp))
 }
 
-func (f *JSONSliceFlag[T]) AppendSlice(slice any) error {
+func (f *JSONSliceFlag[T]) Accumulate(slice any) error {
 	v := (reflect.Value)(*f)
 	if _, ok := slice.(T); !ok {
 		return status.FailedPreconditionErrorf("Cannot append value %v of type %T to flag of type %s.", slice, slice, v.Type().Elem())
@@ -196,7 +196,7 @@ func (f *JSONSliceFlag[T]) AppendSlice(slice any) error {
 }
 
 func (f *JSONSliceFlag[T]) AliasedType() reflect.Type {
-	return reflect.TypeOf((*T)(nil))
+	return reflect.TypeFor[*T]()
 }
 
 func (f *JSONSliceFlag[T]) Slice() T {
@@ -211,7 +211,7 @@ func NewJSONStructFlag[T any](value *T) *JSONStructFlag[T] {
 }
 
 func JSONStruct[T any](flagset *flag.FlagSet, name string, defaultValue T, usage string) *T {
-	value := reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Interface().(*T)
+	value := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
 	JSONStructVar(flagset, value, name, defaultValue, usage)
 	return value
 }
@@ -240,7 +240,7 @@ func (f *JSONStructFlag[T]) String() string {
 
 func (f *JSONStructFlag[T]) Set(values string) error {
 	v := (reflect.Value)(*f).Elem()
-	dst := reflect.New(reflect.TypeOf((*T)(nil)).Elem()).Interface().(*T)
+	dst := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
 	if err := json.Unmarshal([]byte(values), dst); err != nil {
 		return err
 	}
@@ -248,11 +248,133 @@ func (f *JSONStructFlag[T]) Set(values string) error {
 	return nil
 }
 
+func (f *JSONStructFlag[T]) Expand(mapping func(string) (string, error)) error {
+	var ov any
+	if err := json.Unmarshal([]byte(f.String()), &ov); err != nil {
+		return err
+	}
+	nv, err := expandValue(ov, mapping)
+	if err != nil {
+		return err
+	}
+	exp, err := json.Marshal(nv)
+	if err != nil {
+		return err
+	}
+	return f.Set(string(exp))
+}
+
 func (f *JSONStructFlag[T]) AliasedType() reflect.Type {
-	return reflect.TypeOf((*T)(nil))
+	return reflect.TypeFor[*T]()
 }
 
 func (f *JSONStructFlag[T]) Struct() T {
+	return *(reflect.Value)(*f).Interface().(*T)
+}
+
+type JSONMapFlag[T any] reflect.Value
+
+func NewJSONMapFlag[T any](value *T) *JSONMapFlag[T] {
+	v := (JSONMapFlag[T])(reflect.ValueOf(value))
+	return &v
+}
+
+func JSONMap[T any](flagset *flag.FlagSet, name string, defaultValue T, usage string) *T {
+	value := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
+	JSONMapVar(flagset, value, name, defaultValue, usage)
+	return value
+}
+
+func JSONMapVar[T any](flagset *flag.FlagSet, value *T, name string, defaultValue T, usage string) {
+	src := reflect.ValueOf(defaultValue)
+	if src.Kind() != reflect.Map {
+		log.Fatalf("JSONMapVar called for flag %s with non-map value %v of type %T.", name, defaultValue, defaultValue)
+	}
+	v := reflect.ValueOf(value)
+	// Copy the default into a fresh map so the flag's storage isn't aliased
+	// with the caller's default — subsequent Set/Merge calls must not
+	// mutate the caller's map.
+	m := reflect.MakeMapWithSize(reflect.TypeFor[T](), src.Len())
+	if !src.IsNil() {
+		iter := src.MapRange()
+		for iter.Next() {
+			m.SetMapIndex(iter.Key(), iter.Value())
+		}
+	}
+	v.Elem().Set(m)
+	flagset.Var((*JSONMapFlag[T])(&v), name, usage)
+}
+
+func (f *JSONMapFlag[T]) String() string {
+	if !(*reflect.Value)(f).IsValid() || (*reflect.Value)(f).IsNil() {
+		return "{}"
+	}
+	b, err := json.Marshal((*reflect.Value)(f).Interface())
+	if err != nil {
+		alert.UnexpectedEvent("config_cannot_marshal_map", "err: %s", err)
+		return "{}"
+	}
+	return string(b)
+}
+
+// Set merges the decoded JSON map into the existing map value (later-wins on
+// key conflicts), mirroring the append semantics of JSONSliceFlag.Set.
+func (f *JSONMapFlag[T]) Set(values string) error {
+	v := (reflect.Value)(*f).Elem()
+	dst := reflect.New(reflect.TypeFor[T]()).Interface().(*T)
+	if err := json.Unmarshal([]byte(values), dst); err != nil {
+		return err
+	}
+	if v.IsNil() {
+		v.Set(reflect.MakeMap(v.Type()))
+	}
+	src := reflect.ValueOf(*dst)
+	iter := src.MapRange()
+	for iter.Next() {
+		v.SetMapIndex(iter.Key(), iter.Value())
+	}
+	return nil
+}
+
+// Accumulate merges the entries of the passed map into the flag's map value
+// (later-wins on key conflicts), satisfying the Accumulable interface.
+func (f *JSONMapFlag[T]) Accumulate(m any) error {
+	v := (reflect.Value)(*f)
+	if _, ok := m.(T); !ok {
+		return status.FailedPreconditionErrorf("Cannot append value %v of type %T to flag of type %s.", m, m, v.Type().Elem())
+	}
+	if v.Elem().IsNil() {
+		v.Elem().Set(reflect.MakeMap(v.Elem().Type()))
+	}
+	src := reflect.ValueOf(m)
+	iter := src.MapRange()
+	for iter.Next() {
+		v.Elem().SetMapIndex(iter.Key(), iter.Value())
+	}
+	return nil
+}
+
+func (f *JSONMapFlag[T]) Expand(mapping func(string) (string, error)) error {
+	var ov any
+	if err := json.Unmarshal([]byte(f.String()), &ov); err != nil {
+		return err
+	}
+	nv, err := expandValue(ov, mapping)
+	if err != nil {
+		return err
+	}
+	exp, err := json.Marshal(nv)
+	if err != nil {
+		return err
+	}
+	return f.Set(string(exp))
+}
+
+func (f *JSONMapFlag[T]) AliasedType() reflect.Type {
+	return reflect.TypeFor[*T]()
+}
+
+func (f *JSONMapFlag[T]) Map() T {
 	return *(reflect.Value)(*f).Interface().(*T)
 }
 
@@ -286,7 +408,7 @@ func (f *StringSliceFlag) Set(values string) error {
 	if values == "" {
 		return nil
 	}
-	for _, val := range strings.Split(values, ",") {
+	for val := range strings.SplitSeq(values, ",") {
 		*f = append(*f, val)
 	}
 	return nil
@@ -303,7 +425,7 @@ func (f *StringSliceFlag) Expand(mapping func(string) (string, error)) error {
 	return nil
 }
 
-func (f *StringSliceFlag) AppendSlice(slice any) error {
+func (f *StringSliceFlag) Accumulate(slice any) error {
 	s, ok := slice.([]string)
 	if !ok {
 		return status.FailedPreconditionErrorf("Cannot append value %v of type %T to flag of type []string.", slice, slice)
@@ -313,7 +435,7 @@ func (f *StringSliceFlag) AppendSlice(slice any) error {
 }
 
 func (f *StringSliceFlag) AliasedType() reflect.Type {
-	return reflect.TypeOf((*[]string)(nil))
+	return reflect.TypeFor[*[]string]()
 }
 
 type URLFlag url.URL
@@ -365,11 +487,11 @@ func (f *URLFlag) MarshalYAML() (any, error) {
 }
 
 func (f *URLFlag) AliasedType() reflect.Type {
-	return reflect.TypeOf((*url.URL)(nil))
+	return reflect.TypeFor[*url.URL]()
 }
 
 func (f *URLFlag) YAMLTypeAlias() reflect.Type {
-	return reflect.TypeOf((*URLFlag)(nil))
+	return reflect.TypeFor[*URLFlag]()
 }
 
 func (f *URLFlag) YAMLTypeString() string {

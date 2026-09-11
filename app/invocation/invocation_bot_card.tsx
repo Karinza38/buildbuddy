@@ -1,5 +1,5 @@
-import React from "react";
 import { Bot } from "lucide-react";
+import React from "react";
 
 export interface Props {
   suggestions: string[];
@@ -10,7 +10,7 @@ export function InvocationBotCard({ suggestions }: Props) {
     <>
       {suggestions.map((suggestion) => (
         <div className="card card-suggestion card-suggestion-bot">
-          <Bot className="icon" />
+          <Bot />
           <div className="content">
             <div className="details">
               <div className="card-suggestion-message">{suggestion.trim()}</div>

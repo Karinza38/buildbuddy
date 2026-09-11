@@ -2,16 +2,18 @@ package usagetracker
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/filestore"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/constants"
-	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/filestore"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/keys"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/rbuilder"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/sender"
@@ -24,16 +26,17 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
-	"github.com/buildbuddy-io/buildbuddy/server/util/timeutil"
 	"github.com/jonboulle/clockwork"
 
 	"github.com/docker/go-units"
 	"github.com/hashicorp/serf/serf"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	rfpb "github.com/buildbuddy-io/buildbuddy/proto/raft"
 	rfspb "github.com/buildbuddy-io/buildbuddy/proto/raft_service"
+	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 )
 
 var (
@@ -48,7 +51,12 @@ var (
 	deleteBufferSize                   = flag.Int("cache.raft.delete_buffer_size", 20, "Buffer up to this many samples for eviction eviction")
 	minEvictionAge                     = flag.Duration("cache.raft.min_eviction_age", 6*time.Hour, "Don't evict anything unless it's been idle for at least this long")
 	samplerIterRefreshPeriod           = flag.Duration("cache.raft.sampler_iter_refresh_peroid", 5*time.Minute, "How often we refresh iterator in sampler")
+	samplerSleepDuration               = flag.Duration("cache.raft.sampler_sleep_duration", 1*time.Second, "How long the eviction sampler sleeps when it cannot find eligible entries to evict. Set to 0 to disable sleeping (intended for tests).")
 	evictionBatchSize                  = flag.Int("cache.raft.eviction_batch_size", 100, "Buffer this many writes before delete")
+	numDeleteWorkers                   = flag.Int("cache.raft.num_delete_worker", 4, "Number of deletes in parallel")
+	numGCSDeleteWorkers                = flag.Int("cache.raft.num_gcs_delete_worker", 32, "Number of parallel GCS blob deletion workers (per partition).")
+	gcsDeleteBufferSize                = flag.Int("cache.raft.gcs_delete_buffer_size", 10000, "Buffer up to this many GCS deletion requests")
+	gcsDeleteDrainTimeout              = flag.Duration("cache.raft.gcs_delete_drain_timeout", 10*time.Second, "Max time to spend draining buffered GCS deletes on shutdown.")
 )
 
 const (
@@ -65,11 +73,9 @@ const (
 	// based on data changes.
 	storePartitionUsageMaxAge = 5 * time.Minute
 
-	SamplerSleepThreshold = float64(0.2)
-	SamplerSleepDuration  = 1 * time.Second
-
-	SamplerIterRefreshPeriod = 5 * time.Minute
-	evictFlushPeriod         = 10 * time.Second
+	samplerSleepThreshold = float64(0.2)
+	evictFlushPeriod      = 10 * time.Second
+	metricsRefreshPeriod  = 30 * time.Second
 )
 
 type Tracker struct {
@@ -81,10 +87,11 @@ type Tracker struct {
 
 	mu            sync.Mutex
 	byPartition   map[string]*partitionUsage
-	lastBroadcast map[string]*rfpb.PartitionMetadata
+	lastBroadcast map[string]*sgpb.PartitionMetadata
 
-	eg       *errgroup.Group
-	egCancel context.CancelFunc
+	eg                                 *errgroup.Group
+	egCancel                           context.CancelFunc
+	partitionUsageDeltaGossipThreshold int
 }
 
 type nodePartitionUsage struct {
@@ -93,7 +100,8 @@ type nodePartitionUsage struct {
 }
 
 type evictionKey struct {
-	bytes []byte
+	bytes           []byte
+	storageMetadata *sgpb.StorageMetadata
 }
 
 func (k *evictionKey) ID() string {
@@ -102,6 +110,20 @@ func (k *evictionKey) ID() string {
 
 func (k *evictionKey) String() string {
 	return string(k.bytes)
+}
+
+type metricSet struct {
+	cachePartitionSizeBytes     prometheus.Gauge
+	cachePartitionCapacityBytes prometheus.Gauge
+
+	gcsDeleteDropped         prometheus.Counter
+	cacheEvictionAgeMsec     prometheus.Observer
+	cacheLastEvictionAgeUsec prometheus.Gauge
+	cacheNumEvictions        prometheus.Counter
+	cacheBytesEvicted        prometheus.Counter
+
+	evictionSamplesChanSize prometheus.Gauge
+	evictionGCSChanSize     prometheus.Gauge
 }
 
 type partitionUsage struct {
@@ -116,14 +138,33 @@ type partitionUsage struct {
 	// Global view of usage, keyed by Node Host ID.
 	nodes map[string]*nodePartitionUsage
 
-	samples chan *approxlru.Sample[*evictionKey]
-	deletes chan *approxlru.Sample[*evictionKey]
-	rng     *rand.Rand
+	samples    chan *approxlru.Sample[*evictionKey]
+	deletes    chan *approxlru.Sample[*evictionKey]
+	gcsDeletes chan *sgpb.StorageMetadata_GCSMetadata
+	rng        *rand.Rand
 
 	eg       *errgroup.Group
 	egCancel context.CancelFunc
 
+	// gcsDeleteEg runs the GCS-delete worker pool under its own lifecycle so
+	// the producers (above) can be stopped first while the workers stay alive
+	// to drain buffered deletes on shutdown. See drainGCSDeletes.
+	gcsDeleteEg     *errgroup.Group
+	gcsDeleteCancel context.CancelFunc
+
 	sizeBytes int64
+
+	samplesPerBatch          int
+	samplerIterRefreshPeriod time.Duration
+	samplerSleepDuration     time.Duration
+	minEvictionAge           time.Duration
+	localSizeUpdatePeriod    time.Duration
+	evictionBatchSize        int
+	numDeleteWorkers         int
+	numGCSDeleteWorkers      int
+	fileStorer               filestore.Store
+
+	metrics metricSet
 }
 
 func (pu *partitionUsage) LocalSizeBytes() int64 {
@@ -143,8 +184,7 @@ func (pu *partitionUsage) LocalSizeBytes() int64 {
 }
 
 func (pu *partitionUsage) updateLocalSizeBytes(ctx context.Context) {
-	ticker := pu.clock.NewTicker(*localSizeUpdatePeriod)
-	lbls := prometheus.Labels{metrics.PartitionID: pu.part.ID, metrics.CacheNameLabel: constants.CacheName}
+	ticker := pu.clock.NewTicker(pu.localSizeUpdatePeriod)
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,8 +195,8 @@ func (pu *partitionUsage) updateLocalSizeBytes(ctx context.Context) {
 			pu.sizeBytes = sizeBytes
 			pu.mu.RUnlock()
 			pu.lru.UpdateLocalSizeBytes(sizeBytes)
-			metrics.DiskCachePartitionSizeBytes.With(lbls).Set(float64(sizeBytes))
-			metrics.DiskCachePartitionCapacityBytes.With(lbls).Set(float64(pu.part.MaxSizeBytes))
+			pu.metrics.cachePartitionSizeBytes.Set(float64(sizeBytes))
+			pu.metrics.cachePartitionCapacityBytes.Set(float64(pu.part.MaxSizeBytes))
 		}
 	}
 }
@@ -171,7 +211,7 @@ func (pu *partitionUsage) GlobalSizeBytes() int64 {
 	return sizeBytes
 }
 
-func (pu *partitionUsage) RemoteUpdate(nhid string, update *rfpb.PartitionMetadata) {
+func (pu *partitionUsage) RemoteUpdate(nhid string, update *sgpb.PartitionMetadata) {
 	pu.mu.Lock()
 	defer pu.mu.Unlock()
 	n, ok := pu.nodes[nhid]
@@ -187,108 +227,224 @@ func (pu *partitionUsage) partitionKeyPrefix() string {
 	return filestore.PartitionDirectoryPrefix + pu.part.ID
 }
 
-func (pu *partitionUsage) processEviction(ctx context.Context) {
-	var keys []*sender.KeyMeta
-	timer := time.NewTimer(evictFlushPeriod)
-	defer timer.Stop()
+func (pu *partitionUsage) sendDeleteRequests(ctx context.Context, keys []*sender.KeyMeta) {
+	if len(keys) == 0 {
+		return
+	}
+	start := pu.clock.Now()
+	defer metrics.RaftBatchDeleteDurationUsec.Observe(float64(pu.clock.Since(start).Microseconds()))
 
-	flush := func() {
-		if len(keys) == 0 {
-			return
-		}
-		rsps, err := pu.sender.RunMultiKey(ctx, keys, func(c rfspb.ApiClient, h *rfpb.Header, keys []*sender.KeyMeta) (interface{}, error) {
-			batch := rbuilder.NewBatchBuilder()
-			for _, k := range keys {
-				sample, ok := k.Meta.(*approxlru.Sample[*evictionKey])
-				if !ok {
-					return nil, status.InternalError("meta not type of approxlru.Sample[*evictionKey]")
-				}
-				batch.Add(&rfpb.DeleteRequest{
-					Key:        k.Key,
-					MatchAtime: sample.Timestamp.UnixMicro(),
-				})
+	// Eviction delete is replay-safe: a duplicate retry after the entry is gone
+	// still returns success, so this path does not need sender-owned sessions.
+	rsps, err := pu.sender.RunMultiKey(ctx, keys, func(ctx context.Context, c rfspb.ApiClient, h *rfpb.Header, keys []*sender.KeyMeta) (any, error) {
+		batch := rbuilder.NewBatchBuilder()
+		for _, k := range keys {
+			sample, ok := k.Meta.(*approxlru.Sample[*evictionKey])
+			if !ok {
+				return nil, errors.New("meta not type of approxlru.Sample[*evictionKey]")
 			}
-			batchCmd, err := batch.ToProto()
-			if err != nil {
-				return nil, status.InternalErrorf("could not construct delete req proto: %s", err)
-			}
-			rsp, err := c.SyncPropose(ctx, &rfpb.SyncProposeRequest{
-				Header: h,
-				Batch:  batchCmd,
+			batch.Add(&rfpb.DeleteRequest{
+				Key:        k.Key,
+				MatchAtime: sample.Timestamp.UnixMicro(),
 			})
-			if err != nil {
-				return nil, err
-			}
-			res := make([]*approxlru.Sample[*evictionKey], 0)
-			batchRsp := rbuilder.NewBatchResponseFromProto(rsp.GetBatch())
-			for i, k := range keys {
-				_, err := batchRsp.DeleteResponse(i)
-				if err != nil {
-					return nil, err
-				}
-				res = append(res, k.Meta.(*approxlru.Sample[*evictionKey]))
-			}
-			return res, nil
+		}
+		batchCmd, err := batch.ToProto()
+		if err != nil {
+			return nil, fmt.Errorf("could not construct delete req proto: %s", err)
+		}
+		rsp, err := c.SyncPropose(ctx, &rfpb.SyncProposeRequest{
+			Header: h,
+			Batch:  batchCmd,
 		})
 		if err != nil {
-			metrics.RaftEvictionErrorCount.Inc()
-			log.Warningf("failed to evict %d keys: %s", len(keys), err)
+			return nil, err
 		}
-
-		for _, rsp := range rsps {
-			res, ok := rsp.([]*approxlru.Sample[*evictionKey])
-			if !ok {
-				alert.UnexpectedEvent("raft_unexpected_delete_rsp", "response not type of approxlru.Sample[*evictionKey]")
+		parsed := rbuilder.NewBatchResponseFromProto(rsp.GetBatch())
+		res := make([]*approxlru.Sample[*evictionKey], 0)
+		errCount := 0
+		var lastErr error
+		for i, k := range keys {
+			_, lastErr = parsed.DeleteResponse(i)
+			if lastErr == nil {
+				res = append(res, k.Meta.(*approxlru.Sample[*evictionKey]))
+			} else {
+				errCount++
 			}
-			pu.updateEvictionMetrics(res)
 		}
-
-		keys = nil
-		timer.Reset(evictFlushPeriod)
+		if errCount > 0 {
+			return res, fmt.Errorf("failed to evict %d keys in partition %s, last error: %s", errCount, pu.part.ID, lastErr)
+		}
+		return res, nil
+	})
+	if err != nil {
+		metrics.RaftEvictionErrorCount.Inc()
+		log.Warning(err.Error())
 	}
+	for _, rsp := range rsps {
+		res, ok := rsp.([]*approxlru.Sample[*evictionKey])
+		if !ok {
+			alert.UnexpectedEvent("raft_unexpected_delete_rsp", "response not type of approxlru.Sample[*evictionKey]")
+			continue
+		}
 
-	for {
-		select {
-		case <-ctx.Done():
-			for len(pu.deletes) > 0 {
-				<-pu.deletes
+		pu.updateEvictionMetrics(res)
+
+		for _, s := range res {
+			if gcsMD := s.Key.storageMetadata.GetGcsMetadata(); gcsMD != nil {
+				select {
+				case pu.gcsDeletes <- gcsMD:
+				default:
+					pu.metrics.gcsDeleteDropped.Inc()
+					log.Warningf("GCS deletion queue full, dropping delete request for blob %s", gcsMD.GetBlobName())
+				}
 			}
-			return
-		case sampleToDelete := <-pu.deletes:
-			keys = append(keys, &sender.KeyMeta{
-				Key:  sampleToDelete.Key.bytes,
-				Meta: sampleToDelete,
-			})
-			if len(keys) >= *evictionBatchSize {
-				flush()
-			}
-		case <-timer.C:
-			flush()
 		}
 	}
 }
 
-func (pu *partitionUsage) startSampleGenerator(ctx context.Context) {
-	eg := &errgroup.Group{}
-	eg.Go(func() error {
-		return pu.generateSamplesForEviction(ctx)
+func (pu *partitionUsage) processEviction(ctx context.Context) {
+	batches := make(chan []*sender.KeyMeta, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer close(batches)
+		// sendBatch hands a batch to the dispatcher, but bails out on ctx.Done
+		// so the batcher stops promptly on shutdown instead of blocking until
+		// pu.deletes drains. Returns false if ctx was cancelled (return then).
+		sendBatch := func(b []*sender.KeyMeta) bool {
+			select {
+			case batches <- b:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		var batch []*sender.KeyMeta
+		timer := time.NewTimer(evictFlushPeriod)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case sampleToDelete := <-pu.deletes:
+				batch = append(batch, &sender.KeyMeta{
+					Key:  sampleToDelete.Key.bytes,
+					Meta: sampleToDelete,
+				})
+				if len(batch) >= pu.evictionBatchSize {
+					if !sendBatch(batch) {
+						return
+					}
+					batch = nil
+					timer.Reset(evictFlushPeriod)
+				}
+			case <-timer.C:
+				if !sendBatch(batch) {
+					return
+				}
+				batch = nil
+			}
+		}
 	})
-	eg.Wait()
-	// Drain samples chan before exiting
-	for len(pu.samples) > 0 {
-		<-pu.samples
+	wg.Go(func() {
+		sem := semaphore.NewWeighted(int64(pu.numDeleteWorkers))
+		// inner tracks the in-flight sendDeleteRequests goroutines — the only
+		// senders to pu.gcsDeletes. Wait for them, then close gcsDeletes so the
+		// GCS workers drain the remainder and exit.
+		var inner sync.WaitGroup
+		defer func() {
+			inner.Wait()
+			close(pu.gcsDeletes)
+		}()
+		for batch := range batches {
+			if err := sem.Acquire(ctx, 1); err != nil {
+				// Context cancelled; the batcher has already (or will) close
+				// batches, so stop launching new deletes and return.
+				return
+			}
+			inner.Go(func() {
+				defer sem.Release(1)
+				pu.sendDeleteRequests(ctx, batch)
+			})
+		}
+	})
+	// Block until the batcher, the dispatcher, and every in-flight
+	// sendDeleteRequests goroutine have finished. By then the dispatcher has
+	// closed gcsDeletes (above), so the GCS workers can drain the remainder and
+	// exit; Stop just waits for that (see drainGCSDeletes).
+	wg.Wait()
+}
+
+func (pu *partitionUsage) processGCSDeletions(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case gcsMD, ok := <-pu.gcsDeletes:
+			if !ok {
+				// Channel closed and drained on shutdown.
+				return
+			}
+			err := pu.fileStorer.DeleteStoredBlob(ctx, gcsMD)
+			metrics.RaftGCSEvictionCount.With(prometheus.Labels{
+				metrics.PartitionID:              pu.part.ID,
+				metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
+			}).Inc()
+			if err != nil {
+				log.Warningf("failed to delete blob %q: %s", gcsMD.GetBlobName(), err)
+			}
+		}
 	}
+}
+
+// drainGCSDeletes waits for the GCS-delete workers to flush the buffered
+// deletes, bounded by shutdownCtx (the shared drain budget). gcsDeletes is
+// closed by processEviction once the producers stop, so the workers drain
+// what's buffered and exit; here we wait for that, then cancel — releasing
+// their context on success, or force-stopping them (abandoning whatever is
+// left) when the budget runs out first.
+func (pu *partitionUsage) drainGCSDeletes(shutdownCtx context.Context) {
+	eg := pu.gcsDeleteEg
+	if eg == nil {
+		return
+	}
+	pu.gcsDeleteEg = nil // idempotent: a second Stop() is a no-op
+	start := pu.clock.Now()
+	if waitErrgroup(shutdownCtx, eg) {
+		log.Infof("partition %q: drained GCS deletes in %s", pu.part.ID, pu.clock.Since(start))
+	} else {
+		log.Warningf("partition %q: GCS delete drain hit shutdown deadline after %s, %d deletes abandoned", pu.part.ID, pu.clock.Since(start), len(pu.gcsDeletes))
+	}
+	pu.gcsDeleteCancel()
+}
+
+func (pu *partitionUsage) startSampleGenerator(ctx context.Context) {
+	pu.generateSamplesForEviction(ctx)
 	close(pu.samples)
 }
 
 var digestRunes = []rune("abcdef1234567890")
 
 func (pu *partitionUsage) randomKey(n int) []byte {
-	randKey := pu.partitionKeyPrefix() + "/"
-	for i := 0; i < n; i++ {
-		randKey += string(digestRunes[rand.Intn(len(digestRunes))])
+	var randKey strings.Builder
+	randKey.WriteString(pu.partitionKeyPrefix() + "/")
+	for range n {
+		randKey.WriteString(string(digestRunes[rand.Intn(len(digestRunes))]))
 	}
-	return []byte(randKey)
+	return []byte(randKey.String())
+}
+
+// samplerSleep pauses the sampler for the configured sleep duration to avoid
+// busy-looping when there is nothing useful to sample. It returns false if the
+// context was cancelled.
+func (pu *partitionUsage) samplerSleep(ctx context.Context) bool {
+	if pu.samplerSleepDuration <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-pu.clock.After(pu.samplerSleepDuration):
+		return true
+	}
 }
 
 func (pu *partitionUsage) generateSamplesForEviction(ctx context.Context) error {
@@ -300,10 +456,7 @@ func (pu *partitionUsage) generateSamplesForEviction(ctx context.Context) error 
 	defer db.Close()
 	start, end := keys.Range([]byte(pu.partitionKeyPrefix() + "/"))
 	iterCreatedAt := time.Now()
-	iter, err := db.NewIter(&pebble.IterOptions{
-		LowerBound: start,
-		UpperBound: end,
-	})
+	iter, err := db.NewIter(&pebble.IterOptions{LowerBound: start, UpperBound: end})
 	if err != nil {
 		return err
 	}
@@ -313,65 +466,60 @@ func (pu *partitionUsage) generateSamplesForEviction(ctx context.Context) error 
 		iter.Close()
 	}()
 
-	totalCount := 0
-	shouldCreateNewIter := false
-	fileMetadata := rfpb.FileMetadataFromVTPool()
+	leftInBatch := pu.samplesPerBatch
+	fileMetadata := sgpb.FileMetadataFromVTPool()
 	defer fileMetadata.ReturnToVTPool()
 
-	timer := pu.clock.NewTimer(SamplerSleepDuration)
-	defer timeutil.StopAndDrainClockworkTimer(timer)
+	timer := pu.clock.NewTimer(0)
+	defer timer.Stop()
 
 	// Files are kept in random order (because they are keyed by digest), so
 	// instead of doing a new seek for every random sample we will seek once
 	// and just read forward, yielding digests until we've found enough.
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		default:
 		}
 
 		// When we started to populate a cache, we cannot find any eligible
 		// entries to evict. We will sleep for some time to prevent from
 		// constantly generating samples in vain.
 		globalSize := pu.GlobalSizeBytes()
-		shouldSleep := globalSize <= int64(SamplerSleepThreshold*float64(pu.part.MaxSizeBytes))
+		shouldSleep := globalSize <= int64(samplerSleepThreshold*float64(pu.part.MaxSizeBytes))
 		if shouldSleep {
-			select {
-			case <-ctx.Done():
+			if !pu.samplerSleep(ctx) {
 				return nil
-			case <-pu.clock.After(SamplerSleepDuration):
 			}
 		}
 
-		if totalCount > *samplesPerBatch || time.Since(iterCreatedAt) > *samplerIterRefreshPeriod {
-			// Going to refresh the iterator in the next iteration.
-			shouldCreateNewIter = true
-		}
-
 		// Refresh the iterator once a while
-		if shouldCreateNewIter {
-			shouldCreateNewIter = false
-			totalCount = 0
+		if leftInBatch <= 0 || time.Since(iterCreatedAt) > pu.samplerIterRefreshPeriod {
+			leftInBatch = pu.samplesPerBatch
 			iterCreatedAt = time.Now()
-			newIter, err := db.NewIter(&pebble.IterOptions{
-				LowerBound: start,
-				UpperBound: end,
-			})
+			// This iterator won't be positioned (Valid() will return false),
+			// so we will position it below.
+			newIter, err := db.NewIter(&pebble.IterOptions{LowerBound: start, UpperBound: end})
 			if err != nil {
 				return err
 			}
 			iter.Close()
 			iter = newIter
 		}
-		totalCount += 1
+		leftInBatch--
 		if !iter.Valid() {
-			// This should happen once every totalCount times or when
-			// we exausted the iter.
+			// This happens when we create a new iterator or exhaust the
+			// existing one.
 			randomKey := pu.randomKey(64)
-			valid := iter.SeekGE(randomKey)
-			if !valid {
-				shouldCreateNewIter = true
+			if valid := iter.SeekGE(randomKey); !valid {
+				// This is a probabilistic sleep. A partition with no rows on
+				// this node will always sleep. A partition with many rows is
+				// very unlikely to sleep. This ensures that we don't waste CPU
+				// cycles trying to find samples for a partition with no (or
+				// few) rows.
+				if !pu.samplerSleep(ctx) {
+					return nil
+				}
+				leftInBatch = 0 // Force creating a new iterator
 				continue
 			}
 		}
@@ -380,24 +528,22 @@ func (pu *partitionUsage) generateSamplesForEviction(ctx context.Context) error 
 			log.Warningf("cannot generate sample for eviction, skipping: failed to read key: %s", err)
 			continue
 		}
-
-		err = proto.Unmarshal(iter.Value(), fileMetadata)
+		fileMetadata.ResetVT() // UnmarshalVT doesn't reset, unlike proto.Unmarshal.
+		err = fileMetadata.UnmarshalVT(iter.Value())
 		if err != nil {
 			log.Warningf("cannot generate sample for eviction, skipping: failed to read proto: %s", err)
 			continue
 		}
 
 		pu.maybeAddToSampleChan(ctx, iter, fileMetadata, timer)
-
 		iter.Next()
-		fileMetadata.ResetVT()
 	}
 }
 
-func (pu *partitionUsage) maybeAddToSampleChan(ctx context.Context, iter pebble.Iterator, fileMetadata *rfpb.FileMetadata, timer clockwork.Timer) {
+func (pu *partitionUsage) maybeAddToSampleChan(ctx context.Context, iter pebble.Iterator, fileMetadata *sgpb.FileMetadata, timer clockwork.Timer) {
 	atime := time.UnixMicro(fileMetadata.GetLastAccessUsec())
 	age := pu.clock.Since(atime)
-	if age < *minEvictionAge {
+	if age < pu.minEvictionAge {
 		return
 	}
 	sizeBytes := int64(proto.Size(fileMetadata)) + int64(len(iter.Key()))
@@ -406,13 +552,13 @@ func (pu *partitionUsage) maybeAddToSampleChan(ctx context.Context, iter pebble.
 	copy(keyBytes, iter.Key())
 	sample := &approxlru.Sample[*evictionKey]{
 		Key: &evictionKey{
-			bytes: keyBytes,
+			bytes:           keyBytes,
+			storageMetadata: fileMetadata.GetStorageMetadata(),
 		},
 		SizeBytes: sizeBytes,
 		Timestamp: atime,
 	}
-	timeutil.StopAndDrainClockworkTimer(timer)
-	timer.Reset(SamplerSleepDuration)
+	timer.Reset(pu.samplerSleepDuration)
 	select {
 	case pu.samples <- sample:
 	case <-ctx.Done():
@@ -429,15 +575,14 @@ func (e *partitionUsage) evict(ctx context.Context, sample *approxlru.Sample[*ev
 
 func (pu *partitionUsage) updateEvictionMetrics(samples []*approxlru.Sample[*evictionKey]) error {
 	sizeBytes := float64(0)
-	lbls := prometheus.Labels{metrics.PartitionID: pu.part.ID, metrics.CacheNameLabel: constants.CacheName}
 	for _, sample := range samples {
 		age := time.Since(sample.Timestamp)
 		sizeBytes += float64(sample.SizeBytes)
-		metrics.DiskCacheEvictionAgeMsec.With(lbls).Observe(float64(age.Milliseconds()))
-		metrics.DiskCacheLastEvictionAgeUsec.With(lbls).Set(float64(age.Microseconds()))
+		pu.metrics.cacheEvictionAgeMsec.Observe(float64(age.Milliseconds()))
+		pu.metrics.cacheLastEvictionAgeUsec.Set(float64(age.Microseconds()))
 	}
-	metrics.DiskCacheNumEvictions.With(lbls).Add(float64(len(samples)))
-	metrics.DiskCacheBytesEvicted.With(lbls).Add(sizeBytes)
+	pu.metrics.cacheNumEvictions.Add(float64(len(samples)))
+	pu.metrics.cacheBytesEvicted.Add(sizeBytes)
 
 	pu.mu.Lock()
 	defer pu.mu.Unlock()
@@ -460,7 +605,7 @@ func (pu *partitionUsage) updateEvictionMetrics(samples []*approxlru.Sample[*evi
 
 func (pu *partitionUsage) sample(ctx context.Context, k int) ([]*approxlru.Sample[*evictionKey], error) {
 	samples := make([]*approxlru.Sample[*evictionKey], 0, k)
-	for i := 0; i < k; i++ {
+	for range k {
 		s, ok := <-pu.samples
 		if ok {
 			samples = append(samples, s)
@@ -470,31 +615,64 @@ func (pu *partitionUsage) sample(ctx context.Context, k int) ([]*approxlru.Sampl
 	return samples, nil
 }
 
-func New(sender *sender.Sender, dbGetter pebble.Leaser, gossipManager interfaces.GossipService, node *rfpb.NodeDescriptor, partitions []disk.Partition, clock clockwork.Clock) (*Tracker, error) {
+func (pu *partitionUsage) updateMetrics() {
+	pu.mu.Lock()
+	defer pu.mu.Unlock()
+
+	pu.metrics.evictionSamplesChanSize.Set(float64(len(pu.samples)))
+	pu.metrics.evictionGCSChanSize.Set(float64(len(pu.gcsDeletes)))
+}
+
+func New(sender *sender.Sender, dbGetter pebble.Leaser, gossipManager interfaces.GossipService, node *rfpb.NodeDescriptor, partitions []disk.Partition, clock clockwork.Clock, fileStorer filestore.Store) (*Tracker, error) {
 	ut := &Tracker{
 		gossipManager: gossipManager,
 		node:          node,
 		partitions:    partitions,
 		byPartition:   make(map[string]*partitionUsage),
 		clock:         clock,
-		lastBroadcast: make(map[string]*rfpb.PartitionMetadata),
+		lastBroadcast: make(map[string]*sgpb.PartitionMetadata),
+
+		partitionUsageDeltaGossipThreshold: *partitionUsageDeltaGossipThreshold,
 	}
 
 	for _, p := range partitions {
+		if p.SoftDeleted {
+			continue
+		}
+		lbls := prometheus.Labels{metrics.PartitionID: p.ID, metrics.CacheNameLabel: constants.CacheName}
+		partitionLabel := prometheus.Labels{metrics.PartitionID: p.ID}
+		metricSet := metricSet{
+			cachePartitionSizeBytes:     metrics.DiskCachePartitionSizeBytes.With(lbls),
+			cachePartitionCapacityBytes: metrics.DiskCachePartitionCapacityBytes.With(lbls),
+			gcsDeleteDropped:            metrics.RaftGCSDeleteDropped.With(partitionLabel),
+			cacheEvictionAgeMsec:        metrics.DiskCacheEvictionAgeMsec.With(lbls),
+			cacheLastEvictionAgeUsec:    metrics.DiskCacheLastEvictionAgeUsec.With(lbls),
+			cacheNumEvictions:           metrics.DiskCacheNumEvictions.With(lbls),
+			cacheBytesEvicted:           metrics.DiskCacheBytesEvicted.With(lbls),
+			evictionSamplesChanSize:     metrics.RaftEvictionSamplesChanSize.With(partitionLabel),
+			evictionGCSChanSize:         metrics.RaftEvictionGCSChanSize.With(partitionLabel),
+		}
 		u := &partitionUsage{
-			part:     p,
-			sender:   sender,
-			clock:    clock,
-			nodes:    make(map[string]*nodePartitionUsage),
-			dbGetter: dbGetter,
-			samples:  make(chan *approxlru.Sample[*evictionKey], *sampleBufferSize),
-			deletes:  make(chan *approxlru.Sample[*evictionKey], *deleteBufferSize),
+			part:                     p,
+			sender:                   sender,
+			clock:                    clock,
+			nodes:                    make(map[string]*nodePartitionUsage),
+			dbGetter:                 dbGetter,
+			samples:                  make(chan *approxlru.Sample[*evictionKey], *sampleBufferSize),
+			deletes:                  make(chan *approxlru.Sample[*evictionKey], *deleteBufferSize),
+			gcsDeletes:               make(chan *sgpb.StorageMetadata_GCSMetadata, *gcsDeleteBufferSize),
+			samplesPerBatch:          *samplesPerBatch,
+			samplerIterRefreshPeriod: *samplerIterRefreshPeriod,
+			samplerSleepDuration:     *samplerSleepDuration,
+			minEvictionAge:           *minEvictionAge,
+			localSizeUpdatePeriod:    *localSizeUpdatePeriod,
+			evictionBatchSize:        *evictionBatchSize,
+			numDeleteWorkers:         *numDeleteWorkers,
+			numGCSDeleteWorkers:      *numGCSDeleteWorkers,
+			fileStorer:               fileStorer,
+			metrics:                  metricSet,
 		}
 		ut.byPartition[p.ID] = u
-		metricLbls := prometheus.Labels{
-			metrics.PartitionID:    p.ID,
-			metrics.CacheNameLabel: constants.CacheName,
-		}
 		maxSizeBytes := int64(EvictionCutoffThreshold * float64(p.MaxSizeBytes))
 		l, err := approxlru.New(&approxlru.Opts[*evictionKey]{
 			SamplePoolSize:              *samplePoolSize,
@@ -502,8 +680,8 @@ func New(sender *sender.Sender, dbGetter pebble.Leaser, gossipManager interfaces
 			MaxSizeBytes:                maxSizeBytes,
 			DeletesPerEviction:          *deletesPerEviction,
 			RateLimit:                   float64(*evictionRateLimit),
-			EvictionResampleLatencyUsec: metrics.PebbleCacheEvictionResampleLatencyUsec.With(metricLbls),
-			EvictionEvictLatencyUsec:    metrics.PebbleCacheEvictionEvictLatencyUsec.With(metricLbls),
+			EvictionResampleLatencyUsec: metrics.PebbleCacheEvictionResampleLatencyUsec.With(lbls),
+			EvictionEvictLatencyUsec:    metrics.PebbleCacheEvictionEvictLatencyUsec.With(lbls),
 			Clock:                       clock,
 			OnEvict: func(ctx context.Context, sample *approxlru.Sample[*evictionKey]) error {
 				return u.evict(ctx, sample)
@@ -536,6 +714,20 @@ func (ut *Tracker) Start() {
 			pu.processEviction(gctx)
 			return nil
 		})
+		// Run the GCS-delete workers under a separate errgroup/context so that
+		// on shutdown we can stop the producers first and keep the workers
+		// alive to drain the buffer (see drainGCSDeletes).
+		gcsCtx, gcsCancel := context.WithCancel(context.Background())
+		pu.gcsDeleteCancel = gcsCancel
+		gcsEg, gcsGctx := errgroup.WithContext(gcsCtx)
+		pu.gcsDeleteEg = gcsEg
+		numGCSWorkers := max(pu.numGCSDeleteWorkers, 1)
+		for range numGCSWorkers {
+			pu.gcsDeleteEg.Go(func() error {
+				pu.processGCSDeletions(gcsGctx)
+				return nil
+			})
+		}
 		pu.eg.Go(func() error {
 			pu.updateLocalSizeBytes(gctx)
 			return nil
@@ -553,38 +745,79 @@ func (ut *Tracker) Start() {
 		ut.broadcastLoop(gctx)
 		return nil
 	})
+	eg.Go(func() error {
+		ut.refreshMetrics(gctx)
+		return nil
+	})
 }
 
-func (ut *Tracker) Stop() {
+// Stop shuts the tracker down. It honors ctx (the server's bounded shutdown
+// grace) so it always returns within that budget: it drains buffered GCS
+// deletes when there is time, and degrades to a clean abandon when there isn't.
+func (ut *Tracker) Stop(ctx context.Context) {
+	// A single drain budget for all partitions, measured from Stop and capped
+	// by the shutdown grace.
+	drainCtx, cancel := context.WithTimeout(ctx, *gcsDeleteDrainTimeout)
+	defer cancel()
+
 	if ut.egCancel != nil {
 		ut.egCancel()
-		ut.eg.Wait()
+		waitErrgroup(ctx, ut.eg)
 	}
+	// Shut partitions down concurrently. Per partition, one goroutine stops the
+	// producers (which closes gcsDeletes) while another drains the GCS workers;
+	// both are bounded by drainCtx so Stop always returns within budget.
+	var wg sync.WaitGroup
 	for _, p := range ut.byPartition {
-		p.lru.Stop()
-		if p.egCancel != nil {
-			p.egCancel()
-			p.eg.Wait()
-		}
+		wg.Go(func() {
+			p.lru.Stop()
+			if p.egCancel != nil {
+				p.egCancel()
+				waitErrgroup(drainCtx, p.eg)
+			}
+		})
+		wg.Go(func() {
+			p.drainGCSDeletes(drainCtx)
+		})
+	}
+	wg.Wait()
+}
+
+// waitErrgroup blocks until eg's goroutines finish or ctx is done. It returns
+// true only if the errgroup finished first. The detached waiter goroutine
+// leaks only if ctx wins and the group never finishes, which is fine during
+// shutdown.
+func waitErrgroup(ctx context.Context, eg *errgroup.Group) bool {
+	done := make(chan struct{})
+	go func() {
+		eg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
 func (ut *Tracker) Statusz(ctx context.Context) string {
 	ut.mu.Lock()
 	defer ut.mu.Unlock()
-	buf := "Partitions:\n"
+	var buf strings.Builder
+	buf.WriteString("Partitions:\n")
 	for _, p := range ut.partitions {
-		buf += fmt.Sprintf("\t%s\n", p.ID)
+		buf.WriteString(fmt.Sprintf("\t%s\n", p.ID))
 		u, ok := ut.byPartition[p.ID]
 		if !ok {
-			buf += "\t\tno data\n"
+			buf.WriteString("\t\tno data\n")
 			continue
 		}
 
 		globalSizeBytes := u.GlobalSizeBytes()
 		percentFull := (float64(globalSizeBytes) / float64(p.MaxSizeBytes)) * 100
 
-		buf += fmt.Sprintf("\t\tCapacity: %s / %s (%2.2f%% full)\n", units.BytesSize(float64(globalSizeBytes)), units.BytesSize(float64(p.MaxSizeBytes)), percentFull)
+		buf.WriteString(fmt.Sprintf("\t\tCapacity: %s / %s (%2.2f%% full)\n", units.BytesSize(float64(globalSizeBytes)), units.BytesSize(float64(p.MaxSizeBytes)), percentFull))
 
 		// Show nodes in a consistent order so that they don't jump around when
 		// refreshing the statusz page.
@@ -593,16 +826,16 @@ func (ut *Tracker) Statusz(ctx context.Context) string {
 			nhids = append(nhids, nhid)
 		}
 		sort.Strings(nhids)
-		buf += "\t\tGlobal Usage:\n"
+		buf.WriteString("\t\tGlobal Usage:\n")
 		for _, nhid := range nhids {
 			nu, ok := u.nodes[nhid]
 			if !ok {
 				continue
 			}
-			buf += fmt.Sprintf("\t\t\t%s: %s (last updated: %s)\n", nhid, units.BytesSize(float64(nu.sizeBytes)), nu.lastUpdate)
+			buf.WriteString(fmt.Sprintf("\t\t\t%s: %s (last updated: %s)\n", nhid, units.BytesSize(float64(nu.sizeBytes)), nu.lastUpdate))
 		}
 	}
-	return buf
+	return buf.String()
 }
 
 func (ut *Tracker) OnEvent(updateType serf.EventType, event serf.Event) {
@@ -648,6 +881,29 @@ func (ut *Tracker) RemoteUpdate(usage *rfpb.NodePartitionUsage) {
 	}
 }
 
+func (ut *Tracker) refreshMetrics(ctx context.Context) {
+	partitionUsages := make([]*partitionUsage, 0, len(ut.byPartition))
+	ut.mu.Lock()
+	for _, pu := range ut.byPartition {
+		partitionUsages = append(partitionUsages, pu)
+	}
+
+	ut.mu.Unlock()
+
+	ticker := ut.clock.NewTicker(metricsRefreshPeriod)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.Chan():
+			for _, pu := range partitionUsages {
+				pu.updateMetrics()
+			}
+		}
+	}
+}
+
 func (ut *Tracker) computeUsage() *rfpb.NodePartitionUsage {
 	ut.mu.Lock()
 	defer ut.mu.Unlock()
@@ -656,7 +912,7 @@ func (ut *Tracker) computeUsage() *rfpb.NodePartitionUsage {
 	}
 
 	for _, p := range ut.partitions {
-		up := &rfpb.PartitionMetadata{
+		up := &sgpb.PartitionMetadata{
 			PartitionId: p.ID,
 		}
 		if u, ok := ut.byPartition[p.ID]; ok {
@@ -683,7 +939,6 @@ func (ut *Tracker) broadcastLoop(ctx context.Context) {
 				log.Warningf("could not gossip node partition usage info: %s", err)
 			}
 			if broadcasted {
-				timeutil.StopAndDrainClockworkTimer(idleTimer)
 				idleTimer.Reset(storePartitionUsageMaxAge)
 			}
 		case <-idleTimer.Chan():
@@ -704,7 +959,7 @@ func (ut *Tracker) broadcast(force bool) (bool, error) {
 		ut.mu.Lock()
 		for _, u := range usage.GetPartitionUsage() {
 			lb, ok := ut.lastBroadcast[u.GetPartitionId()]
-			if !ok || math.Abs(float64(u.GetSizeBytes()-lb.GetSizeBytes())) > float64(*partitionUsageDeltaGossipThreshold) {
+			if !ok || math.Abs(float64(u.GetSizeBytes()-lb.GetSizeBytes())) > float64(ut.partitionUsageDeltaGossipThreshold) {
 				significantChange = true
 				break
 			}
@@ -734,7 +989,13 @@ func (ut *Tracker) broadcast(force bool) (bool, error) {
 	return true, nil
 }
 
-func (ut *Tracker) TestingWaitForGC() {
+type watermark struct {
+	timestamp time.Time
+	sizeBytes int64
+}
+
+func (ut *Tracker) TestingWaitForGC(ctx context.Context) error {
+	lastSize := make(map[string]watermark)
 	for {
 		ut.mu.Lock()
 		partitionUsage := ut.byPartition
@@ -748,10 +1009,22 @@ func (ut *Tracker) TestingWaitForGC() {
 				break
 			}
 			db.Flush()
+			start, end := keys.Range([]byte(pu.partitionKeyPrefix() + "/"))
+			db.Compact(start, end, false /*parallelize*/)
 			db.Close()
 			totalSizeBytes := pu.LocalSizeBytes()
 			pu.lru.UpdateSizeBytes(totalSizeBytes)
 			maxAllowedSize := int64(EvictionCutoffThreshold * float64(pu.part.MaxSizeBytes))
+			if lastSize[pu.part.ID].sizeBytes != totalSizeBytes {
+				lastSize[pu.part.ID] = watermark{
+					timestamp: time.Now(),
+					sizeBytes: totalSizeBytes,
+				}
+			} else {
+				if size := lastSize[pu.part.ID].sizeBytes; size > 0 && time.Since(lastSize[pu.part.ID].timestamp) > 3*time.Second {
+					log.Warningf("LRU not making progress: size is %s, maxAllowedSize is %s", units.HumanSize(float64(size)), units.HumanSize(float64(maxAllowedSize)))
+				}
+			}
 			if totalSizeBytes <= maxAllowedSize {
 				done += 1
 			}
@@ -759,7 +1032,12 @@ func (ut *Tracker) TestingWaitForGC() {
 		if done == len(partitionUsage) {
 			break
 		}
-
+		select {
+		case <-ctx.Done():
+			return status.CanceledError("context canceled waiting for GC")
+		default:
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	return nil
 }

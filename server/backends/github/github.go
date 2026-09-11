@@ -21,11 +21,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/cookie"
+	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/random"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/google/go-github/v59/github"
+
+	gitutil "github.com/buildbuddy-io/buildbuddy/server/util/git"
 )
 
 var (
@@ -33,11 +36,11 @@ var (
 	JwtKey           = flag.String("github.jwt_key", "", "The key to use when signing JWT tokens for github auth.", flag.Secret)
 	enterpriseHost   = flag.String("github.enterprise_host", "", "The Github enterprise hostname to use if using GitHub enterprise server, not including https:// and no trailing slash.", flag.Secret)
 
-	// TODO: Mark these deprecated once the new GitHub app is implemented.
+	accessToken = flag.String("github.access_token", "", "The GitHub access token used to post GitHub commit statuses. This is intended as a convenience option and can be set to a personal access token (PAT) or a shared machine account PAT.", flag.Secret)
 
+	// TODO: Mark these deprecated once the new GitHub app is implemented.
 	clientID     = flag.String("github.client_id", "", "The client ID of your GitHub Oauth App. ** Enterprise only **")
 	clientSecret = flag.String("github.client_secret", "", "The client secret of your GitHub Oauth App. ** Enterprise only **", flag.Secret)
-	accessToken  = flag.String("github.access_token", "", "The GitHub access token used to post GitHub commit statuses. ** Enterprise only **", flag.Secret)
 )
 
 const (
@@ -64,6 +67,12 @@ const (
 
 func AuthEnabled(env environment.Env) bool {
 	return *JwtKey != ""
+}
+
+func AlwaysEnableStatusReporting() bool {
+	// If a user has hard-coded an access token for GitHub status
+	// reporting, assume they want it enabled.
+	return *accessToken != ""
 }
 
 // State represents a status value that GitHub's statuses API understands.
@@ -135,8 +144,8 @@ func NewGitHubStatusService(env environment.Env) *githubStatusService {
 	return &githubStatusService{env}
 }
 
-func (s *githubStatusService) GetStatusClient(accessToken string) interfaces.GitHubStatusClient {
-	return NewGithubClient(s.env, accessToken)
+func (s *githubStatusService) GetStatusClient() interfaces.GitHubStatusClient {
+	return NewGithubClient(s.env, "")
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -165,7 +174,7 @@ func getLegacyOAuthHandler(env environment.Env) *OAuthHandler {
 	a := NewOAuthHandler(env, *clientID, legacyClientSecret(), legacyOAuthAppPath)
 	a.GroupLinkEnabled = true
 	// Only enable user-level linking if the new GitHub App is not yet enabled.
-	a.UserLinkEnabled = env.GetGitHubApp() == nil
+	a.UserLinkEnabled = env.GetGitHubAppService() == nil
 	return a
 }
 
@@ -231,37 +240,6 @@ func NewOAuthHandler(env environment.Env, clientID, clientSecret, path string) *
 	}
 }
 
-func (c *OAuthHandler) StartAuthFlow(w http.ResponseWriter, r *http.Request, redirectPath string) {
-	state := fmt.Sprintf("%d", random.RandUint64())
-	userID := r.FormValue("user_id")
-	groupID := r.FormValue("group_id")
-	redirectURL := r.FormValue("redirect_url")
-	if err := build_buddy_url.ValidateRedirect(redirectURL); err != nil {
-		redirectWithError(w, r, err)
-		return
-	}
-	expiry := time.Now().Add(tempCookieDuration)
-	cookie.SetCookie(w, stateCookieName, state, expiry, true)
-	cookie.SetCookie(w, userIDCookieName, userID, expiry, true)
-	cookie.SetCookie(w, groupIDCookieName, groupID, expiry, true)
-	cookie.SetCookie(w, cookie.RedirCookie, redirectURL, expiry, true)
-
-	var authURL string
-	if r.FormValue("install") == "true" && c.InstallURL != "" {
-		authURL = fmt.Sprintf("%s?state=%s", c.InstallURL, state)
-	} else {
-		authURL = fmt.Sprintf(
-			"https://%s/login/oauth/authorize?client_id=%s&state=%s&redirect_uri=%s&scope=%s",
-			GithubHost(),
-			c.ClientID,
-			state,
-			url.QueryEscape(build_buddy_url.WithPath(redirectPath).String()),
-			"repo")
-	}
-
-	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
-}
-
 func (c *OAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, err := c.env.GetAuthenticator().AuthenticatedUser(r.Context())
 	if err != nil {
@@ -281,10 +259,14 @@ func (c *OAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If we are missing either the OAuth code or app installation ID, start the
-	// OAuth flow.
-	if r.FormValue("code") == "" && r.FormValue("installation_id") == "" {
-		c.StartAuthFlow(w, r, c.Path)
+	// If code or installation_id is set, this URL was hit as a callback from GitHub.
+	githubCallback := r.FormValue("code") != "" || r.FormValue("installation_id") != ""
+	if !githubCallback {
+		if r.FormValue("install") == "true" && c.InstallURL != "" {
+			c.handleInstallApp(w, r)
+		} else {
+			c.HandleLinkRepo(w, r, c.Path)
+		}
 		return
 	}
 
@@ -296,7 +278,7 @@ func (c *OAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if code := r.FormValue("code"); code != "" {
-		if err := c.requestAccessToken(r, code); err != nil {
+		if err := c.handleLinkRepoCallback(r); err != nil {
 			redirectWithError(w, r, status.WrapError(err, "failed to exchange OAuth code for access token"))
 			return
 		}
@@ -306,7 +288,7 @@ func (c *OAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Note, during the "install & authorize" flow, both the OAuth "code" param
 	// and "installation_id" param will be set.
 	if installationID := r.FormValue("installation_id"); installationID != "" {
-		redirected, err := c.handleInstallation(w, r, installationID)
+		redirected, err := c.handleInstallAppCallback(w, r, installationID)
 		if err != nil {
 			redirectWithError(w, r, status.WrapError(err, "could not complete installation"))
 			return
@@ -324,13 +306,60 @@ func (c *OAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, appRedirectURL, http.StatusTemporaryRedirect)
 }
 
-// requestAccessToken exchanges an OAuth code for an access token and links the
+// HandleLinkRepo handles the case where the user has never connected their
+// GitHub repo to BuildBuddy. This will take them to an oauth flow in GitHub.
+//
+// This flow will create a connection between a GitHub user and BuildBuddy user.
+// It will generate a GitHub token that a BuildBuddy user can use for GitHub operations.
+// It will not grant specific repo permissions. That must be separately granted
+// via the `handleInstallApp` flow, though this oauth step is a prerequisite.
+//
+// GitHub will redirect back to the callback URL set in the app settings (something like
+// auth/github/app/link or auth/github/read_only_app/link) with the "code" query param set.
+// This subsequent request should be handled with handleLinkRepoCallback
+func (c *OAuthHandler) HandleLinkRepo(w http.ResponseWriter, r *http.Request, redirectPath string) {
+	state := fmt.Sprintf("%d", random.RandUint64())
+	if !setCookies(w, r, state) {
+		return
+	}
+
+	authURL := fmt.Sprintf(
+		"https://%s/login/oauth/authorize?client_id=%s&state=%s&redirect_uri=%s&scope=%s",
+		GithubHost(),
+		c.ClientID,
+		state,
+		url.QueryEscape(build_buddy_url.WithPath(redirectPath).String()),
+		"repo")
+	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
+}
+
+func setCookies(w http.ResponseWriter, r *http.Request, state string) bool {
+	userID := r.FormValue("user_id")
+	groupID := r.FormValue("group_id")
+	redirectURL := r.FormValue("redirect_url")
+	if err := build_buddy_url.ValidateRedirect(redirectURL); err != nil {
+		redirectWithError(w, r, err)
+		return false
+	}
+	expiry := time.Now().Add(tempCookieDuration)
+	cookie.SetCookie(w, stateCookieName, state, expiry, true)
+	cookie.SetCookie(w, userIDCookieName, userID, expiry, true)
+	cookie.SetCookie(w, groupIDCookieName, groupID, expiry, true)
+	cookie.SetCookie(w, cookie.RedirCookie, redirectURL, expiry, true)
+	return true
+}
+
+// handleLinkRepoCallback handles an oauth callback from GitHub.
+//
+// After a user has authenticated through GitHub's oauth flow (triggered by `HandleLinkRepo`),
+// GitHub will redirect back to the callback URL set in the app settings with the "code" query param set.
+// This method exchanges that OAuth code for an access token and links the
 // access token to either the authenticated group ID or authenticated user ID,
 // depending on the state of the OAuth flow.
 //
 // Note: if the state param is set, it is assumed to be pre-validated against
 // the state cookie.
-func (c *OAuthHandler) requestAccessToken(r *http.Request, code string) error {
+func (c *OAuthHandler) handleLinkRepoCallback(r *http.Request) error {
 	ctx := r.Context()
 	state, err := validateState(r)
 	if err != nil {
@@ -444,7 +473,43 @@ func (c *OAuthHandler) Exchange(r *http.Request) (string, error) {
 	return accessTokenResponse.AccessToken, nil
 }
 
-func (c *OAuthHandler) handleInstallation(w http.ResponseWriter, r *http.Request, rawID string) (redirected bool, err error) {
+// handleInstallApp takes the user to the GitHub flow to install an app.
+//
+// Installing an app will grant access to specific repos. Note that granting oauth
+// access (via `HandleLinkRepo`) is a pre-requisite.
+//
+// GitHub will redirect back to the callback URL set in the app settings (something like
+// auth/github/app/link or auth/github/read_only_app/link) with the "installation_id" query param set.
+// This subsequent request should be handled with handleInstallAppCallback.
+func (c *OAuthHandler) handleInstallApp(w http.ResponseWriter, r *http.Request) {
+	if c.InstallURL == "" {
+		redirectWithError(w, r, status.InternalErrorf("no install URL for github oauth handler %s", c.ClientID))
+		return
+	} else if r.FormValue("install") != "true" {
+		redirectWithError(w, r, status.InternalErrorf("unexpected install parameter not set"))
+		return
+	}
+
+	state := fmt.Sprintf("%d", random.RandUint64())
+	if !setCookies(w, r, state) {
+		return
+	}
+
+	authURL := fmt.Sprintf("%s?state=%s", c.InstallURL, state)
+	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
+}
+
+// handleInstallAppCallback handles an app installation callback from GitHub.
+//
+// After a user has installed an app in GitHub (via `handleInstallApp`),
+// GitHub will redirect back to the callback URL set in the app settings with the
+// "installation_id" query param set.
+//
+// This method creates a record of the app installation in the BB database.
+//
+// Note: if the state param is set, it is assumed to be pre-validated against
+// the state cookie.
+func (c *OAuthHandler) handleInstallAppCallback(w http.ResponseWriter, r *http.Request, rawID string) (redirected bool, err error) {
 	installationID, err := strconv.ParseInt(rawID, 10, 64)
 	if err != nil {
 		redirectWithError(w, r, status.InvalidArgumentErrorf("invalid installation_id %q", r.FormValue("installation_id")))
@@ -466,10 +531,19 @@ func (c *OAuthHandler) handleInstallation(w http.ResponseWriter, r *http.Request
 	return false, nil
 }
 
-func (c *GithubClient) CreateStatus(ctx context.Context, ownerRepo string, commitSHA string, payload *GithubStatusPayload) error {
+func (c *GithubClient) CreateStatus(ctx context.Context, groupID string, ownerRepo string, commitSHA string, payload *GithubStatusPayload) error {
 	if ownerRepo == "" {
 		return status.InvalidArgumentErrorf("failed to create GitHub status: ownerRepo argument is empty")
 	}
+
+	enabled, err := c.IsStatusReportingEnabled(ctx, groupID, ownerRepo)
+	if err != nil {
+		return status.WrapErrorf(err, "failed to check if status reporting is enabled for %s", ownerRepo)
+	}
+	if !enabled {
+		return nil
+	}
+
 	if commitSHA == "" {
 		return status.InvalidArgumentError("failed to create GitHub status: commitSHA argument is empty")
 	}
@@ -508,15 +582,21 @@ func (c *GithubClient) CreateStatus(ctx context.Context, ownerRepo string, commi
 }
 
 func (c *GithubClient) getAppInstallationToken(ctx context.Context, ownerRepo string) (*github.InstallationToken, error) {
-	app := c.env.GetGitHubApp()
-	if app == nil {
-		return nil, nil
+	gh := c.env.GetGitHubAppService()
+	if gh == nil {
+		return nil, status.UnimplementedError("No GitHub app configured")
 	}
 	parts := strings.Split(ownerRepo, "/")
 	if len(parts) != 2 {
 		return nil, status.InvalidArgumentErrorf("invalid owner/repo %q", ownerRepo)
 	}
-	return app.GetInstallationTokenForStatusReportingOnly(ctx, parts[0])
+	// When handling webhooks, we do not have an authenticated BuildBuddy user in
+	// the context and cannot use `GetGitHubAppForAuthenticatedUser`.
+	app, err := gh.GetGitHubAppForOwner(ctx, parts[0])
+	if err != nil {
+		return nil, err
+	}
+	return app.GetInstallationTokenForInternalUseOnly(ctx, parts[0])
 }
 
 func (c *GithubClient) getToken(ctx context.Context, ownerRepo string) (string, error) {
@@ -594,6 +674,55 @@ func (c *GithubClient) fetchToken(ctx context.Context, ownerRepo string) error {
 		c.tokenValue = *group.GithubToken
 	}
 	return nil
+}
+
+func (c *GithubClient) IsStatusReportingEnabled(ctx context.Context, groupID string, repoURL string) (bool, error) {
+	if AlwaysEnableStatusReporting() {
+		return true, nil
+	}
+
+	dbh := c.env.GetDBHandle()
+	if dbh == nil {
+		return false, status.InternalError("no database handle")
+	}
+
+	parsedRepo, err := gitutil.ParseGitHubRepoURL(repoURL)
+	if err != nil {
+		return false, status.InvalidArgumentErrorf("invalid repo URL %s: %s", repoURL, err)
+	}
+
+	installation := &tables.GitHubAppInstallation{}
+	err = dbh.NewQuery(ctx, "build_status_reporter_get_app_installation").Raw(
+		`SELECT * from "GitHubAppInstallations" WHERE group_id = ? AND owner = ?`, groupID, parsedRepo.Owner).Take(installation)
+	if err == nil {
+		return installation.ReportCommitStatusesForCIBuilds, nil
+	} else if !db.IsRecordNotFound(err) {
+		return false, status.WrapErrorf(err, "failed to query GitHubAppInstallations: %s", err)
+	}
+
+	// If the user hasn't installed our GH app, check legacy methods for
+	// enabling status reporting. Always report statuses for users that
+	// onboarded through a legacy method, because status reporting was
+	// automatically enabled for them.
+	legacyWorkflow := &struct{ Count int64 }{}
+	err = dbh.NewQuery(ctx, "build_status_reporter_get_workflow").Raw(
+		`SELECT COUNT(*) as count from "Workflows" WHERE repo_url = ?`, repoURL).Take(legacyWorkflow)
+	if err == nil && legacyWorkflow.Count > 0 {
+		return true, nil
+	} else if err != nil {
+		return false, status.WrapErrorf(err, "failed to query Workflows: %s", err)
+	}
+
+	groupWithLegacyToken := &struct{ Count int64 }{}
+	err = dbh.NewQuery(ctx, "build_status_reporter_get_group").Raw(
+		`SELECT COUNT(*) as count from "Groups" WHERE group_id = ? AND github_token <> '' AND github_token IS NOT NULL`, groupID).Take(groupWithLegacyToken)
+	if err == nil && groupWithLegacyToken.Count > 0 {
+		return true, nil
+	} else if err != nil {
+		return false, status.WrapErrorf(err, "failed to query Groups: %s", err)
+	}
+
+	return false, nil
 }
 
 func appendStatusNameSuffix(p *GithubStatusPayload) *GithubStatusPayload {

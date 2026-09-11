@@ -1,7 +1,6 @@
 package types
 
 import (
-	"fmt"
 	"io"
 )
 
@@ -14,6 +13,22 @@ const (
 
 	DocIDField   = "_id"
 	DeletesField = "_del"
+
+	// ImportsField holds the import-identity terms a document imports.
+	// ImportIDField holds the document's own import-identity terms; it is
+	// known to the index so its value can be carried in the per-doc stats
+	// record and resolved into scoring signals at query time.
+	ImportsField  = "imports"
+	ImportIDField = "import_id"
+
+	// SymbolsField holds the names the document declares (tree-sitter
+	// extracted, lowercased), so symbol-definition matches can be scored
+	// above usage and substring matches.
+	SymbolsField = "symbols"
+
+	// SignalImportInDegree is the number of documents whose ImportsField
+	// contains one of this document's ImportIDField terms.
+	SignalImportInDegree = "import_indegree"
 )
 
 func (ft FieldType) String() string {
@@ -29,11 +44,27 @@ func (ft FieldType) String() string {
 	}
 }
 
-type Field interface {
+type FieldSchema interface {
 	Type() FieldType
 	Name() string
-	Contents() []byte
 	Stored() bool
+	MakeTokenizer() Tokenizer
+	MakeField([]byte) Field
+	String() string
+}
+
+type DocumentSchema interface {
+	Fields() []FieldSchema
+	Field(name string) FieldSchema
+	MakeDocument(map[string][]byte) (Document, error)
+	MustMakeDocument(map[string][]byte) Document
+}
+
+type Field interface {
+	Contents() []byte
+	Type() FieldType
+	Name() string
+	Schema() FieldSchema
 }
 
 type Document interface {
@@ -44,14 +75,18 @@ type Document interface {
 
 type Posting interface {
 	Docid() uint64
-	Positions() []uint64
-	Merge(Posting)
+	Frequency() uint32
 }
 
 type DocumentMatch interface {
 	Docid() uint64
 	FieldNames() []string
 	Posting(fieldName string) Posting
+	FieldLength(fieldName string) uint32
+	// Signal returns the named per-document scoring signal, or 0 if the
+	// signal is absent or has not been resolved. Signals are attached to
+	// matches by the index reader's ResolveSignals before scoring.
+	Signal(name string) float64
 }
 
 type Tokenizer interface {
@@ -60,23 +95,67 @@ type Tokenizer interface {
 
 	Type() FieldType
 	Ngram() []byte
+	NgramString() string
+	IterateTermFrequencies(func(ngram string, frequency uint32))
+	TermFrequencyStats() TermFrequencyStats
+}
+
+// NumTFLog2Buckets is the size of CountsByLog2Bucket. It covers every
+// possible uint32 frequency: bucket index = bits.Len(uint(tf-1)), so tf=1
+// maps to 0 and tf == math.MaxUint32 maps to 32.
+const NumTFLog2Buckets = 33
+
+type TermFrequencyStats struct {
+	Occurrences          int64
+	UniquePostings       int64
+	DuplicateOccurrences int64
+	DuplicatePostings    int64
+	// RLEBytesEstimate is the on-disk cost of the frequency tail when written
+	// in the run-length-encoded form used by the posting list serializer
+	// (sum of uvarint(runlen)+uvarint(value) per run).
+	RLEBytesEstimate int64
+	// CountsByLog2Bucket[i] is the number of postings whose term frequency
+	// falls in (2^(i-1), 2^i], with bucket 0 reserved for tf == 1. Compute
+	// the index with bits.Len(uint(tf - 1)).
+	CountsByLog2Bucket [NumTFLog2Buckets]int64
 }
 
 type IndexWriter interface {
 	AddDocument(doc Document) error
 	UpdateDocument(matchField Field, newDoc Document) error
 	DeleteDocument(docID uint64) error
+	DeleteDocumentByMatchField(matchField Field) error
 	Flush() error
 }
 
 type IndexReader interface {
-	GetStoredDocument(docID uint64) (Document, error)
+	GetStoredDocument(docID uint64) Document
 	RawQuery(squery string) ([]DocumentMatch, error)
+	// ResolveSignals computes the named per-document scoring signals and
+	// attaches them to the matches, where scorers read them via
+	// DocumentMatch.Signal. Resolving is part of the reader contract because
+	// the signals (e.g. import in-degree) can only be computed from the index.
+	ResolveSignals(matches []DocumentMatch, names ...string) error
 }
 
 type Scorer interface {
 	Skip() bool
-	Score(docMatch DocumentMatch, doc Document) float64
+	// Score computes a relevance score for a matched document using only
+	// index-side data (term frequencies and field lengths) — it must not need
+	// the stored document, so it stays cheap enough to run on every match.
+	Score(docMatch DocumentMatch) float64
+	// Prepare precomputes statistics over the full candidate set (e.g.
+	// average field length for BM25 normalization) before per-document
+	// scoring begins. Searchers must call Prepare once with all candidate
+	// matches before the first Score call. Prepare mutates scorer state, so
+	// a Scorer is single-use per search and must not be shared across
+	// concurrent Search calls.
+	Prepare(matches []DocumentMatch)
+	// Rescore computes an exact relevance score using the stored document
+	// contents. It is much more expensive than Score and is only run on the
+	// documents Score ranked into the result window. A Rescore of 0 means the
+	// document is not a true match and must be dropped from the results.
+	Rescore(docMatch DocumentMatch, doc Document) float64
 }
 
 type HighlightedRegion interface {
@@ -97,51 +176,4 @@ type Query interface {
 
 type Searcher interface {
 	Search(q Query, numResults, offset int) ([]Document, error)
-}
-
-// TODO(tylerw): move these structs somewhere else. This file should only
-// contain interface definitions.
-type NamedField struct {
-	ftype  FieldType
-	name   string
-	buf    []byte
-	stored bool
-}
-
-func (f NamedField) Type() FieldType  { return f.ftype }
-func (f NamedField) Name() string     { return f.name }
-func (f NamedField) Contents() []byte { return f.buf }
-func (f NamedField) Stored() bool     { return f.stored }
-func (f NamedField) String() string {
-	var snippet string
-	if len(f.buf) < 10 {
-		snippet = string(f.buf)
-	} else {
-		snippet = string(f.buf[:10])
-	}
-	return fmt.Sprintf("field<type: %v, name: %q, buf: %q>", f.ftype, f.name, snippet)
-}
-
-func NewNamedField(ftype FieldType, name string, buf []byte, stored bool) NamedField {
-	return NamedField{
-		ftype:  ftype,
-		name:   name,
-		buf:    buf,
-		stored: stored,
-	}
-}
-
-type MapDocument map[string]NamedField
-
-func (d MapDocument) Field(name string) Field { return d[name] }
-func (d MapDocument) Fields() []string {
-	fieldNames := make([]string, 0, len(d))
-	for name := range d {
-		fieldNames = append(fieldNames, name)
-	}
-	return fieldNames
-}
-
-func NewMapDocument(fieldMap map[string]NamedField) MapDocument {
-	return MapDocument(fieldMap)
 }

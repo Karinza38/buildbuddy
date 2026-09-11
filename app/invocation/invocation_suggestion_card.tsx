@@ -1,12 +1,13 @@
-import React from "react";
 import { AlertCircle, AlertTriangle, HelpCircle } from "lucide-react";
-import { TextLink } from "../components/link/link";
-import InvocationModel from "./invocation_model";
-import capabilities from "../capabilities/capabilities";
-import { User } from "../auth/user";
-import { grp } from "../../proto/group_ts_proto";
+import React from "react";
+import { build_event_stream } from "../../proto/build_event_stream_ts_proto";
 import { execution_stats } from "../../proto/execution_stats_ts_proto";
+import { grp } from "../../proto/group_ts_proto";
+import { User } from "../auth/user";
+import capabilities from "../capabilities/capabilities";
+import { TextLink } from "../components/link/link";
 import { bytes as formatBytes } from "../format/format";
+import InvocationModel, { InvocationStatus } from "./invocation_model";
 
 interface Props {
   suggestions: Suggestion[];
@@ -35,6 +36,14 @@ export enum SuggestionLevel {
   INFO,
   WARNING,
   ERROR,
+}
+
+function sortSuggestionsByLevel<T extends { level: SuggestionLevel }>(suggestions: T[]): T[] {
+  return [...suggestions].sort((a, b) => b.level - a.level);
+}
+
+export function hasSuggestionAboveInfo<T extends { level: SuggestionLevel }>(suggestions: T[]): boolean {
+  return suggestions.some((suggestion) => suggestion.level > SuggestionLevel.INFO);
 }
 
 /** Given some data about an invocation, optionally returns a suggestion. */
@@ -85,13 +94,77 @@ export const getTimingDataSuggestion: SuggestionMatcher = ({ model }) => {
           For a more detailed timing profile, try using these flags:{" "}
           {missingFlags.map((flag) => (
             <>
-              <BazelFlag>{`--${recommendedOptions[flag] ? "" : "no"}${flag}`}</BazelFlag>{" "}
+              <CommonBazelFlag>{`--${recommendedOptions[flag] ? "" : "no"}${flag}`}</CommonBazelFlag>{" "}
             </>
           ))}
         </div>
       </>
     ),
     reason: <>Shown because these flags are neither enabled nor explicitly disabled.</>,
+  };
+};
+
+export const getTestShardingSuggestion = ({
+  model,
+  resultEvents,
+}: {
+  model: InvocationModel;
+  resultEvents?: build_event_stream.BuildEvent[];
+}) => {
+  if (!capabilities.config.expandedSuggestionsEnabled) {
+    return null;
+  }
+  if (!model.isBazelInvocation()) {
+    return null;
+  }
+
+  // Only suggest for test commands
+  const command = model.getCommand();
+  if (command !== "test") return null;
+
+  // Check if --test_filter is specified
+  const testFilter = model.optionsMap.get("test_filter");
+  if (!testFilter) return null;
+
+  // Check if --test_sharding_strategy is already set to disabled
+  const testShardingStrategy = model.optionsMap.get("test_sharding_strategy");
+  if (testShardingStrategy === "disabled") return null;
+
+  // Check if any tests have multiple shards configured by looking at test results
+  let hasMultipleShards = false;
+
+  if (resultEvents && resultEvents.length > 0) {
+    // Early exit optimization: stop as soon as we find two different shard numbers
+    let firstShard: number | null = null;
+    for (const event of resultEvents) {
+      const shard = event.id?.testResult?.shard || 0;
+      if (firstShard === null) {
+        firstShard = shard;
+      } else if (firstShard !== shard) {
+        hasMultipleShards = true;
+        break;
+      }
+    }
+  }
+
+  if (!hasMultipleShards) {
+    return null;
+  }
+
+  return {
+    level: SuggestionLevel.INFO,
+    message: (
+      <>
+        When using <BazelFlag>--test_filter</BazelFlag>, consider adding{" "}
+        <BazelFlag>--test_sharding_strategy=disabled</BazelFlag> to find the test logs faster.
+      </>
+    ),
+    reason: (
+      <>
+        Shown because this build uses <span className="inline-code">--test_filter</span> with sharded tests, which can
+        cause misleading "no tests to run" warnings when test shards don't contain matching tests.
+      </>
+    ),
   };
 };
 
@@ -133,6 +206,57 @@ const matchers: SuggestionMatcher[] = [
       </>
     ),
   }),
+  ({ model }) => {
+    if (!capabilities.config.expandedSuggestionsEnabled) return null;
+    if (!model.isBazelInvocation()) return null;
+    if (model.invocation.invocationStatus !== InvocationStatus.DISCONNECTED_INVOCATION_STATUS) return null;
+
+    const besUploadMode = model.optionsMap.get("bes_upload_mode");
+    const isBESUploadAsync = besUploadMode === "fully_async" || besUploadMode === "nowait_for_upload_complete";
+    const ciEvidence = getCIEvidence(model);
+    // If this looks like a CI build with an async BES upload mode, we can be
+    // fairly confident about the cause of the disconnect: the CI runner kills
+    // Bazel once the command exits, before the upload completes.
+    if (isBESUploadAsync && ciEvidence) {
+      return {
+        level: SuggestionLevel.ERROR,
+        message: (
+          <>
+            Bazel disconnected from BuildBuddy before it finished uploading the build results. This is likely because
+            this CI build was run with <CommonBazelFlag>{`--bes_upload_mode=${besUploadMode}`}</CommonBazelFlag>, which
+            lets the bazel command exit before build events have finished uploading. CI runners typically kill the Bazel
+            server as soon as the job finishes, so the upload never completes. Consider setting{" "}
+            <CommonBazelFlag>--bes_upload_mode=wait_for_upload_complete</CommonBazelFlag> (the default) on CI.
+          </>
+        ),
+        reason: (
+          <>
+            Shown because the build finished with a disconnected status, looks like a CI build ({ciEvidence}), and has
+            the effective flag <span className="inline-code">--bes_upload_mode={besUploadMode}</span>.
+          </>
+        ),
+      };
+    }
+
+    return {
+      level: SuggestionLevel.ERROR,
+      message: (
+        <>
+          Bazel disconnected from BuildBuddy before it finished uploading the build results. This may have been caused
+          by a flaky network connection, Bazel crashing due to an OOM error, or Bazel being killed manually.
+          {isBESUploadAsync && (
+            <>
+              {" "}
+              Note: Since this invocation was run with{" "}
+              <CommonBazelFlag>{`--bes_upload_mode=${besUploadMode}`}</CommonBazelFlag>, the Bazel server may need to
+              live a bit longer to finish uploading the results.
+            </>
+          )}
+        </>
+      ),
+      reason: "Shown because the build finished with a disconnected status.",
+    };
+  },
   ({ model, buildLogs }) => {
     if (!capabilities.config.expandedSuggestionsEnabled) return null;
     if (!model.isBazelInvocation()) return null;
@@ -140,6 +264,7 @@ const matchers: SuggestionMatcher[] = [
     if (!model.optionsMap.get("remote_cache") && !model.optionsMap.get("remote_executor")) return null;
     if (!buildLogs.includes("DEADLINE_EXCEEDED")) return null;
     if (model.optionsMap.get("remote_timeout") && Number(model.optionsMap.get("remote_timeout")) >= 600) return null;
+
     if (!model.isComplete() || model.invocation.success) return null;
 
     return {
@@ -147,8 +272,8 @@ const matchers: SuggestionMatcher[] = [
       message: (
         <>
           A "deadline exceeded" error was encountered, possibly due to large artifacts being downloaded or uploaded. If
-          you see this often, consider setting a higher value of <BazelFlag>--remote_timeout</BazelFlag>. We recommend a
-          value of 600 (10 minutes).
+          you see this often, consider setting a higher value of <CommonBazelFlag>--remote_timeout</CommonBazelFlag>. We
+          recommend a value of 600 (10 minutes).
         </>
       ),
       reason: (
@@ -328,17 +453,18 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
     if (model.optionsMap.get("experimental_remote_cache_compression")) return null;
     if (!model.optionsMap.get("remote_cache") && !model.optionsMap.get("remote_executor")) return null;
 
-    const version = getBazelVersion(model);
+    const version = model.getBazelVersion();
     // Bazel pre-v5 doesn't support compression.
     if (version === null || version.major < 5) return null;
 
-    const flag = version.major >= 7 ? "--experimental_remote_cache_compression" : "--remote_cache_compression";
+    // --experimental_remote_cache_compression was renamed to --remote_cache_compression in Bazel 7.0.
+    const flag = version.major >= 7 ? "--remote_cache_compression" : "--experimental_remote_cache_compression";
 
     return {
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider adding the Bazel flag <BazelFlag>{flag}</BazelFlag> to improve remote cache throughput.
+          Consider adding the Bazel flag <CommonBazelFlag>{flag}</CommonBazelFlag> to improve remote cache throughput.
         </>
       ),
       reason: (
@@ -349,6 +475,7 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       ),
     };
   },
+  // Suggest compression threshold for Bazel versions where threshold default is 0.
   ({ model }) => {
     if (!capabilities.config.expandedSuggestionsEnabled) return null;
     if (!model.isBazelInvocation()) return null;
@@ -361,22 +488,29 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       return null;
     if (!model.optionsMap.get("remote_cache") && !model.optionsMap.get("remote_executor")) return null;
 
-    const version = getBazelVersion(model);
-    // threshold flag is available from Bazel 7.1 forward
-    if (version === null || version.major < 7 || version.minor < 1) return null;
+    const version = model.getBazelVersion();
+    // Threshold flag first appears in Bazel 7.1, and defaults to 100 in Bazel 8.0+.
+    if (version === null || version.major < 7 || (version.major === 7 && version.minor < 1) || version.major >= 8) {
+      return null;
+    }
+
+    const compressionFlag = model.optionsMap.get("remote_cache_compression")
+      ? "--remote_cache_compression"
+      : "--experimental_remote_cache_compression";
 
     return {
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider adding the Bazel flag <BazelFlag>--experimental_remote_cache_compression_threshold=100</BazelFlag> to
-          avoid inflating blobs smaller than 100 bytes with ZSTD compression.
+          Consider adding the Bazel flag{" "}
+          <CommonBazelFlag>--experimental_remote_cache_compression_threshold=100</CommonBazelFlag> to avoid inflating
+          blobs smaller than 100 bytes with ZSTD compression.
         </>
       ),
       reason: (
         <>
-          Shown because this build is cache-enabled with <span className="inline-code">--remote_cache_compression</span>{" "}
-          set without <span className="inline-code">--experimental_remote_cache_compression_threshold</span> set.
+          Shown because this build is cache-enabled with <span className="inline-code">{compressionFlag}</span> set
+          without <span className="inline-code">--experimental_remote_cache_compression_threshold</span> set.
         </>
       ),
     };
@@ -393,8 +527,8 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider setting the Bazel flag <BazelFlag>--jobs</BazelFlag> to allow more actions to execute in parallel,
-          which can significantly improve remote execution performance. We recommend starting with{" "}
+          Consider setting the Bazel flag <BuildBazelFlag>--jobs</BuildBazelFlag> to allow more actions to execute in
+          parallel, which can significantly improve remote execution performance. We recommend starting with{" "}
           <span className="inline-code">--jobs=50</span> and working your way up.
         </>
       ),
@@ -409,7 +543,7 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
     if (!model.optionsMap.get("remote_cache")) return null;
     if (model.optionsMap.get("remote_build_event_upload")) return null;
     if (model.optionsMap.get("experimental_remote_build_event_upload")) return null;
-    const version = getBazelVersion(model);
+    const version = model.getBazelVersion();
     // Bazel pre-v6 doesn't support --experimental_remote_build_event_upload=minimal, and Bazel post-v6 default to the
     // correct setting
     if (version === null || version.major != 6) return null;
@@ -418,8 +552,9 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider setting the Bazel flag <BazelFlag>--experimental_remote_build_event_upload=minimal</BazelFlag> to
-          reduce the number of unnecessary cache uploads that Bazel might perform during a build.
+          Consider setting the Bazel flag{" "}
+          <CommonBazelFlag>--experimental_remote_build_event_upload=minimal</CommonBazelFlag> to reduce the number of
+          unnecessary cache uploads that Bazel might perform during a build.
         </>
       ),
       reason: (
@@ -437,14 +572,18 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
     if (!capabilities.config.expandedSuggestionsEnabled) return null;
     if (!model.isBazelInvocation()) return null;
 
+    const version = model.getBazelVersion();
+    if (version === null || version.major >= 8) return null;
+
     if (model.optionsMap.get("legacy_important_outputs")) return null;
 
     return {
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider adding the Bazel flag <BazelFlag>--nolegacy_important_outputs</BazelFlag>, which can significantly
-          reduce the payload size of the uploaded build event stream by eliminating duplicate file references.
+          Consider adding the Bazel flag <CommonBazelFlag>--nolegacy_important_outputs</CommonBazelFlag>, which can
+          significantly reduce the payload size of the uploaded build event stream by eliminating duplicate file
+          references.
         </>
       ),
       reason: (
@@ -482,9 +621,9 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       message: (
         <>
           <div>
-            Consider using the Bazel flag <BazelFlag>--modify_execution_info</BazelFlag> to selectively disable remote
-            capabilities for certain build actions, which can improve overall build performance. For iOS builds, we
-            recommend:
+            Consider using the Bazel flag <CommonBazelFlag>--modify_execution_info</CommonBazelFlag> to selectively
+            disable remote capabilities for certain build actions, which can improve overall build performance. For iOS
+            builds, we recommend:
           </div>
           <code>{recommendedFlag}</code>
         </>
@@ -517,7 +656,7 @@ ${yamlSuggestions.map((s) => `      ${s}`).join("\n")}`}
       level: SuggestionLevel.INFO,
       message: (
         <>
-          Consider enabling <BazelFlag>--experimental_remote_cache_async</BazelFlag> to improve remote cache
+          Consider enabling <CommonBazelFlag>--remote_cache_async</CommonBazelFlag> to improve remote cache
           performance.
         </>
       ),
@@ -589,7 +728,7 @@ export function getSuggestions({
     const suggestion = matcher({ buildLogs, model, runnerExecution });
     if (suggestion) suggestions.push(suggestion);
   }
-  return suggestions;
+  return sortSuggestionsByLevel(suggestions);
 }
 
 export default class SuggestionCardComponent extends React.Component<Props> {
@@ -639,11 +778,11 @@ export default class SuggestionCardComponent extends React.Component<Props> {
 function renderIcon(level: SuggestionLevel) {
   switch (level) {
     case SuggestionLevel.INFO:
-      return <HelpCircle className="icon" />;
+      return <HelpCircle />;
     case SuggestionLevel.WARNING:
-      return <AlertTriangle className="icon orange" />;
+      return <AlertTriangle className="orange" />;
     case SuggestionLevel.ERROR:
-      return <AlertCircle className="icon red" />;
+      return <AlertCircle className="red" />;
   }
 }
 
@@ -665,6 +804,44 @@ export function SuggestionComponent({ suggestion }: SuggestionComponentProps) {
   );
 }
 
+/**
+ * Returns a phrase describing why the invocation looks like a CI build, for
+ * use in a suggestion reason, or null if it doesn't look like a CI build.
+ */
+function getCIEvidence(model: InvocationModel): React.ReactNode {
+  if (model.getRole() === "CI") {
+    return (
+      <>
+        the role is <span className="inline-code">CI</span>
+      </>
+    );
+  }
+  const ci = model.clientEnvMap.get("CI");
+  if (ci === "true" || ci === "1") {
+    return (
+      <>
+        <span className="inline-code">CI={ci}</span> is set
+      </>
+    );
+  }
+  // Buildkite and GitHub Actions set these variables on every job. Unlike
+  // most environment variables, these are on the server's redaction allowlist
+  // (the UI links to CI runs using them), so their values are visible here.
+  // Don't match on name prefixes: unrelated variables like GITHUB_TOKEN are
+  // often set in local dev environments and also show up here (with redacted
+  // values, since redaction preserves variable names).
+  for (const name of ["BUILDKITE_BUILD_URL", "GITHUB_RUN_ID"]) {
+    if (model.clientEnvMap.get(name)) {
+      return (
+        <>
+          the <span className="inline-code">{name}</span> environment variable is set
+        </>
+      );
+    }
+  }
+  return null;
+}
+
 /** Returns the given suggestion message if the given regex matches the build logs. */
 function buildLogRegex({
   level,
@@ -683,7 +860,12 @@ function buildLogRegex({
   };
 }
 
-function BazelFlag({ children }: { children: string }) {
+type BazelFlagProps = {
+  children: string;
+  section?: string;
+};
+
+function BazelFlag({ children, section = "" }: BazelFlagProps) {
   let flag = children.split("=")[0] || "";
   if (flag.startsWith("--no")) {
     flag = "--" + flag.substring("--no".length);
@@ -691,10 +873,18 @@ function BazelFlag({ children }: { children: string }) {
   return (
     <TextLink
       className="inline-code bazel-flag"
-      href={`https://docs.bazel.build/versions/main/command-line-reference.html#flag${flag}`}>
+      href={`https://bazel.build/reference/command-line-reference#${section}flag${flag}`}>
       {children}
     </TextLink>
   );
+}
+
+function CommonBazelFlag(props: Omit<BazelFlagProps, "section">) {
+  return <BazelFlag {...props} section="common_options-" />;
+}
+
+function BuildBazelFlag(props: Omit<BazelFlagProps, "section">) {
+  return <BazelFlag {...props} section="build-" />;
 }
 
 /**
@@ -720,16 +910,4 @@ function InlineProseList({ items }: { items: React.ReactNode[] }) {
     }
   }
   return <>{out}</>;
-}
-
-// getBazelVersion returns the major and minor version of Bazel from BES event.
-//
-// The version could contain rc version in the patch number, such as "7.2.1rc1".
-function getBazelVersion(model: InvocationModel): { major: number; minor: number } | null {
-  const version = model.started?.buildToolVersion;
-  if (!version) return null;
-  const segments = version.split(".").map(Number);
-  if (segments.length < 2) return null;
-  if (segments.slice(0, 2).some(isNaN)) return null;
-  return { major: segments[0], minor: segments[1] };
 }

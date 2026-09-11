@@ -219,9 +219,9 @@ func TestGetCacheScoreCard_GroupByTargetOrderByDuration(t *testing.T) {
 	expectedResults := []*capb.ScoreCard_Result{}
 	// Set up results so that expected action IDs alternate within each target
 	// group, and so that durations across groups have some overlap.
-	for target := 0; target < 2; target++ {
+	for target := range 2 {
 		dur := time.Duration(target) * time.Millisecond
-		for i := 0; i < 4; i++ {
+		for i := range 4 {
 			expectedResults = append(expectedResults, &capb.ScoreCard_Result{
 				TargetId: fmt.Sprintf("%d", target),
 				ActionId: fmt.Sprintf("%d%d", target, i%2),
@@ -283,7 +283,7 @@ type fakeBlobStore struct {
 func (bs *fakeBlobStore) ReadBlob(ctx context.Context, name string) ([]byte, error) {
 	tokens := strings.Split(name, "/")
 	if attempt := tokens[1]; attempt == "1" {
-		return proto.MarshalOld(bs.ScoreCard)
+		return proto.Marshal(bs.ScoreCard)
 	}
 	return nil, status.NotFoundError("")
 }

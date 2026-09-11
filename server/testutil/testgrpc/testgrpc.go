@@ -63,13 +63,13 @@ func StartProxy(t *testing.T) *Proxy {
 		Addr:     lis.Addr(),
 		director: nil,
 	}
-	director := func(ctx context.Context, fullMethodName string) (context.Context, *grpc.ClientConn, error) {
+	director := func(ctx context.Context, fullMethodName string) (context.Context, grpc.ClientConnInterface, error) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		require.NotNil(t, p.director, "Proxy.Director is nil")
 		return p.director(ctx, fullMethodName)
 	}
-	handler := grpc.UnknownServiceHandler(proxy.TransparentHandler(proxy.StreamDirector(director)))
+	handler := grpc.UnknownServiceHandler(proxy.TransparentHandler(director))
 	server := grpc.NewServer(handler)
 	go server.Serve(lis)
 	t.Cleanup(server.Stop)
@@ -98,7 +98,7 @@ func RandomDialer(targets []string) Director {
 		var cc *grpc.ClientConn
 		var err error
 		r := rand.Intn(len(targets))
-		for i := 0; i < len(targets); i++ {
+		for i := range targets {
 			target := targets[(r+i)%len(targets)]
 			cc, err = grpc_client.DialSimpleWithoutPooling(target)
 			if status.IsUnavailableError(err) {
@@ -117,4 +117,13 @@ func RandomDialer(targets []string) Director {
 		}
 		return ctx, cc, nil
 	}
+}
+
+// Simulates an outgoing RPC by copying outgoing metadatam from the provided
+// context into new incoming metadata which is added to the provided context
+// and returned.
+func OutgoingToIncomingContext(t *testing.T, ctx context.Context) context.Context {
+	outgoingMD, ok := metadata.FromOutgoingContext(ctx)
+	require.True(t, ok)
+	return metadata.NewIncomingContext(ctx, outgoingMD)
 }

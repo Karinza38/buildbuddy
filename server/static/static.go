@@ -5,17 +5,17 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
-	"os"
-	"path/filepath"
+	"path"
 	"strings"
 
-	"github.com/bazelbuild/rules_go/go/tools/bazel"
+	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/github"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/target_tracker"
 	"github.com/buildbuddy-io/buildbuddy/server/endpoint_urls/build_buddy_url"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/features"
 	"github.com/buildbuddy-io/buildbuddy/server/http/csp"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/action_cache_server"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/hit_tracker"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/region"
@@ -30,6 +30,8 @@ import (
 	scheduler_server_config "github.com/buildbuddy-io/buildbuddy/server/scheduling/scheduler_server/config"
 )
 
+var staticGoRlocation string
+
 const (
 	indexTemplateFilename = "index.html"
 	stylePathTemplate     = "/app/style.css?hash={APP_BUNDLE_HASH}"
@@ -42,9 +44,10 @@ var (
 	userManagementEnabled                  = flag.Bool("app.user_management_enabled", true, "If set, the user management page will be enabled in the UI.", flag.Deprecated("This flag has no effect and will be removed in the future."))
 	testGridV2Enabled                      = flag.Bool("app.test_grid_v2_enabled", true, "Whether to enable test grid V2")
 	usageEnabled                           = flag.Bool("app.usage_enabled", false, "If set, the usage page will be enabled in the UI.")
-	expandedSuggestionsEnabled             = flag.Bool("app.expanded_suggestions_enabled", false, "If set, enable more build suggestions in the UI.")
+	expandedSuggestionsEnabled             = flag.Bool("app.expanded_suggestions_enabled", true, "If set, enable more build suggestions in the UI.")
 	enableWorkflows                        = flag.Bool("remote_execution.enable_workflows", false, "Whether to enable BuildBuddy workflows.")
 	enableExecutorKeyCreation              = flag.Bool("remote_execution.enable_executor_key_creation", false, "If enabled, UI will allow executor keys to be created.")
+	enableCacheProxyKeyCreation            = flag.Bool("cache_proxy.enable_cache_proxy_key_creation", false, "If enabled, UI will allow cache proxy keys to be created.")
 	testOutputManifestsEnabled             = flag.Bool("app.test_output_manifests_enabled", true, "If set, the target page will render the contents of test output zips.")
 	patternFilterEnabled                   = flag.Bool("app.pattern_filter_enabled", true, "If set, allow filtering by pattern in the client.")
 	executionSearchEnabled                 = flag.Bool("app.execution_search_enabled", true, "If set, fetch lists of executions from the OLAP DB in the trends UI.")
@@ -52,6 +55,7 @@ var (
 	customerManagedEncryptionKeysEnabled   = flag.Bool("app.customer_managed_encryption_keys_enabled", false, "If set, show customer-managed encryption configuration UI.")
 	tagsUIEnabled                          = flag.Bool("app.tags_ui_enabled", false, "If set, expose tags data and let users filter by tag.")
 	timeseriesChartsInTimingProfileEnabled = flag.Bool("app.timeseries_charts_in_timing_profile_enabled", true, "If set, charts with sampled time series data (such as CPU and memory usage) will be shown")
+	timingProfileMaxSizeBytes              = flag.Int64("app.timing_profile_max_size_bytes", 350_000_000, "Maximum compressed timing profile size that the UI will load.")
 	auditLogsUIEnabled                     = flag.Bool("app.audit_logs_ui_enabled", false, "If set, the audit logs UI will be accessible from the sidebar.")
 	newTrendsUIEnabled                     = flag.Bool("app.new_trends_ui_enabled", false, "DEPRECATED: If set, show a new trends UI with a bit more organization.")
 	trendsRangeSelectionEnabled            = flag.Bool("app.trends_range_selection", true, "If set, let users drag to select time ranges in the trends UI.")
@@ -67,19 +71,24 @@ var (
 	targetFlakesUIEnabled                  = flag.Bool("app.target_flakes_ui_enabled", false, "If set, show some fancy new features for analyzing flakes.")
 	bazelButtonsEnabled                    = flag.Bool("app.bazel_buttons_enabled", false, "If set, show remote bazel buttons in the UI.")
 	communityLinksEnabled                  = flag.Bool("app.community_links_enabled", true, "If set, show links to BuildBuddy community in the UI.")
+	targetsPageEnabled                     = flag.Bool("app.targets_page_enabled", true, "If true, show a targets page for exploring RBE usage by target in the UI.")
+	userListsUIEnabled                     = flag.Bool("app.user_lists_ui_enabled", false, "If set, show show user list management options in the UI.")
+	darkModeEnabled                        = flag.Bool("app.dark_mode_enabled", true, "If set, show dark mode option in user preferences.")
+	defaultLoginSlug                       = flag.String("app.default_login_slug", "", "If set, the login page will default to using this slug.")
 
 	jsEntryPointPath = flag.String("js_entry_point_path", "/app/app_bundle/app.js?hash={APP_BUNDLE_HASH}", "Absolute URL path of the app JS entry point")
 	disableGA        = flag.Bool("disable_ga", false, "If true; ga will be disabled")
 )
 
 func FSFromRelPath(relPath string) (fs.FS, error) {
-	// Figure out where our runfiles (static content bundled with the binary) live.
-	rfp, err := bazel.RunfilesPath()
+	// Get a filesystem containing the runfiles (static content bundled with the binary).
+	runfilesFS, err := runfiles.New()
 	if err != nil {
 		return nil, err
 	}
-	dirFS := os.DirFS(filepath.Join(rfp, relPath))
-	return dirFS, nil
+	moduleName, _, _ := strings.Cut(staticGoRlocation, "/")
+
+	return fs.Sub(runfilesFS, path.Clean(path.Join(moduleName, relPath)))
 }
 
 // StaticFileServer implements a static file http server that serves static
@@ -109,7 +118,7 @@ func NewStaticFileServer(env environment.Env, fs fs.FS, rootPaths []string, appB
 		handler = handleRootPaths(env, rootPaths, template, version.Tag(), jsPath, stylePath, appBundleHash, handler)
 	}
 	return &StaticFileServer{
-		handler: setCacheHeaders(handler),
+		handler: setCacheHeaders(handler, appBundleHash),
 	}, nil
 }
 
@@ -136,10 +145,12 @@ func handleRootPaths(env environment.Env, rootPaths []string, template *template
 }
 
 // Set cache headers if a static file request has a `hash` query parameter.
-func setCacheHeaders(h http.Handler) http.Handler {
+func setCacheHeaders(h http.Handler, appBundleHash string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if (r.URL.Query().Get("hash")) != "" {
+		if (r.URL.Query().Get("hash")) == appBundleHash {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable") // 1 year
+		} else if (r.URL.Query().Get("hash")) != "" {
+			w.Header().Set("Cache-Control", "no-cache")
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -160,18 +171,23 @@ type FrontendTemplateData struct {
 
 func serveIndexTemplate(ctx context.Context, env environment.Env, tpl *template.Template, version, jsPath, stylePath, appBundleHash string, w http.ResponseWriter) {
 	nonce, _ := ctx.Value(csp.Nonce{}).(string)
+	apiKeyValueReadbackEnabled := true
+	if authDB := env.GetAuthDB(); authDB != nil {
+		apiKeyValueReadbackEnabled = authDB.GetAPIKeyValueReadbackEnabled()
+	}
 	config := cfgpb.FrontendConfig{
 		Version:                                version,
 		AppBundleHash:                          appBundleHash,
 		ConfiguredIssuers:                      env.GetAuthenticator().PublicIssuers(),
 		DefaultToDenseMode:                     *defaultToDenseMode,
 		GithubEnabled:                          github.IsLegacyOAuthAppEnabled(),
-		GithubAppEnabled:                       env.GetGitHubApp() != nil,
+		GithubAppEnabled:                       env.GetGitHubAppService() != nil,
 		GithubAuthEnabled:                      github.AuthEnabled(env),
 		AnonymousUsageEnabled:                  env.GetAuthenticator().AnonymousUsageEnabled(ctx),
 		TestDashboardEnabled:                   target_tracker.TargetTrackingEnabled(),
 		UserOwnedExecutorsEnabled:              remote_execution_config.RemoteExecutionEnabled() && scheduler_server_config.UserOwnedExecutorsEnabled(),
 		ExecutorKeyCreationEnabled:             remote_execution_config.RemoteExecutionEnabled() && *enableExecutorKeyCreation,
+		CacheProxyKeyCreationEnabled:           *enableCacheProxyKeyCreation,
 		WorkflowsEnabled:                       remote_execution_config.RemoteExecutionEnabled() && *enableWorkflows,
 		CodeEditorEnabled:                      *features.CodeEditorEnabled || *features.CodeEditorV2Enabled,
 		RemoteExecutionEnabled:                 remote_execution_config.RemoteExecutionEnabled(),
@@ -192,9 +208,11 @@ func serveIndexTemplate(ctx context.Context, env environment.Env, tpl *template.
 		MultipleSuggestionProviders:            env.GetSuggestionService() != nil && env.GetSuggestionService().MultipleProvidersConfigured(),
 		ExecutionSearchEnabled:                 *executionSearchEnabled,
 		TrendsSummaryEnabled:                   *trendsSummaryEnabled,
+		ActionResultOriginEnabled:              action_cache_server.RecordActionResultOriginEnabled(),
 		CustomerManagedEncryptionKeysEnabled:   *customerManagedEncryptionKeysEnabled,
 		TagsUiEnabled:                          *tagsUIEnabled,
 		TimeseriesChartsInTimingProfileEnabled: *timeseriesChartsInTimingProfileEnabled,
+		TimingProfileMaxSizeBytes:              *timingProfileMaxSizeBytes,
 		AuditLogsUiEnabled:                     *auditLogsUIEnabled,
 		TrendsRangeSelectionEnabled:            *trendsRangeSelectionEnabled && env.GetOLAPDBHandle() != nil,
 		SubdomainsEnabled:                      subdomain.Enabled(),
@@ -208,12 +226,26 @@ func serveIndexTemplate(ctx context.Context, env environment.Env, tpl *template.
 		CodeSearchEnabled:                      *codeSearchEnabled,
 		OrgAdminApiKeyCreationEnabled:          *orgAdminApiKeyCreationEnabled,
 		ReaderWriterRolesEnabled:               *readerWriterRolesEnabled,
+		ApiKeyValueReadbackEnabled:             &apiKeyValueReadbackEnabled,
+		GroupMembershipRequestsEnabled:         new(env.GetUserDB() != nil && env.GetUserDB().GetGroupMembershipRequestsEnabled()),
+		UsageAlertsEnabled:                     env.GetUsageService() != nil && env.GetUsageService().GetAlertsEnabled(),
 		InvocationLogStreamingEnabled:          *invocationLogStreamingEnabled,
 		TargetFlakesUiEnabled:                  *targetFlakesUIEnabled && env.GetOLAPDBHandle() != nil,
 		CodeEditorV2Enabled:                    *features.CodeEditorV2Enabled,
 		BazelButtonsEnabled:                    *bazelButtonsEnabled,
 		CspNonce:                               nonce,
 		CommunityLinksEnabled:                  *communityLinksEnabled,
+		DefaultLoginSlug:                       *defaultLoginSlug,
+		ReadOnlyGithubAppEnabled:               env.GetGitHubAppService() != nil && env.GetGitHubAppService().IsReadOnlyAppEnabled(),
+		TargetsPageEnabled:                     *targetsPageEnabled && env.GetOLAPDBHandle() != nil,
+		UserListsUiEnabled:                     *userListsUIEnabled,
+		DarkModeEnabled:                        *darkModeEnabled,
+	}
+
+	if efp := env.GetExperimentFlagProvider(); efp != nil {
+		config.FlipLogoOnHover = efp.Boolean(ctx, "flip-logo-on-hover", false /*=default*/)
+		// Global experiments can be handled here, but experiments that are user or group specific
+		// should be included in the experiments field of GetUserResponse instead.
 	}
 
 	configJSON, err := protojson.Marshal(&config)

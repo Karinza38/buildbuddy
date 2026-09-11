@@ -126,6 +126,10 @@ func (a *fakeAccumulator) ActionName() string {
 	return ""
 }
 
+func (a *fakeAccumulator) CommitStatusLabel() string {
+	return ""
+}
+
 func (a *fakeAccumulator) MetadataIsLoaded() bool {
 	return true
 }
@@ -157,7 +161,7 @@ func TestTrackTargetForEvents_NonOLAP(t *testing.T) {
 
 func runTrackTargetsForEventsTest(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(ta)
 	flags.Set(t, "app.enable_target_tracking", true)
 
@@ -478,7 +482,7 @@ func runTrackTargetsForEventsTest(t *testing.T) {
 
 func TestTargetTracking_BuildGraphIsADag(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	ta := testauth.NewTestAuthenticator(testauth.TestUsers("USER1", "GROUP1"))
+	ta := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
 	te.SetAuthenticator(ta)
 	flags.Set(t, "app.enable_target_tracking", true)
 
@@ -652,7 +656,7 @@ func TestTrackTargetsForEventsAborted(t *testing.T) {
 		UserID:  "USER1",
 		GroupID: "GROUP1",
 	}
-	ta := testauth.NewTestAuthenticator(map[string]interfaces.UserInfo{user.UserID: user})
+	ta := testauth.NewTestAuthenticator(t, map[string]interfaces.UserInfo{user.UserID: user})
 	te.SetAuthenticator(ta)
 	ctx := testauth.WithAuthenticatedUserInfo(context.Background(), user)
 
@@ -775,7 +779,7 @@ func TestTrackTargetsForEventsAborted(t *testing.T) {
 
 func assertTestTargetStatusesMatchOLAPDB(t *testing.T, te *testenv.TestEnv, expected []Row) {
 	var got []Row
-	query := `SELECT group_id, commit_sha, rule_type, label, repo_url, role, command, test_size, status, cached, target_type FROM "TestTargetStatuses"`
+	query := `SELECT group_id, commit_sha, rule_type, label, repo_url, branch_name, role, command, test_size, status, cached, target_type FROM "TestTargetStatuses"`
 	err := te.GetOLAPDBHandle().NewQuery(context.Background(), "get_target_status").Raw(query).Take(&got)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, got, expected)
@@ -793,7 +797,7 @@ func assertTestTargetStatusesMatchPrimaryDB(t *testing.T, ctx context.Context, t
 		Command:        "test",
 	})
 	var got []Row
-	query := `SELECT i.group_id, i.commit_sha, t.rule_type, t.label, i.repo_url,
+	query := `SELECT i.group_id, i.commit_sha, t.rule_type, t.label, i.repo_url, i.branch_name,
       i.role, i.command, ts.test_size, ts.status, ts.cached, ts.target_type 
 	  FROM "Targets" as t 
 	  JOIN "TargetStatuses" as ts ON ts.target_id = t.target_id 

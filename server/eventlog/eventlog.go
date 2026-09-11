@@ -8,11 +8,14 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/backends/chunkstore"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/metrics"
+	"github.com/buildbuddy-io/buildbuddy/server/util/db"
 	"github.com/buildbuddy-io/buildbuddy/server/util/keyval"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -32,11 +35,32 @@ const (
 
 	// Max number of workers to run in parallel when fetching chunks.
 	numReadWorkers = 16
+
+	DefaultTerminalLineLength = 300
+	// Number of log lines to buffer before flushing them.
+	// This is used for progress logs that are live-updated. We only want to flush
+	// the finalized logs.
+	DefaultTerminalLinesBuffered = 10
+
+	// Experiment gating suffix-only writes of the live chunk to the key-value
+	// store.
+	suffixWritesExperiment = "build_event_stream.live_chunk_suffix_writes_enabled"
+
+	// Redis key suffix for the v2 live log chunk, which is updated more
+	// efficiently, using ReplaceSuffix.
+	liveChunkV2KeySuffix = "/v2"
 )
 
 var (
 	//Id of an empty log
+	// TODO(zoey): actually use this in the file; it's clearer.
 	EmptyId = chunkstore.ChunkIndexAsStringId(chunkstore.EmptyIndex)
+
+	// Max size of the buffer in the EventLogChunkResponse returned by GetEventLogChunk
+	MaxBufferSize = defaultLogChunkSize * 16
+
+	// Length of a chunk ID string.
+	chunkIdLength = len(chunkstore.ChunkIndexAsStringId(0))
 )
 
 func GetEventLogPathFromInvocationIdAndAttempt(invocationId string, attempt uint64) string {
@@ -52,23 +76,59 @@ func GetEventLogPubSubChannel(invocationID string) string {
 	return fmt.Sprintf("eventlog/%s/updates", invocationID)
 }
 
+func GetRunLogPathFromInvocationId(invocationId string) string {
+	return invocationId + "/chunks/log/runlog"
+}
+
+func GetRunLogPubSubChannel(invocationId string) string {
+	return fmt.Sprintf("runlog/%s/updates", invocationId)
+}
+
 // Gets the chunk of the event log specified by the request from the blobstore and returns a response containing it
 func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEventLogChunkRequest) (*elpb.GetEventLogChunkResponse, error) {
+	// TODO(zoey): this function is way too long; split it up.
 	inv, err := env.GetInvocationDB().LookupInvocation(ctx, req.GetInvocationId())
 	if err != nil {
+		if db.IsRecordNotFound(err) {
+			return nil, status.NotFoundError("invocation not found")
+		}
 		return nil, err
 	}
 
-	if inv.LastChunkId == "" {
-		return &elpb.GetEventLogChunkResponse{}, nil
+	var eventLogPath string
+	var inProgress bool
+	var scanFromChunkId string
+	switch req.GetType() {
+	case elpb.LogType_RUN_LOG:
+		if inv.RunStatus == int64(inspb.OverallStatus_UNKNOWN_OVERALL_STATUS) {
+			// This invocation does not have run logs; return an empty
+			// response to indicate that to the client.
+			return &elpb.GetEventLogChunkResponse{}, nil
+		}
+		eventLogPath = GetRunLogPathFromInvocationId(req.InvocationId)
+		inProgress = inv.RunStatus == int64(inspb.OverallStatus_IN_PROGRESS)
+		scanFromChunkId = "0"
+	default:
+		// TODO: Have clients specifically request this type of build log
+		if inv.LastChunkId == "" {
+			// This invocation does not have chunked event logs; return an empty
+			// response to indicate that to the client.
+			return &elpb.GetEventLogChunkResponse{}, nil
+		}
+		eventLogPath = GetEventLogPathFromInvocationIdAndAttempt(req.InvocationId, inv.Attempt)
+		inProgress = inv.InvocationStatus == int64(inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS)
+		scanFromChunkId = inv.LastChunkId
 	}
 
-	invocationInProgress := inv.InvocationStatus == int64(inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS)
 	c := chunkstore.New(env.GetBlobstore(), &chunkstore.ChunkstoreOptions{})
-	eventLogPath := GetEventLogPathFromInvocationIdAndAttempt(req.InvocationId, inv.Attempt)
 
-	// Get the id of the last chunk on disk after the last id stored in the db
-	lastChunkId, err := c.GetLastChunkId(ctx, eventLogPath, inv.LastChunkId)
+	// Check that expected logs exist.
+	lastChunkId, err := c.GetLastChunkId(ctx, eventLogPath, scanFromChunkId)
+	// TODO(zoey): this should check for the status.NotFoundError, as that is the
+	// only one we can handle. Any other errors are real errors.
+	//
+	// If expected logs aren't in chunkstore, check whether they just haven't been written yet, for
+	// in progress builds, vs. they will never exist and we should exit early.
 	if err != nil {
 		if inv.LastChunkId != chunkstore.ChunkIndexAsStringId(math.MaxUint16) {
 			// The last chunk id recorded in the invocation table is wrong; the only
@@ -80,11 +140,11 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 		}
 
 		// No chunks have been written for this invocation
-		if invocationInProgress {
+		if inProgress {
 			// If the invocation is in progress and the chunk requested is not on
 			// disk, check the cache to see if the live chunk is being requested.
 			liveChunk := &elpb.LiveEventLogChunk{}
-			if err := keyval.GetProto(ctx, env.GetKeyValStore(), eventLogPath, liveChunk); err == nil {
+			if err := getLiveChunk(ctx, env.GetKeyValStore(), eventLogPath, liveChunk); err == nil {
 				if req.ChunkId == liveChunk.ChunkId {
 					return &elpb.GetEventLogChunkResponse{
 						Buffer:      liveChunk.Buffer,
@@ -113,10 +173,16 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 		return nil, err
 	}
 
+	// If the requested chunk ID is empty, we're returning the last N lines of the
+	// blob instead of the first N lines beginning at the requested chunk ID, so
+	// our starting chunkIndex is the last one we know about.
 	startIndex := lastChunkIndex
 	if req.ChunkId != "" {
+		// The client requested a specific chunkID; we need to convert to a uint16
+		// and then validate it as the ID of a fetchable chunk.
 		var err error
-		if startIndex, err = chunkstore.ChunkIdAsUint16Index(req.ChunkId); err != nil {
+		startIndex, err = chunkstore.ChunkIdAsUint16Index(req.ChunkId)
+		if err != nil {
 			return nil, err
 		}
 
@@ -126,11 +192,29 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 		}
 
 		if startIndex > lastChunkIndex {
-			if invocationInProgress {
+			// The requested chunk ID is greater than the one that we had recorded on
+			// disk when we populated lastChunkIndex above. We should check to see if
+			// the client requested the chunk cached in redis, and return it if they
+			// did.
+			if inProgress {
 				// If the invocation is in progress and the chunk requested is not on
 				// disk, check the cache to see if the live chunk is being requested.
 				liveChunk := &elpb.LiveEventLogChunk{}
-				if err := keyval.GetProto(ctx, env.GetKeyValStore(), eventLogPath, liveChunk); err == nil {
+				if err := getLiveChunk(ctx, env.GetKeyValStore(), eventLogPath, liveChunk); err == nil {
+					// TODO(zoey): there is a potential race condition here where we
+					// retrieve the last chunk ID on disk, then one or more live chunks
+					// are written to disk and stored in the database, and then we
+					// retrieve the new live chunk here. If the client requested a chunk
+					// which was written to disk after we retrieved the last chunk ID,
+					// the conditional below will fail and we will fall through to
+					// returning an empty response with the last chunk ID we retrieved
+					// above. This will result in an unnecessary reconnection by the
+					// client to attempt to retrieve that chunk again. Instead, we should
+					// do this check FIRST, and then check if the requested chunk ID is
+					// less than the live chunk ID. If it is, we should validate it as a
+					// fetchable chunk.
+					//
+					// The same logic applies for when we check the live chunk above.
 					if chunkstore.ChunkIndexAsStringId(startIndex) == liveChunk.ChunkId {
 						return &elpb.GetEventLogChunkResponse{
 							Buffer:      liveChunk.Buffer,
@@ -149,7 +233,7 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 				Buffer:          []byte{},
 				PreviousChunkId: chunkstore.ChunkIndexAsStringId(lastChunkIndex),
 			}
-			if invocationInProgress {
+			if inProgress {
 				// If out-of-bounds and the invocation is in-progress, set NextChunkId
 				// to the id of the next chunk to be written.
 				rsp.NextChunkId = chunkstore.ChunkIndexAsStringId(lastChunkIndex + 1)
@@ -167,16 +251,24 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 	boundary := lastChunkIndex
 	step := uint16(1)
 	if req.ChunkId == "" {
+		// The caller is requesting the last n lines instead of the first n lines;
+		// We need to read from the end and go backwards until we have enough lines.
 		boundary = 0
 		step = math.MaxUint16 // decrements the value when added
 	}
 	q := newChunkQueue(c, eventLogPath, startIndex, step, boundary)
 	lineCount := 0
-	// Fetch one chunk even if the minimum line count is 0
+	// Fetch one chunk even if the minimum line count is 0.
+	// `step` should only ever be 1 or MaxUint16 (effectively -1), so as long as
+	// `boundary` remains invariant, this loop is guaranteed to terminate in
+	// 65536 iterations or fewer.
 	for chunkIndex := startIndex; chunkIndex != boundary+step; chunkIndex += step {
 		buffer, err := q.pop(ctx)
 		if err != nil {
 			return nil, err
+		}
+		if len(rsp.Buffer) > 0 && len(buffer)+len(rsp.Buffer) > MaxBufferSize {
+			break
 		}
 		scanner := bufio.NewScanner(bytes.NewReader(buffer))
 		for scanner.Scan() {
@@ -186,9 +278,11 @@ func GetEventLogChunk(ctx context.Context, env environment.Env, req *elpb.GetEve
 			lineCount++
 		}
 		if step == 1 {
+			// Reading forwards, append the new lines
 			rsp.Buffer = append(rsp.Buffer, buffer...)
 			rsp.NextChunkId = chunkstore.ChunkIndexAsStringId(chunkIndex + step)
 		} else {
+			// Reading backwards, prepend the new lines
 			rsp.Buffer = append(buffer, rsp.Buffer...)
 			rsp.PreviousChunkId = chunkstore.ChunkIndexAsStringId(chunkIndex + step)
 		}
@@ -245,6 +339,7 @@ func (q *chunkQueue) pushNewFuture(ctx context.Context, index uint16) {
 	q.futures = append(q.futures, future)
 
 	if index == q.boundary+q.step {
+		// This future was the last valid index; append EOF.
 		future <- chunkReadResult{err: io.EOF}
 		return
 	}
@@ -268,7 +363,12 @@ func (q *chunkQueue) pop(ctx context.Context) ([]byte, error) {
 	numLoading := len(q.futures) - q.numPopped
 	numNewConnections := q.maxConnections - numLoading
 	for numNewConnections > 0 {
+		// the index of the next future is the index of the start plus or minus the
+		// current length of the queue.
 		index := q.start + uint16(len(q.futures))*q.step
+		// TODO: we shouldn't push futures if we already pushed EOF; add an
+		// indicator to q as to whether or not that has happened so that we can
+		// break this this loop when we reach the end of the availiable chunks.
 		q.pushNewFuture(ctx, index)
 		numNewConnections--
 	}
@@ -281,7 +381,7 @@ func (q *chunkQueue) pop(ctx context.Context) ([]byte, error) {
 	return result.data, nil
 }
 
-func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces.KeyValStore, pubsub interfaces.PubSub, pubsubChannel string, eventLogPath string, numLinesToRetain int) *EventLogWriter {
+func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces.KeyValStore, pubsub interfaces.PubSub, experiments interfaces.ExperimentFlagProvider, pubsubChannel string, eventLogPath string, requestedTerminalColumns int, requestedTerminalLines int) (*EventLogWriter, error) {
 	chunkstoreOptions := &chunkstore.ChunkstoreOptions{
 		WriteBlockSize: defaultLogChunkSize,
 	}
@@ -290,6 +390,9 @@ func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces
 		pubsub:        pubsub,
 		pubsubChannel: pubsubChannel,
 		eventLogPath:  eventLogPath,
+	}
+	if experiments != nil {
+		eventLogWriter.suffixWritesEnabled = experiments.Boolean(ctx, suffixWritesExperiment, false)
 	}
 	var writeHook func(ctx context.Context, writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte)
 	if c != nil {
@@ -301,14 +404,19 @@ func NewEventLogWriter(ctx context.Context, b interfaces.Blobstore, c interfaces
 		WriteHook:            writeHook,
 	}
 	cw := chunkstore.New(b, chunkstoreOptions).Writer(ctx, eventLogPath, chunkstoreWriterOptions)
-	eventLogWriter.WriteCloserWithContext = &ANSICursorBufferWriter{
-		WriteWithTailCloser:           cw,
-		terminalWriter:                terminal.NewScreenWriter(),
-		numLinesToRetainForANSICursor: numLinesToRetain,
+	// If a UI action is split across more than 2 lines, it will mangle the log a
+	// little bit by leaving lines behind, and that's okay. That's exceptional,
+	// and logs where actions are spanning three or more lines are likely to not
+	// be very readable in the first place.
+	height := max(1, requestedTerminalLines*2)
+	sw, err := terminal.NewScreenWriter(requestedTerminalColumns, height)
+	if err != nil {
+		return nil, err
 	}
+	eventLogWriter.WriteCloserWithContext = NewANSICursorBufferWriter(cw, sw)
 	eventLogWriter.chunkstoreWriter = cw
 
-	return eventLogWriter
+	return eventLogWriter, nil
 }
 
 type WriteCloserWithContext interface {
@@ -324,39 +432,119 @@ type EventLogWriter struct {
 	pubsub           interfaces.PubSub
 	pubsubChannel    string
 	eventLogPath     string
+
+	// Whether to write the live chunk to the key-value store by appending
+	// just the changed suffix when possible (experiment).
+	suffixWritesEnabled bool
+	// The encoded value most recently written to the key-value store. Only
+	// tracked when suffix writes are enabled.
+	lastWritten []byte
+}
+
+// liveChunkKey returns the key-value store key this writer stores the live
+// chunk under: the v2 key when suffix writes are enabled, or the v1 key
+// otherwise.
+func (w *EventLogWriter) liveChunkKey() string {
+	if w.suffixWritesEnabled {
+		return w.eventLogPath + liveChunkV2KeySuffix
+	}
+	return w.eventLogPath
 }
 
 func (w *EventLogWriter) writeChunkToKeyValStore(ctx context.Context, writeRequest *chunkstore.WriteRequest, writeResult *chunkstore.WriteResult, chunk []byte, volatileTail []byte) {
 	if writeResult.Close {
-		keyval.SetProto(ctx, w.keyValueStore, w.eventLogPath, nil)
+		w.keyValueStore.Set(ctx, w.liveChunkKey(), nil)
 		return
 	}
 	chunkId := chunkstore.ChunkIndexAsStringId(writeResult.LastChunkIndex + 1)
 	if chunkId == chunkstore.ChunkIndexAsStringId(math.MaxUint16) {
-		keyval.SetProto(ctx, w.keyValueStore, w.eventLogPath, nil)
+		w.keyValueStore.Set(ctx, w.liveChunkKey(), nil)
 		return
 	}
-	curChunk := &elpb.LiveEventLogChunk{
-		ChunkId: chunkId,
-		Buffer:  append(chunk, volatileTail...),
-	}
+	curChunk := elpb.LiveEventLogChunkFromVTPool()
+	curChunk.ChunkId = chunkId
+	curChunk.Buffer = append(chunk, volatileTail...)
+
 	if proto.Equal(w.lastChunk, curChunk) {
+		curChunk.ReturnToVTPool()
 		return
 	}
-	keyval.SetProto(
-		ctx,
-		w.keyValueStore,
-		w.eventLogPath,
-		curChunk,
-	)
+	if w.suffixWritesEnabled {
+		// Update only the changed suffix, using ReplaceSuffix.
+		w.writeLiveChunkSuffix(ctx, curChunk)
+	} else {
+		metrics.InvocationLogLiveChunkWrittenBytes.WithLabelValues("false").Add(float64(curChunk.SizeVT()))
+		keyval.SetProto(
+			ctx,
+			w.keyValueStore,
+			w.eventLogPath,
+			curChunk,
+		)
+	}
+	w.lastChunk.ReturnToVTPool()
 	w.lastChunk = curChunk
 	if w.pubsub != nil {
 		w.pubsub.Publish(ctx, w.pubsubChannel, "")
 	}
 }
 
+// writeLiveChunkSuffix writes curChunk to the key-value store, overwriting only
+// the changed suffix.
+func (w *EventLogWriter) writeLiveChunkSuffix(ctx context.Context, curChunk *elpb.LiveEventLogChunk) {
+	encoded := append([]byte(curChunk.GetChunkId()), curChunk.GetBuffer()...)
+	if offset := commonPrefixLen(w.lastWritten, encoded); offset > 0 {
+		suffix := encoded[offset:]
+		if err := w.keyValueStore.ReplaceSuffix(ctx, w.liveChunkKey(), int64(len(w.lastWritten)), int64(offset), suffix); err == nil {
+			metrics.InvocationLogLiveChunkWrittenBytes.WithLabelValues("true").Add(float64(len(suffix)))
+			w.lastWritten = encoded
+			return
+		}
+		// The suffix write fails if the stored value doesn't match what we
+		// last wrote, for example if the key was evicted; recover by writing
+		// the full value.
+	}
+	metrics.InvocationLogLiveChunkWrittenBytes.WithLabelValues("true").Add(float64(len(encoded)))
+	if err := w.keyValueStore.Set(ctx, w.liveChunkKey(), encoded); err != nil {
+		// The write failed, so we no longer know what's stored at the key.
+		// Clear lastWritten so the next update writes the full value instead
+		// of overwriting a suffix of a possibly stale value.
+		w.lastWritten = nil
+		return
+	}
+	w.lastWritten = encoded
+}
+
+func commonPrefixLen(a, b []byte) int {
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
 func (w *EventLogWriter) GetLastChunkId(ctx context.Context) string {
 	return chunkstore.ChunkIndexAsStringId(w.chunkstoreWriter.GetLastChunkIndex(ctx))
+}
+
+// getLiveChunk reads the live chunk for the given event log path from the
+// key-value store, checking the v2 key first and falling back to the v1 key.
+func getLiveChunk(ctx context.Context, store interfaces.KeyValStore, eventLogPath string, c *elpb.LiveEventLogChunk) error {
+	data, err := store.Get(ctx, eventLogPath+liveChunkV2KeySuffix)
+	if status.IsNotFoundError(err) {
+		return keyval.GetProto(ctx, store, eventLogPath, c)
+	}
+	if err != nil {
+		return err
+	}
+	if len(data) < chunkIdLength {
+		// Shouldn't happen; treat like an evicted live chunk.
+		return status.NotFoundErrorf("malformed live chunk value")
+	}
+	c.ChunkId = string(data[:chunkIdLength])
+	c.Buffer = data[chunkIdLength:]
+	return nil
 }
 
 type WriteWithTailCloser interface {
@@ -370,28 +558,99 @@ type WriteWithTailCloser interface {
 // N lines.
 type ANSICursorBufferWriter struct {
 	WriteWithTailCloser
-	terminalWriter *terminal.ScreenWriter
+	terminal          *terminal.ScreenWriter
+	seenCursorControl bool
+}
 
-	// Number of lines to keep in the screen buffer so that they may be modified
-	// by ANSI Cursor control codes.
-	numLinesToRetainForANSICursor int
+func NewANSICursorBufferWriter(closer WriteWithTailCloser, terminal *terminal.ScreenWriter) *ANSICursorBufferWriter {
+	return &ANSICursorBufferWriter{WriteWithTailCloser: closer, terminal: terminal}
 }
 
 func (w *ANSICursorBufferWriter) Write(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return w.WriteWithTailCloser.WriteWithTail(ctx, p, nil)
 	}
-
-	if _, err := w.terminalWriter.Write(p); err != nil {
+	if containsCursorControl(p) {
+		w.seenCursorControl = true
+	}
+	if _, err := w.terminal.Write(p); err != nil {
 		return 0, err
 	}
-	popped := w.terminalWriter.PopExtraLines(w.numLinesToRetainForANSICursor)
-	if len(popped) != 0 {
-		popped = append(popped, '\n')
+	if w.terminal.WriteErr != nil {
+		return 0, w.terminal.WriteErr
 	}
-	return w.WriteWithTailCloser.WriteWithTail(ctx, popped, w.terminalWriter.Render())
+	popped := w.terminal.OutputAccumulator.String()
+	w.terminal.OutputAccumulator.Reset()
+	return w.WriteWithTailCloser.WriteWithTail(ctx, []byte(popped), []byte(w.terminal.Render()))
 }
 
 func (w *ANSICursorBufferWriter) Close(ctx context.Context) error {
+	if w.seenCursorControl {
+		// Bazel curses progress can leave cleared rows in the final terminal
+		// screen. Drop only those trailing blank rows before the volatile tail is
+		// flushed as durable log text.
+		trimmedTail := []byte(trimTrailingBlankANSILines(w.terminal.Render()))
+		if _, err := w.WriteWithTailCloser.WriteWithTail(ctx, []byte{}, trimmedTail); err != nil {
+			return err
+		}
+	}
 	return w.WriteWithTailCloser.Close(ctx)
+}
+
+func containsCursorControl(p []byte) bool {
+	if bytes.Contains(p, []byte{'\r'}) {
+		return true
+	}
+	for i := 0; i < len(p)-1; i++ {
+		if p[i] != '\x1b' || p[i+1] != '[' {
+			continue
+		}
+		for j := i + 2; j < len(p); j++ {
+			if p[j] < 0x40 || p[j] > 0x7e {
+				continue
+			}
+			if strings.ContainsRune("ABCDHJKsu", rune(p[j])) {
+				return true
+			}
+			i = j
+			break
+		}
+	}
+	return false
+}
+
+func trimTrailingBlankANSILines(s string) string {
+	end := len(s)
+	for end > 0 {
+		lineStart := strings.LastIndexByte(s[:end], '\n')
+		line := s[lineStart+1 : end]
+		if !isBlankANSILine(line) {
+			break
+		}
+		if lineStart < 0 {
+			return ""
+		}
+		end = lineStart
+	}
+	return s[:end]
+}
+
+func isBlankANSILine(line string) bool {
+	var b strings.Builder
+	inCSI := false
+	for i := 0; i < len(line); i++ {
+		if inCSI {
+			if line[i] >= 0x40 && line[i] <= 0x7e {
+				inCSI = false
+			}
+			continue
+		}
+		if line[i] == '\x1b' && i+1 < len(line) && line[i+1] == '[' {
+			inCSI = true
+			i++
+			continue
+		}
+		b.WriteByte(line[i])
+	}
+	return strings.TrimSpace(b.String()) == ""
 }

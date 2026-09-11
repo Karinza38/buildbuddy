@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -41,11 +40,13 @@ var NoSync = pebble.NoSync
 var Sync = pebble.Sync
 var ErrNotFound = pebble.ErrNotFound
 
+var FormatNewest = pebble.FormatNewest
 var NewCache = pebble.NewCache
 var WithFlushedWAL = pebble.WithFlushedWAL
 var Peek = pebble.Peek
 var DefaultFS = vfs.Default
 
+type FormatMajorVersion = pebble.FormatMajorVersion
 type Options = pebble.Options
 type IterOptions = pebble.IterOptions
 type LevelOptions = pebble.LevelOptions
@@ -193,6 +194,9 @@ type IPebbleDB interface {
 	// even if hard links are used, the space overhead for the checkpoint will
 	// increase over time as the DB performs compactions.
 	Checkpoint(destDir string, opts ...pebble.CheckpointOption) error
+
+	// Returns the major version of the underlying pebble DB.
+	FormatMajorVersion() pebble.FormatMajorVersion
 }
 
 type instrumentedIter struct {
@@ -424,6 +428,11 @@ func (idb *instrumentedDB) NewIndexedBatch() Batch {
 	return &instrumentedBatch{batch, batch, idb}
 }
 
+// FormatMajorVersion returns the major version of the underlying pebble DB.
+func (idb *instrumentedDB) FormatMajorVersion() pebble.FormatMajorVersion {
+	return idb.db.FormatMajorVersion()
+}
+
 func Open(dbDir string, id string, options *pebble.Options) (IPebbleDB, error) {
 	db, err := pebble.Open(dbDir, options)
 	if err != nil {
@@ -470,7 +479,7 @@ type Leaser interface {
 type leaser struct {
 	db       IPebbleDB
 	waiters  sync.WaitGroup
-	closedMu sync.Mutex // PROTECTS(closed)
+	closedMu sync.RWMutex // PROTECTS(closed)
 	closed   bool
 }
 
@@ -487,7 +496,7 @@ func NewDBLeaser(db IPebbleDB) Leaser {
 	return &leaser{
 		db:       db,
 		waiters:  sync.WaitGroup{},
-		closedMu: sync.Mutex{},
+		closedMu: sync.RWMutex{},
 		closed:   false,
 	}
 }
@@ -505,8 +514,8 @@ func (l *leaser) Close() {
 }
 
 func (l *leaser) DB() (IPebbleDB, error) {
-	l.closedMu.Lock()
-	defer l.closedMu.Unlock()
+	l.closedMu.RLock()
+	defer l.closedMu.RUnlock()
 	if l.closed {
 		return nil, status.FailedPreconditionError("db is closed")
 	}
@@ -566,9 +575,21 @@ type fnReadCloser struct {
 	closeFn func() error
 }
 
-func ReadCloserWithFunc(rc io.ReadCloser, closeFn func() error) io.ReadCloser {
-	return &fnReadCloser{rc, closeFn}
+type fnReadCloseWriterTo struct {
+	fnReadCloser
+	io.WriterTo
 }
+
+// ReadCloserWithFunc wraps the input reader so that rc.Close also calls
+// closeFn. If the input is an io.WriterTo, the output will be as well.
+func ReadCloserWithFunc(rc io.ReadCloser, closeFn func() error) io.ReadCloser {
+	r := fnReadCloser{rc, closeFn}
+	if wt, ok := rc.(io.WriterTo); ok {
+		return &fnReadCloseWriterTo{r, wt}
+	}
+	return &r
+}
+
 func (f fnReadCloser) Close() error {
 	err := f.ReadCloser.Close()
 	closeFnErr := f.closeFn()
@@ -577,37 +598,6 @@ func (f fnReadCloser) Close() error {
 		return closeFnErr
 	}
 	return err
-}
-
-type writeCloser struct {
-	interfaces.MetadataWriteCloser
-	commitFn     func(n int64) error
-	bytesWritten int64
-	closeFn      func() error
-}
-
-func CommittedWriterWithFunc(wcm interfaces.MetadataWriteCloser, commitFn func(n int64) error, closeFn func() error) interfaces.CommittedMetadataWriteCloser {
-	return &writeCloser{wcm, commitFn, 0, closeFn}
-}
-
-func (dc *writeCloser) Commit() error {
-	if err := dc.MetadataWriteCloser.Close(); err != nil {
-		return err
-	}
-	return dc.commitFn(dc.bytesWritten)
-}
-
-func (dc *writeCloser) Close() error {
-	return dc.closeFn()
-}
-
-func (dc *writeCloser) Write(p []byte) (int, error) {
-	n, err := dc.MetadataWriteCloser.Write(p)
-	if err != nil {
-		return 0, err
-	}
-	dc.bytesWritten += int64(n)
-	return n, nil
 }
 
 func GetCopy(b Reader, key []byte) ([]byte, error) {
@@ -659,33 +649,36 @@ func LookupProto(iter Iterator, key []byte, pb proto.Message) error {
 
 type MetricsCollector struct {
 	// Atomicly accessed metrics updated by pebble callbacks.
-	writeStallCount      int64
-	writeStallDuration   time.Duration
-	writeStallStartNanos int64
-	diskSlowCount        int64
-	diskStallCount       int64
+	writeStallCount      atomic.Int64
+	writeStallDuration   atomic.Int64
+	writeStallStartNanos atomic.Int64
+	diskSlowCount        atomic.Int64
+	diskStallCount       atomic.Int64
+}
+
+func (mc *MetricsCollector) BackgroundError(err error) {
+	log.Errorf("Pebble Cache background error: %v", err)
 }
 
 func (mc *MetricsCollector) WriteStallStats() (int64, time.Duration) {
-	count := atomic.LoadInt64(&mc.writeStallCount)
-	durationInt := atomic.LoadInt64((*int64)(&mc.writeStallDuration))
-	return count, time.Duration(durationInt)
+	count := mc.writeStallCount.Load()
+	return count, time.Duration(mc.writeStallDuration.Load())
 }
 
 func (mc *MetricsCollector) DiskStallStats() (int64, int64) {
-	slowCount := atomic.LoadInt64(&mc.diskSlowCount)
-	stallCount := atomic.LoadInt64(&mc.diskStallCount)
+	slowCount := mc.diskSlowCount.Load()
+	stallCount := mc.diskStallCount.Load()
 	return slowCount, stallCount
 }
 
 func (mc *MetricsCollector) WriteStallBegin(info pebble.WriteStallBeginInfo) {
 	startNanos := time.Now().UnixNano()
-	atomic.StoreInt64(&mc.writeStallStartNanos, startNanos)
-	atomic.AddInt64(&mc.writeStallCount, 1)
+	mc.writeStallStartNanos.Store(startNanos)
+	mc.writeStallCount.Add(1)
 }
 
 func (mc *MetricsCollector) WriteStallEnd() {
-	startNanos := atomic.SwapInt64(&mc.writeStallStartNanos, 0)
+	startNanos := mc.writeStallStartNanos.Swap(0)
 	if startNanos == 0 {
 		return
 	}
@@ -693,16 +686,16 @@ func (mc *MetricsCollector) WriteStallEnd() {
 	if stallDuration < 0 {
 		return
 	}
-	atomic.AddInt64((*int64)(&mc.writeStallDuration), stallDuration)
+	mc.writeStallDuration.Add(stallDuration)
 }
 
 func (mc *MetricsCollector) DiskSlow(info pebble.DiskSlowInfo) {
 	if info.Duration.Seconds() >= maxSyncDuration.Seconds() {
-		atomic.AddInt64(&mc.diskStallCount, 1)
+		mc.diskStallCount.Add(1)
 		log.Errorf("Pebble Cache: disk stall: unable to write %q in %.2f seconds.", info.Path, info.Duration.Seconds())
 		return
 	}
-	atomic.AddInt64(&mc.diskSlowCount, 1)
+	mc.diskSlowCount.Add(1)
 }
 
 func (mc *MetricsCollector) UpdateMetrics(m *Metrics, om Metrics, cacheName string) error {
@@ -754,6 +747,18 @@ func (mc *MetricsCollector) UpdateMetrics(m *Metrics, om Metrics, cacheName stri
 
 	// Block cache metrics.
 	metrics.PebbleCachePebbleBlockCacheSizeBytes.With(nameLabel).Set(float64(m.BlockCache.Size))
+	hitLabel := prometheus.Labels{
+		metrics.CacheNameLabel:     cacheName,
+		metrics.CacheHitMissStatus: "hit",
+	}
+	missLabel := prometheus.Labels{
+		metrics.CacheNameLabel:     cacheName,
+		metrics.CacheHitMissStatus: "miss",
+	}
+	metrics.PebbleCachePebbleBlockCacheRequestsCount.With(hitLabel).Add(float64(m.BlockCache.Hits - om.BlockCache.Hits))
+	metrics.PebbleCachePebbleBlockCacheRequestsCount.With(missLabel).Add(float64(m.BlockCache.Misses - om.BlockCache.Misses))
+	metrics.PebbleCachePebbleTableCacheRequestsCount.With(hitLabel).Add(float64(m.TableCache.Hits - om.TableCache.Hits))
+	metrics.PebbleCachePebbleTableCacheRequestsCount.With(missLabel).Add(float64(m.TableCache.Misses - om.TableCache.Misses))
 
 	// Write Stall metrics
 	count, dur := mc.WriteStallStats()

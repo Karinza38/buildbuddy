@@ -49,6 +49,21 @@ func TestAnd(t *testing.T) {
 	assert.Equal(t, []uint64{3}, pl.ToArray())
 }
 
+func TestAndNot(t *testing.T) {
+	pl := posting.NewList()
+	pl.Add(1)
+	pl.Add(2)
+	pl.Add(3)
+
+	pl2 := posting.NewList()
+	pl2.Add(3)
+	pl2.Add(4)
+	pl2.Add(5)
+
+	pl.AndNot(pl2)
+	assert.Equal(t, []uint64{1, 2}, pl.ToArray())
+}
+
 func TestRemove(t *testing.T) {
 	pl := posting.NewList()
 	pl.Add(1)
@@ -68,9 +83,103 @@ func TestAddMany(t *testing.T) {
 	assert.Equal(t, []uint64{1, 2, 3, 4, 5}, pl.ToArray())
 }
 
+func TestBuilderList(t *testing.T) {
+	pl := posting.NewBuilderList()
+	pl.Add(1)
+	pl.Add(2)
+	pl.Add(3)
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+}
+
+func TestBuilderListAddOutOfOrder(t *testing.T) {
+	// The unified list accepts adds in any order: duplicates are ignored and
+	// smaller ids are inserted in sorted position. The indexing path still hits
+	// the increasing-append fast path, but out-of-order adds are no longer a
+	// programming error.
+	pl := posting.NewBuilderList(1, 2, 4)
+	pl.Add(4) // duplicate trailing id: ignored
+	pl.Add(2) // duplicate interior id: ignored
+	pl.Add(3) // out-of-order id: inserted in place
+	assert.Equal(t, []uint64{1, 2, 3, 4}, pl.ToArray())
+}
+
+func TestAddWithFrequencyOnExistingIDIsNoOp(t *testing.T) {
+	// Re-adding an id already present is a no-op: the doc set is unchanged and the
+	// supplied frequency is dropped (the original is kept). This pins the dedup
+	// behavior the unified list inherited from MergeList; the old BuilderList
+	// panicked on a duplicate add instead, so the indexer must continue to feed
+	// unique ids per list.
+	pl := posting.NewBuilderList()
+	pl.AddWithFrequency(1, 2)
+	pl.AddWithFrequency(2, 3)
+
+	pl.AddWithFrequency(2, 9) // duplicate trailing id, higher freq: dropped
+	pl.AddWithFrequency(1, 9) // duplicate interior id, higher freq: dropped
+
+	assert.Equal(t, []uint64{1, 2}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(3), pl.Frequency(2))
+}
+
+func TestAddWithFrequencyOnExistingIDKeepsAllOnesUnmaterialized(t *testing.T) {
+	// A dropped duplicate add must not force an otherwise all-ones list to
+	// materialize a frequency column: it still serializes byte-for-byte as a plain
+	// (uncounted) roaring list.
+	pl := posting.NewBuilderList(1, 2, 3)
+	pl.AddWithFrequency(2, 5) // dropped
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+	assert.Equal(t, uint32(1), pl.Frequency(2))
+
+	got, err := pl.Marshal()
+	require.NoError(t, err)
+	want, err := posting.NewList(1, 2, 3).Marshal()
+	require.NoError(t, err)
+	assert.Equal(t, want, got, "duplicate add must not turn an all-ones list into a counted one")
+}
+
+func TestBuilderListFrequencyDecodesRLE(t *testing.T) {
+	pl := posting.NewBuilderList()
+	pl.AddWithFrequency(1, 1)
+	pl.AddWithFrequency(2, 3)
+	pl.AddWithFrequency(3, 3) // same run as id 2
+	pl.AddWithFrequency(4, 1)
+
+	assert.Equal(t, uint32(1), pl.Frequency(1))
+	assert.Equal(t, uint32(3), pl.Frequency(2))
+	assert.Equal(t, uint32(3), pl.Frequency(3))
+	assert.Equal(t, uint32(1), pl.Frequency(4)) // last run
+	assert.Equal(t, uint32(0), pl.Frequency(99))
+}
+
+func TestBuilderListRemovePreservesFrequencies(t *testing.T) {
+	pl := posting.NewBuilderList()
+	pl.AddWithFrequency(1, 2)
+	pl.AddWithFrequency(2, 1)
+	pl.AddWithFrequency(3, 5)
+	pl.AddWithFrequency(4, 1)
+
+	pl.Remove(2)
+
+	assert.Equal(t, []uint64{1, 3, 4}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(5), pl.Frequency(3))
+	assert.Equal(t, uint32(1), pl.Frequency(4))
+	assert.Equal(t, uint32(0), pl.Frequency(2))
+
+	// Round-trips correctly after the decode-and-rebuild.
+	buf, err := pl.Marshal()
+	require.NoError(t, err)
+	pl2, err := posting.Unmarshal(buf)
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{1, 3, 4}, pl2.ToArray())
+	assert.Equal(t, uint32(5), pl2.Frequency(3))
+}
+
 func TestMarshal(t *testing.T) {
 	pl := posting.NewList(1, 2, 3, 4, 5)
-	buf, err := posting.Marshal(pl)
+	buf, err := pl.Marshal()
 	assert.NoError(t, err)
 
 	pl2, err := posting.Unmarshal(buf)
@@ -80,26 +189,292 @@ func TestMarshal(t *testing.T) {
 	assert.Equal(t, []uint64{1, 2, 3, 4, 5}, pl2.ToArray())
 }
 
-func TestConcat(t *testing.T) {
-	pl := posting.NewList(1, 2, 3, 4, 5)
-	buf, err := posting.Marshal(pl)
+func TestBuilderListMarshal(t *testing.T) {
+	pl := posting.NewBuilderList(1, 2, 3, 4, 5, 4294967296, 4294967297)
+	buf, err := pl.Marshal()
 	assert.NoError(t, err)
 
-	pl2 := posting.NewList(4294967296, 4294967297, 4294967298, 4294967299, 4294967300)
-	buf2, err := posting.Marshal(pl2)
+	pl2, err := posting.Unmarshal(buf)
 	assert.NoError(t, err)
 
-	pl3, err := posting.Unmarshal(append(buf, buf2...))
+	pl3, err := posting.UnmarshalReadOnly(buf)
 	assert.NoError(t, err)
 
-	assert.Equal(t, []uint64{1, 2, 3, 4, 5}, pl.ToArray())
-	assert.Equal(t, []uint64{4294967296, 4294967297, 4294967298, 4294967299, 4294967300}, pl2.ToArray())
-	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 4294967296, 4294967297, 4294967298, 4294967299, 4294967300}, pl3.ToArray())
+	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 4294967296, 4294967297}, pl.ToArray())
+	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 4294967296, 4294967297}, pl2.ToArray())
+	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 4294967296, 4294967297}, pl3.ToArray())
+}
+
+func TestBuilderListMarshalAlternatingFrequencies(t *testing.T) {
+	// Each doc is its own RLE run since adjacent TFs all differ. Also
+	// exercises a multi-byte uvarint value (129 needs 2 bytes).
+	pl := posting.NewBuilderList()
+	pl.AddWithFrequency(1, 2)
+	pl.AddWithFrequency(2, 1)
+	pl.AddWithFrequency(3, 129)
+	buf, err := pl.Marshal()
+	require.NoError(t, err)
+
+	pl2, err := posting.Unmarshal(buf)
+	require.NoError(t, err)
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl2.ToArray())
+	assert.Equal(t, uint32(2), pl2.Frequency(1))
+	assert.Equal(t, uint32(1), pl2.Frequency(2))
+	assert.Equal(t, uint32(129), pl2.Frequency(3))
+
+	pl3, err := posting.UnmarshalReadOnly(buf)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), pl3.Frequency(1))
+	assert.Equal(t, uint32(1), pl3.Frequency(2))
+	assert.Equal(t, uint32(129), pl3.Frequency(3))
+}
+
+func TestBuilderListMarshalLongRunWithOutlier(t *testing.T) {
+	// 15 docs with TF=1 followed by one doc with TF=4 — RLE compresses this
+	// to two (runlen, value) pairs: (15, 1) and (1, 4) = 4 varint bytes.
+	pl := posting.NewBuilderList()
+	for i := uint64(1); i <= 15; i++ {
+		pl.AddWithFrequency(i, 1)
+	}
+	pl.AddWithFrequency(16, 4)
+	buf, err := pl.Marshal()
+	require.NoError(t, err)
+
+	pl2, err := posting.Unmarshal(buf)
+	require.NoError(t, err)
+
+	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, pl2.ToArray())
+	assert.Equal(t, uint32(1), pl2.Frequency(1))
+	assert.Equal(t, uint32(4), pl2.Frequency(16))
+
+	pl3, err := posting.UnmarshalReadOnly(buf)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), pl3.Frequency(1))
+	assert.Equal(t, uint32(4), pl3.Frequency(16))
+}
+
+func TestMergeListOrAddsFrequencies(t *testing.T) {
+	a := posting.NewBuilderList()
+	a.AddWithFrequency(1, 2)
+	a.AddWithFrequency(2, 3)
+	b := posting.NewBuilderList()
+	b.AddWithFrequency(2, 4)
+	b.AddWithFrequency(3, 5)
+
+	pl := posting.NewMergeList()
+	pl.Or(a)
+	pl.Or(b)
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(7), pl.Frequency(2))
+	assert.Equal(t, uint32(5), pl.Frequency(3))
+}
+
+func TestMergeListRemovePreservesFrequencies(t *testing.T) {
+	src := posting.NewBuilderList()
+	src.AddWithFrequency(1, 2)
+	src.AddWithFrequency(2, 3)
+	src.AddWithFrequency(3, 4)
+	pl := posting.NewMergeList()
+	pl.Or(src)
+
+	pl.Remove(2)
+
+	assert.Equal(t, []uint64{1, 3}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(4), pl.Frequency(3))
+	assert.Equal(t, uint32(0), pl.Frequency(2))
+}
+
+// TestMergeListUnmarshalThenRemove exercises the delete-compaction path:
+// unmarshal a counted list, then Remove a doc, preserving survivors' TFs.
+func TestMergeListUnmarshalThenRemove(t *testing.T) {
+	src := posting.NewBuilderList()
+	src.AddWithFrequency(1, 2)
+	src.AddWithFrequency(2, 3)
+	src.AddWithFrequency(3, 4)
+	buf, err := src.Marshal()
+	require.NoError(t, err)
+
+	pl, err := posting.Unmarshal(buf)
+	require.NoError(t, err)
+	pl.Remove(2)
+
+	assert.Equal(t, []uint64{1, 3}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(4), pl.Frequency(3))
+	assert.Equal(t, uint32(0), pl.Frequency(2))
+}
+
+func TestCountedReadOnlyListFrequencySparseIDs(t *testing.T) {
+	// Use sparse, non-contiguous IDs to exercise Rank rather than a tight
+	// iteration that would happen to match a sequential scan.
+	pl := posting.NewBuilderList()
+	pl.AddWithFrequency(10, 5)
+	pl.AddWithFrequency(1000, 7)
+	pl.AddWithFrequency(1<<32, 9)
+	pl.AddWithFrequency(1<<40, 11)
+	buf, err := pl.Marshal()
+	require.NoError(t, err)
+
+	roList, err := posting.UnmarshalReadOnly(buf)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(5), roList.Frequency(10))
+	assert.Equal(t, uint32(7), roList.Frequency(1000))
+	assert.Equal(t, uint32(9), roList.Frequency(1<<32))
+	assert.Equal(t, uint32(11), roList.Frequency(1<<40))
+	// Missing IDs return 0.
+	assert.Equal(t, uint32(0), roList.Frequency(0))
+	assert.Equal(t, uint32(0), roList.Frequency(11))
+	assert.Equal(t, uint32(0), roList.Frequency(1<<40+1))
+}
+
+func TestMergeListOr(t *testing.T) {
+	pl := posting.NewMergeList()
+	pl.Or(posting.NewBuilderList(1, 3))
+	pl.Or(posting.NewBuilderList(2, 3))
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+}
+
+func TestMergeListAddPreservesFrequencies(t *testing.T) {
+	src := posting.NewBuilderList()
+	src.AddWithFrequency(2, 7)
+	pl := posting.NewMergeList()
+	pl.Or(src)
+
+	pl.Add(1)
+	pl.Add(3)
+
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+	assert.Equal(t, uint32(1), pl.Frequency(1))
+	assert.Equal(t, uint32(7), pl.Frequency(2))
+	assert.Equal(t, uint32(1), pl.Frequency(3))
+}
+
+func TestMergeListAndPreservesFrequencies(t *testing.T) {
+	src := posting.NewBuilderList()
+	src.AddWithFrequency(1, 2)
+	src.AddWithFrequency(2, 3)
+	src.AddWithFrequency(3, 4)
+	pl := posting.NewMergeList()
+	pl.Or(src)
+
+	pl.And(posting.NewList(2, 3, 5))
+
+	assert.Equal(t, []uint64{2, 3}, pl.ToArray())
+	assert.Equal(t, uint32(3), pl.Frequency(2))
+	assert.Equal(t, uint32(4), pl.Frequency(3))
+	assert.Equal(t, uint32(0), pl.Frequency(1))
+}
+
+func TestMergeListRemove(t *testing.T) {
+	pl := posting.NewMergeList()
+	pl.Or(posting.NewBuilderList(1, 2, 3))
+	pl.Remove(2)
+	assert.Equal(t, []uint64{1, 3}, pl.ToArray())
+
+	// Collapse down to a single element, then merge back up again — exercises
+	// the first-only representation transition in both directions.
+	pl.Remove(1)
+	assert.Equal(t, []uint64{3}, pl.ToArray())
+
+	pl.Or(posting.NewBuilderList(5))
+	assert.Equal(t, []uint64{3, 5}, pl.ToArray())
+}
+
+func TestMergeListRemoveAllAllOnes(t *testing.T) {
+	// All-TF=1 list takes the bulk roaring-AndNot path (no stored frequencies).
+	pl := posting.NewMergeList()
+	pl.Or(posting.NewBuilderList(1, 2, 3, 4, 5))
+
+	pl.RemoveAll(posting.NewList(2, 4, 99)) // 99 is absent
+
+	assert.Equal(t, []uint64{1, 3, 5}, pl.ToArray())
+	assert.Equal(t, uint32(1), pl.Frequency(1))
+	assert.Equal(t, uint32(1), pl.Frequency(5))
+	assert.Equal(t, uint32(0), pl.Frequency(2))
+}
+
+func TestMergeListRemoveAllPreservesFrequencies(t *testing.T) {
+	// Counted list takes the single-pass survivor-rebuild path.
+	src := posting.NewBuilderList()
+	src.AddWithFrequency(1, 2)
+	src.AddWithFrequency(2, 1)
+	src.AddWithFrequency(3, 7)
+	src.AddWithFrequency(4, 1)
+	src.AddWithFrequency(5, 4)
+	pl := posting.NewMergeList()
+	pl.Or(src)
+
+	// Remove a TF=1 doc (2) and a TF>1 doc (3) in one bulk call.
+	pl.RemoveAll(posting.NewList(2, 3))
+
+	assert.Equal(t, []uint64{1, 4, 5}, pl.ToArray())
+	assert.Equal(t, uint32(2), pl.Frequency(1))
+	assert.Equal(t, uint32(1), pl.Frequency(4))
+	assert.Equal(t, uint32(4), pl.Frequency(5))
+	assert.Equal(t, uint32(0), pl.Frequency(2))
+	assert.Equal(t, uint32(0), pl.Frequency(3))
+
+	// Survivors' frequencies round-trip through the serialized form.
+	buf, err := pl.Marshal()
+	require.NoError(t, err)
+	pl2, err := posting.Unmarshal(buf)
+	require.NoError(t, err)
+	assert.Equal(t, []uint64{1, 4, 5}, pl2.ToArray())
+	assert.Equal(t, uint32(4), pl2.Frequency(5))
+}
+
+func TestMergeListRemoveAllEdgeCases(t *testing.T) {
+	pl := posting.NewMergeList()
+	pl.Or(posting.NewBuilderList(1, 2, 3))
+
+	pl.RemoveAll(posting.NewList()) // empty deletes: no-op
+	assert.Equal(t, []uint64{1, 2, 3}, pl.ToArray())
+
+	pl.RemoveAll(posting.NewList(1, 2, 3)) // remove everything
+	assert.Empty(t, pl.ToArray())
+	assert.Equal(t, uint64(0), pl.GetCardinality())
+}
+
+func TestBuilderListClearThenReuse(t *testing.T) {
+	pl := posting.NewBuilderList(1, 2, 3)
+	pl.Clear()
+	assert.Empty(t, pl.ToArray())
+
+	pl.Add(4)
+	pl.Add(5)
+	assert.Equal(t, []uint64{4, 5}, pl.ToArray())
+}
+
+func TestBuilderListMarshalIntoTooSmall(t *testing.T) {
+	pl := posting.NewBuilderList(1, 2, 3)
+	size := int(pl.GetSerializedSizeInBytes())
+
+	err := pl.MarshalInto(make([]byte, 0, size-1))
+
+	assert.Error(t, err)
+}
+
+func TestBuilderListMarshalInto(t *testing.T) {
+	pl := posting.NewBuilderList(1, 2, 3)
+	want, err := pl.Marshal()
+	require.NoError(t, err)
+	buf := make([]byte, 0, pl.GetSerializedSizeInBytes())
+
+	err = pl.MarshalInto(buf)
+
+	require.NoError(t, err)
+	assert.Equal(t, want, buf[:len(want)])
 }
 
 func TestConcat2(t *testing.T) {
 	pl := posting.NewList(1, 2, 3, 4, 5, 4294967296, 4294967297, 4294967298, 4294967299, 4294967300)
-	buf, err := posting.Marshal(pl)
+	buf, err := pl.Marshal()
 	assert.NoError(t, err)
 
 	pl2, err := posting.Unmarshal(buf)
@@ -150,28 +525,31 @@ func TestFieldMapAnd(t *testing.T) {
 	assert.Equal(t, []uint64{2}, fm["test2"].ToArray())
 }
 
-func TestMerge(t *testing.T) {
-	pl1 := posting.NewList(1, 2, 3, 4, 5)
-	buf1, err := posting.Marshal(pl1)
-	assert.NoError(t, err)
+func TestFieldMapAndPreservesFieldFrequencies(t *testing.T) {
+	content := posting.NewBuilderList()
+	content.AddWithFrequency(1, 2)
+	content.AddWithFrequency(2, 3)
 
-	pl2 := posting.NewList(6, 7, 8)
-	buf2, err := posting.Marshal(pl2)
-	assert.NoError(t, err)
+	filename := posting.NewBuilderList()
+	filename.AddWithFrequency(2, 5)
+	filename.AddWithFrequency(3, 7)
 
-	combined := make([]byte, len(buf1)+len(buf2))
-	copy(combined, buf1)
-	copy(combined[len(buf1):], buf2)
+	fm := posting.NewFieldMap()
+	fm.OrField("content", content)
+	fm2 := posting.NewFieldMap()
+	fm2.OrField("filename", filename)
 
-	pl3, err := posting.Unmarshal(combined)
-	assert.NoError(t, err)
+	fm.And(fm2)
 
-	assert.Equal(t, []uint64{1, 2, 3, 4, 5, 6, 7, 8}, pl3.ToArray())
+	assert.Equal(t, []uint64{2}, fm["content"].ToArray())
+	assert.Equal(t, uint32(3), fm["content"].Frequency(2))
+	assert.Equal(t, []uint64{2}, fm["filename"].ToArray())
+	assert.Equal(t, uint32(5), fm["filename"].Frequency(2))
 }
 
 func BenchmarkListSerializationPosting(b *testing.B) {
 	ids := make([]uint64, 1_000_000)
-	for i := 0; i < len(ids); i++ {
+	for i := range ids {
 		if i == 0 {
 			ids[i] = 1
 		} else {
@@ -179,20 +557,53 @@ func BenchmarkListSerializationPosting(b *testing.B) {
 		}
 	}
 
+	// b.Loop() requires the timer to be running when it's evaluated, so the
+	// per-iteration work goes straight in the loop body; setup before the loop is
+	// excluded from timing automatically.
 	b.ReportAllocs()
-	b.StopTimer()
-	for n := 0; n < b.N; n++ {
-		b.StartTimer()
+	for b.Loop() {
 		pl := posting.NewList(ids...)
-		_, err := posting.Marshal(pl)
-		b.StopTimer()
-		require.NoError(b, err)
+		if _, err := pl.Marshal(); err != nil {
+			b.Fatal(err)
+		}
 	}
+}
+
+// BenchmarkBuildList models the indexing hot path: append doc IDs in increasing
+// order via AddWithFrequency, then serialize. The AllOnes arm exercises the
+// common case where the frequency column never materializes; SparseOutliers
+// adds occasional TF>1 docs so the dense column and the RLE marshal kick in.
+func BenchmarkBuildList(b *testing.B) {
+	const n = 100_000
+	build := func(b *testing.B, freq func(i uint64) uint32) {
+		b.ReportAllocs()
+		for b.Loop() {
+			pl := posting.NewBuilderList()
+			for i := range uint64(n) {
+				pl.AddWithFrequency(i, freq(i))
+			}
+			if _, err := pl.Marshal(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	b.Run("AllOnes", func(b *testing.B) {
+		build(b, func(i uint64) uint32 { return 1 })
+	})
+	b.Run("SparseOutliers", func(b *testing.B) {
+		build(b, func(i uint64) uint32 {
+			if i%50 == 0 {
+				return 3
+			}
+			return 1
+		})
+	})
 }
 
 func BenchmarkListDeserializationPosting(b *testing.B) {
 	ids := make([]uint64, 1_000_000)
-	for i := 0; i < len(ids); i++ {
+	for i := range ids {
 		if i == 0 {
 			ids[i] = 1
 		} else {
@@ -201,16 +612,117 @@ func BenchmarkListDeserializationPosting(b *testing.B) {
 	}
 
 	pl := posting.NewList(ids...)
-	buf, err := posting.Marshal(pl)
+	buf, err := pl.Marshal()
+	require.NoError(b, err)
+
+	// Ensure this operation will succeed, to avoid checking err in the loop
+	_, err = posting.Unmarshal(buf)
 	require.NoError(b, err)
 
 	b.ReportAllocs()
-	b.StopTimer()
-	for n := 0; n < b.N; n++ {
-		b.StartTimer()
-		pl, err := posting.Unmarshal(buf)
-		_ = pl.ToArray()
-		b.StopTimer()
-		require.NoError(b, err)
+
+	b.Run("UnmarshalReadOnly", func(b *testing.B) {
+		for b.Loop() {
+			posting.UnmarshalReadOnly(buf)
+		}
+	})
+
+	b.Run("Unmarshal", func(b *testing.B) {
+		for b.Loop() {
+			posting.Unmarshal(buf)
+		}
+	})
+}
+
+func BenchmarkListQuery(b *testing.B) {
+	// Mimic a codesearch query: unmarshal a bunch of posting lists, or them together, then
+	// remove one big list of deleted ids.
+	c := 0
+	delPls := posting.NewList()
+	for range 100_000 {
+		delPls.Add(uint64(c))
+		c += rand.Intn(500_000)
 	}
+
+	bufs := make([][]byte, 0)
+	c = 0
+	for range 10_000 {
+		newBuf, err := posting.NewList(uint64(c)).Marshal()
+		require.NoError(b, err)
+		bufs = append(bufs, newBuf)
+		c += rand.Intn(500_000)
+	}
+
+	b.ReportAllocs()
+	b.Run("MergeOptimized", func(b *testing.B) {
+		for b.Loop() {
+			pl := posting.NewList()
+			for _, b := range bufs {
+				newPl, _ := posting.UnmarshalReadOnly(b)
+				pl.Or(newPl)
+			}
+			pl.AndNot(delPls)
+		}
+	})
+
+	b.Run("MergeOld", func(b *testing.B) {
+		for b.Loop() {
+			pl := posting.NewList()
+			for _, b := range bufs {
+				newPl, _ := posting.Unmarshal(b)
+				pl.Or(newPl)
+			}
+			delA := delPls.ToArray()
+			for _, id := range delA {
+				pl.Remove(id)
+			}
+		}
+	})
+}
+
+// BenchmarkMergeListDeleteCompaction models the per-posting-list work in
+// CompactDeletes: unmarshal a counted list and drop ~10% of its docs. RemoveAll
+// is one O(cardinality) pass; the old per-ID loop does a binary search plus an
+// O(n) slice shift per deleted ID, which dominates for large lists. The
+// per-iteration Unmarshal (which CompactDeletes also does) is excluded from the
+// timer so the two arms compare only the removal strategy.
+func BenchmarkMergeListDeleteCompaction(b *testing.B) {
+	const n = 100_000
+	base := posting.NewBuilderList()
+	delIDs := make([]uint64, 0, n/10)
+	for i := range uint64(n) {
+		freq := uint32(1)
+		if i%50 == 0 { // sparse TF>1 outliers, so the list is counted
+			freq = 3
+		}
+		base.AddWithFrequency(i, freq)
+		if i%10 == 0 {
+			delIDs = append(delIDs, i)
+		}
+	}
+	buf, err := base.Marshal()
+	require.NoError(b, err)
+	dels := posting.NewList(delIDs...)
+
+	b.Run("RemoveAll", func(b *testing.B) {
+		for b.Loop() {
+			b.StopTimer()
+			pl, err := posting.Unmarshal(buf)
+			require.NoError(b, err)
+			b.StartTimer()
+			pl.RemoveAll(dels)
+		}
+	})
+
+	b.Run("PerIDRemoveLoop", func(b *testing.B) {
+		for b.Loop() {
+			b.StopTimer()
+			pl, err := posting.Unmarshal(buf)
+			require.NoError(b, err)
+			b.StartTimer()
+			for _, id := range delIDs {
+				pl.Remove(id)
+			}
+		}
+	})
 }

@@ -1,6 +1,9 @@
 syntax = "proto3";
 
+import "proto/capability.proto";
 import "proto/context.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 package api_key;
 
@@ -17,25 +20,8 @@ message ApiKey {
   // remember what it's for.
   string label = 3;
 
-  // A capability associated with an API key.
-  //
-  // Values are powers of 2 so that bitmask operations can be used
-  // to check capabilities.
-  enum Capability {
-    UNKNOWN_CAPABILITY = 0;
-    // Allows writing to the content-addressable store and action cache.
-    CACHE_WRITE_CAPABILITY = 1;  // 2^0
-    // Allows registering an executor with the scheduler.
-    REGISTER_EXECUTOR_CAPABILITY = 2;  // 2^1
-    // Allows writing to the content-addressable store only.
-    CAS_WRITE_CAPABILITY = 4;  // 2^2
-    // Allows changing org-level settings and managing org users, such as via
-    // the settings UI or via the SCIM API.
-    ORG_ADMIN_CAPABILITY = 8;  // 2^3
-  }
-
   // Capabilities associated with this API key.
-  repeated Capability capability = 4;
+  repeated capability.Capability capability = 4;
 
   // True if this API key is visible to developers.
   bool visible_to_developers = 5;
@@ -49,6 +35,29 @@ message ApiKey {
   // Optional certificate corresponding to this API key, if
   // requested.
   Certificate certificate = 8;
+
+  // Metadata about the creation of this API key.
+  CreationMetadata creation_metadata = 9;
+}
+
+message CreationMetadata {
+  // The time at which the API key was created, if known.
+  google.protobuf.Timestamp created_at = 1;
+
+  // The display name of the user who created this API key. Only provided if
+  // known and if the requesting user may view this information.
+  string created_by = 2;
+}
+
+// Who can see an API key. Each value is a distinct bit so that a set of
+// visibilities can be stored as a bitmask, like Capability.
+enum Visibility {
+  UNKNOWN_VISIBILITY = 0;
+  // Visible to non-admin members of the owning group.
+  VISIBLE_TO_DEVELOPERS = 1;  // 2^0
+  // Visible to admins of the owning group. Keys used for internal purposes on
+  // behalf of the group omit this, and are visible only to server admins.
+  VISIBLE_TO_GROUP_ADMINS = 2;  // 2^1
 }
 
 message Certificate {
@@ -74,10 +83,13 @@ message CreateApiKeyRequest {
   string label = 3;
 
   // Optional. Capabilities granted to this API key.
-  repeated ApiKey.Capability capability = 4;
+  repeated capability.Capability capability = 4;
 
   // True if this API key should be visible to developers.
   bool visible_to_developers = 5;
+
+  // Optional. Duration after which the API key should no longer be valid.
+  google.protobuf.Duration expires_in = 7;
 }
 
 message CreateApiKeyResponse {
@@ -140,7 +152,7 @@ message UpdateApiKeyRequest {
   //
   // NOTE: If this is empty, all capabilities will be removed as part of
   // this update.
-  repeated ApiKey.Capability capability = 4;
+  repeated capability.Capability capability = 4;
 
   // True if this API key should be visible to developers.
   bool visible_to_developers = 5;

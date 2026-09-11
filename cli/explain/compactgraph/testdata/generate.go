@@ -217,6 +217,46 @@ genrule(
 echo "Tool"
 `
 
+const ToolRunfilesEmptyFilesProject = `
+-- MODULE.bazel --
+-- pkg/BUILD.bazel --
+py_binary(
+    name = "bin",
+    srcs = ["bin.py"],
+    deps = [
+        "//pkg/lib",
+        ":init",
+    ],
+)
+
+py_library(
+	name = "init",
+	srcs = ["__init__.py"],
+)
+
+genrule(
+	name = "gen",
+	outs = ["out"],
+    tools = [":bin"],
+	cmd = "cp $(location :bin) $@",
+)
+-- pkg/__init__.py --
+-- pkg/bin.py --
+import pkg.lib
+
+def main():
+	print(lib.get_name())
+-- pkg/lib/BUILD.bazel --
+py_library(
+	name = "lib",
+    srcs = glob(["*.py"]),
+    visibility = ["//visibility:public"],
+)
+-- pkg/lib/lib.py --
+def get_name():
+	return "Lib"
+`
+
 func main() {
 	bazelisk, err := runfiles.Rlocation(os.Getenv("BAZELISK"))
 	if err != nil {
@@ -313,7 +353,38 @@ genrule(
 `,
 			baselineArgs:  []string{"--action_env=EXTRA=foo", "--action_env=OLD_ONLY=old_only", "--action_env=OLD_AND_NEW=old"},
 			changedArgs:   []string{"--action_env=NEW_ONLY=new_only", "--action_env=OLD_AND_NEW=new", "--action_env=EXTRA=foo"},
-			bazelVersions: []string{"8.0.0"},
+			bazelVersions: []string{"7.3.1", "8.0.0"},
+		},
+		{
+			name: "exec_properties_change",
+			baseline: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+genrule(
+    name = "gen",
+    outs = ["out"],
+    cmd = "touch $@",
+    exec_properties = {
+        "old_only": "old_only",
+        "extra": "foo",
+    },
+)
+`,
+			changes: `
+-- pkg/BUILD --
+genrule(
+	name = "gen",
+	outs = ["out"],
+	cmd = "touch $@",
+	exec_properties = {
+		"new_only": "new_only",
+		"extra": "foo",
+	},
+)
+`,
+			baselineArgs:  []string{"--remote_default_exec_properties=old_and_new=old"},
+			changedArgs:   []string{"--remote_default_exec_properties=old_and_new=new"},
+			bazelVersions: []string{"8.1.0"},
 		},
 		{
 			name: "non_hermetic",
@@ -799,6 +870,20 @@ sh_binary(
 			bazelVersions: []string{"8.0.0"},
 		},
 		{
+			name:     "tool_runfiles_empty_files_identical",
+			baseline: ToolRunfilesEmptyFilesProject,
+			changes: `
+-- pkg/lib/__init__.py --
+`,
+			bazelVersions: []string{"8.0.0"},
+		},
+		{
+			name:          "tool_runfiles_empty_files_differ",
+			baseline:      ToolRunfilesEmptyFilesProject,
+			changedArgs:   []string{"--incompatible_default_to_explicit_init_py"},
+			bazelVersions: []string{"8.0.0"},
+		},
+		{
 			name: "settings",
 			baseline: `
 -- MODULE.bazel --
@@ -816,6 +901,216 @@ echo "Test"
 `,
 			changedArgs:   []string{"--legacy_external_runfiles", "--noenable_bzlmod", "--enable_workspace"},
 			bazelVersions: []string{"8.0.0"},
+		},
+		{
+			name: "transitive_invalidation",
+			baseline: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+genrule(
+	name = "direct1",
+	srcs = ["in1.txt"],
+	outs = ["out_direct1"],
+	cmd = "cat $< > $@",
+)
+genrule(
+	name = "direct2",
+	srcs = ["in2.txt"],
+	outs = ["out_direct2"],
+	cmd = "cat $< > $@",
+)
+genrule(
+	name = "intermediate",
+	srcs = [":direct1", ":direct2"],
+	outs = ["out_intermediate"],
+	cmd = "cat $(SRCS) > $@",
+)
+genrule(
+	name = "top1",
+	srcs = [":intermediate"],
+	outs = ["out_top1"],
+	cmd = "cat $< > $@",
+)
+genrule(
+	name = "top2",
+	srcs = [":intermediate"],
+	outs = ["out_top2"],
+	cmd = "cat $< > $@",
+)
+-- pkg/in1.txt --
+old
+-- pkg/in2.txt --
+old
+`,
+			changes: `
+-- pkg/in1.txt --
+new
+-- pkg/in2.txt --
+new
+`,
+			bazelVersions: []string{"8.0.0"},
+		},
+		{
+			name: "transitive_invalidation_for_tool",
+			baseline: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+genrule(
+    name = "library",
+    outs = ["lib.out"],
+    srcs = ["lib.in"],
+    cmd = "cp $< $@",
+)
+
+genrule(
+    name = "tool",
+	outs = ["tool.out"],
+	srcs = [":library"],
+    cmd = "cp $< $@",
+	executable = True,
+    tags = ["manual"],
+)
+
+genrule(
+    name = "tool_via_tool",
+	outs = ["tool_via_tool.out"],
+    tools = [":tool"],
+    cmd = "cp $(location :tool) $@",
+    executable = True,
+)
+
+genrule(
+	name = "gen",
+	outs = ["gen.out"],
+    tools = [":tool"],
+	cmd = "cp $(location :tool) $@",
+)
+
+genrule(
+    name = "toplevel",
+	outs = ["toplevel.out"],
+	srcs = [
+        ":library",
+        ":gen",
+        ":tool_via_tool",
+    ],
+	cmd = "cat $(SRCS) > $@",
+)
+-- pkg/lib.in --
+old
+`,
+			changes: `
+-- pkg/lib.in --
+new
+`,
+			bazelVersions: []string{"8.0.0"},
+		},
+		{
+			name: "empty_vs_nonempty",
+			baseline: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+`,
+			changes: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+genrule(
+	name = "gen_tool",
+	outs = ["tool"],
+	cmd = "echo 'echo Tool' > $@",
+	executable = True,
+  tags = ["manual"],
+)
+genrule(
+	name = "gen",
+	outs = ["out"],
+	tools = [":gen_tool"],
+	cmd = "$(location :gen_tool) > $@",
+)
+`,
+			bazelVersions: []string{"7.3.1", "8.0.0", "8.1.0"},
+		},
+		{
+			name: "chain_of_local_changes",
+			baseline: `
+-- MODULE.bazel --
+-- pkg/BUILD --
+genrule(
+	name = "gen1",
+	outs = ["out1"],
+	cmd = "echo $$FOO > $@",
+)
+genrule(
+	name = "gen2",
+	outs = ["out2"],
+	srcs = [":gen1"],
+	cmd = """
+cat $< > $@
+echo $$FOO >> $@
+""",
+)
+genrule(
+	name = "gen3",
+	outs = ["out3"],
+	srcs = [":gen2"],
+	cmd = """
+cat $< > $@
+echo $$FOO >> $@
+""",
+)
+`,
+			baselineArgs:  []string{"--action_env=FOO=old"},
+			changedArgs:   []string{"--action_env=FOO=new"},
+			bazelVersions: []string{"8.1.0"},
+		},
+		{
+			// A spawn whose only difference is the content of a param file (the
+			// command line and all other inputs are identical). This exercises
+			// the diffing of param files, which are split out from the regular
+			// inputs of a spawn.
+			name: "param_file_contents",
+			baseline: `
+-- MODULE.bazel --
+-- rules/BUILD --
+-- rules/defs.bzl --
+def _param_file_impl(ctx):
+    out = ctx.actions.declare_file(ctx.attr.name)
+    out_args = ctx.actions.args()
+    out_args.add(out)
+    param_args = ctx.actions.args()
+    param_args.add_all(ctx.attr.contents)
+    # Force the contents into a param file regardless of command line length so
+    # that the only change between builds is the param file's content.
+    param_args.use_param_file("@%s", use_always = True)
+    param_args.set_param_file_format("multiline")
+    ctx.actions.run_shell(
+        outputs = [out],
+        arguments = [out_args, param_args],
+        command = "touch $1",
+        mnemonic = "ParamFileGen",
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+param_file = rule(
+    _param_file_impl,
+    attrs = {"contents": attr.string_list()},
+)
+-- pkg/BUILD --
+load("//rules:defs.bzl", "param_file")
+param_file(
+    name = "gen",
+    contents = ["old"],
+)
+`,
+			changes: `
+-- pkg/BUILD --
+load("//rules:defs.bzl", "param_file")
+param_file(
+    name = "gen",
+    contents = ["new"],
+)
+`,
+			bazelVersions: []string{"8.1.0"},
 		},
 	} {
 		if toGenerate != nil && !toGenerate[tc.name] {
@@ -872,10 +1167,6 @@ func collectLog(bazelisk string, args []string, projectDir, logPath, bazelVersio
 	cmd.Dir = projectDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	// TODO: Update to 8.0.0 when it's released.
-	if bazelVersion == "8.0.0" {
-		bazelVersion = "8.0.0rc1"
-	}
 	cmd.Env = append(os.Environ(), "USE_BAZEL_VERSION="+bazelVersion)
 	if err = cmd.Run(); err != nil {
 		// Allow failures due to no tests as we always run with `bazel test`.

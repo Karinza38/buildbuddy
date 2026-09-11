@@ -11,7 +11,6 @@ go_library(
     visibility = ["//visibility:private"],
     deps = [
         "//proto:remote_execution_go_proto",
-        "//proto:resource_go_proto",
         "//server/metrics",
         "//server/real_environment",
         "//server/remote_cache/cachetools",
@@ -23,6 +22,7 @@ go_library(
         "//server/util/qps",
         "//server/util/retry",
         "//server/util/status",
+        "@com_github_jonboulle_clockwork//:clockwork",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_github_prometheus_client_golang//prometheus/promauto",
         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",

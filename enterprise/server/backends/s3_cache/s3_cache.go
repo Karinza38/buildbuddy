@@ -36,21 +36,23 @@ import (
 	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
 )
 
+const deprecatedS3CacheFlagMessage = "The cache.s3 backend is deprecated. Use storage.aws_s3 for durable blob storage and cache.disk.root_directory for cache storage."
+
 var (
-	region                   = flag.String("cache.s3.region", "", "The AWS region.")
-	bucket                   = flag.String("cache.s3.bucket", "", "The AWS S3 bucket to store files in.")
-	pathPrefix               = flag.String("cache.s3.path_prefix", "", "Prefix inside the AWS S3 bucket to store files")
-	credentialsProfile       = flag.String("cache.s3.credentials_profile", "", "A custom credentials profile to use.")
-	ttlDays                  = flag.Int("cache.s3.ttl_days", 0, "The period after which cache files should be TTLd. Disabled if 0.")
-	webIdentityTokenFilePath = flag.String("cache.s3.web_identity_token_file", "", "The file path to the web identity token file.")
-	roleARN                  = flag.String("cache.s3.role_arn", "", "The role ARN to use for web identity auth.")
-	roleSessionName          = flag.String("cache.s3.role_session_name", "", "The role session name to use for web identity auth.")
-	endpoint                 = flag.String("cache.s3.endpoint", "", "The AWS endpoint to use, useful for configuring the use of MinIO.")
-	staticCredentialsID      = flag.String("cache.s3.static_credentials_id", "", "Static credentials ID to use, useful for configuring the use of MinIO.")
-	staticCredentialsSecret  = flag.String("cache.s3.static_credentials_secret", "", "Static credentials secret to use, useful for configuring the use of MinIO.", flag.Secret)
-	staticCredentialsToken   = flag.String("cache.s3.static_credentials_token", "", "Static credentials token to use, useful for configuring the use of MinIO.")
-	disableSSL               = flag.Bool("cache.s3.disable_ssl", false, "Disables the use of SSL, useful for configuring the use of MinIO.", flag.Deprecated("Specify a non-HTTPS endpoint instead."))
-	forcePathStyle           = flag.Bool("cache.s3.s3_force_path_style", false, "Force path style urls for objects, useful for configuring the use of MinIO.")
+	region                   = flag.String("cache.s3.region", "", "The AWS region.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	bucket                   = flag.String("cache.s3.bucket", "", "The AWS S3 bucket to store files in.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	pathPrefix               = flag.String("cache.s3.path_prefix", "", "Prefix inside the AWS S3 bucket to store files", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	credentialsProfile       = flag.String("cache.s3.credentials_profile", "", "A custom credentials profile to use.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	ttlDays                  = flag.Int("cache.s3.ttl_days", 0, "The period after which cache files should be TTLd. Disabled if 0.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	webIdentityTokenFilePath = flag.String("cache.s3.web_identity_token_file", "", "The file path to the web identity token file.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	roleARN                  = flag.String("cache.s3.role_arn", "", "The role ARN to use for web identity auth.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	roleSessionName          = flag.String("cache.s3.role_session_name", "", "The role session name to use for web identity auth.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	endpoint                 = flag.String("cache.s3.endpoint", "", "The AWS endpoint to use, useful for configuring the use of MinIO.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	staticCredentialsID      = flag.String("cache.s3.static_credentials_id", "", "Static credentials ID to use, useful for configuring the use of MinIO.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	staticCredentialsSecret  = flag.String("cache.s3.static_credentials_secret", "", "Static credentials secret to use, useful for configuring the use of MinIO.", flag.Secret, flag.Deprecated(deprecatedS3CacheFlagMessage))
+	staticCredentialsToken   = flag.String("cache.s3.static_credentials_token", "", "Static credentials token to use, useful for configuring the use of MinIO.", flag.Deprecated(deprecatedS3CacheFlagMessage))
+	disableSSL               = flag.Bool("cache.s3.disable_ssl", false, "Disables the use of SSL, useful for configuring the use of MinIO.", flag.Deprecated(deprecatedS3CacheFlagMessage+" Specify a non-HTTPS endpoint instead."))
+	forcePathStyle           = flag.Bool("cache.s3.s3_force_path_style", false, "Force path style urls for objects, useful for configuring the use of MinIO.", flag.Deprecated(deprecatedS3CacheFlagMessage))
 )
 
 const (
@@ -104,7 +106,7 @@ func NewS3Cache() (*S3Cache, error) {
 	if *endpoint != "" {
 		configOptions = append(configOptions, config.WithEndpointResolverWithOptions(
 			aws.EndpointResolverWithOptionsFunc(
-				func(_, _ string, _ ...interface{}) (aws.Endpoint, error) {
+				func(_, _ string, _ ...any) (aws.Endpoint, error) {
 					return aws.Endpoint{
 						URL:               *endpoint,
 						SigningRegion:     *region,
@@ -215,7 +217,7 @@ func (s3c *S3Cache) setBucketTTL(ctx context.Context, bucketName string, ageInDa
 				break
 			}
 
-			if rule.Expiration.Days == ageInDays {
+			if rule.Expiration.Days == &ageInDays {
 				return nil
 			}
 		}
@@ -229,11 +231,11 @@ func (s3c *S3Cache) setBucketTTL(ctx context.Context, bucketName string, ageInDa
 			Rules: []s3types.LifecycleRule{
 				{
 					Expiration: &s3types.LifecycleExpiration{
-						Days: ageInDays,
+						Days: &ageInDays,
 					},
 					Status: s3types.ExpirationStatusEnabled,
-					Filter: &s3types.LifecycleRuleFilterMemberPrefix{
-						Value: "",
+					Filter: &s3types.LifecycleRuleFilter{
+						Prefix: aws.String(""),
 					},
 				},
 			},
@@ -289,6 +291,18 @@ func (s3c *S3Cache) get(ctx context.Context, d *repb.Digest, key string) ([]byte
 		return nil, status.NotFoundErrorf("Digest '%s/%d' not found in cache", d.GetHash(), d.GetSizeBytes())
 	}
 	return buff.Bytes(), err
+}
+
+func (s3c *S3Cache) GetWithMetadata(ctx context.Context, r *rspb.ResourceName) ([]byte, *interfaces.CacheMetadata, error) {
+	data, err := s3c.Get(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	md, err := s3c.Metadata(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, md, nil
 }
 
 func (s3c *S3Cache) GetMulti(ctx context.Context, resources []*rspb.ResourceName) (map[*repb.Digest][]byte, error) {
@@ -450,11 +464,11 @@ func (s3c *S3Cache) Metadata(ctx context.Context, r *rspb.ResourceName) (*interf
 	// TODO - Add digest size support for AC
 	digestSizeBytes := int64(-1)
 	if r.GetCacheType() == rspb.CacheType_CAS {
-		digestSizeBytes = metadata.ContentLength
+		digestSizeBytes = aws.ToInt64(metadata.ContentLength)
 	}
 
 	return &interfaces.CacheMetadata{
-		StoredSizeBytes:    metadata.ContentLength,
+		StoredSizeBytes:    aws.ToInt64(metadata.ContentLength),
 		DigestSizeBytes:    digestSizeBytes,
 		LastModifyTimeUsec: metadata.LastModified.UnixMicro(),
 	}, nil
@@ -613,10 +627,14 @@ func (s3c *S3Cache) Stop() error {
 	return nil
 }
 
+func (s3c *S3Cache) Partition(ctx context.Context, remoteInstanceName string) (string, error) {
+	return "", nil
+}
+
 func (s3c *S3Cache) SupportsCompressor(compressor repb.Compressor_Value) bool {
 	return compressor == repb.Compressor_IDENTITY
 }
 
-func (s3c *S3Cache) SupportsEncryption(ctx context.Context) bool {
-	return false
+func (s3c *S3Cache) RegisterAtimeUpdater(updater interfaces.DigestOperator) error {
+	return status.UnimplementedError("s3_cache.RegisterAtimeUpdater() unsupported")
 }

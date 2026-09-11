@@ -2,16 +2,22 @@ load("//rules/typescript:index.bzl", "ts_library")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["root.css"])
+exports_files([
+    "root.css",
+    "colors.css",
+])
 
 ts_library(
     name = "root",
     srcs = ["root.tsx"],
     deps = [
+        "//:node_modules/@types/react",
+        "//:node_modules/react",
         "//app/alert",
         "//app/auth:auth_service",
         "//app/capabilities",
         "//app/compare:compare_invocations",
+        "//app/debug",
         "//app/docs:setup",
         "//app/errors:error_service",
         "//app/favicon",
@@ -20,7 +26,5 @@ ts_library(
         "//app/menu",
         "//app/preferences",
         "//app/router",
-        "@npm//@types/react",
-        "@npm//react",
     ],
 )

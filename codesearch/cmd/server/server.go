@@ -7,10 +7,12 @@ import (
 
 	"github.com/buildbuddy-io/buildbuddy/codesearch/server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/configsecrets"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/clientidentity"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remoteauth"
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/rpc/interceptors"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
@@ -33,6 +35,8 @@ var (
 	remoteCache  = flag.String("codesearch.remote_cache", "", "gRPC Address of buildbuddy cache")
 
 	monitoringAddr = flag.String("monitoring.listen", ":9090", "Address to listen for monitoring traffic on")
+
+	headersToPropagate = []string{authutil.APIKeyHeader, authutil.ContextTokenStringKey}
 )
 
 func main() {
@@ -42,9 +46,11 @@ func main() {
 		log.Fatalf("Could not prepare config secrets provider: %s", err)
 	}
 
-	if err := config.Load(); err == nil {
-		config.ReloadOnSIGHUP()
+	if err := config.Load(); err != nil {
+		log.Fatalf("Could not load config: %s", err)
 	}
+
+	config.ReloadOnSIGHUP()
 
 	if err := log.Configure(); err != nil {
 		fmt.Printf("Error configuring logging: %s", err)
@@ -60,12 +66,13 @@ func main() {
 	healthChecker := healthcheck.NewHealthChecker(*serverType)
 	env := real_environment.NewRealEnv(healthChecker)
 
-	authenticator, err := remoteauth.NewRemoteAuthenticator()
-	if err != nil {
+	if err := clientidentity.Register(env); err != nil {
 		log.Fatal(err.Error())
 	}
-	env.SetAuthenticator(authenticator)
 
+	if err := remoteauth.Register(env); err != nil {
+		log.Fatal(err.Error())
+	}
 	monitoring.StartMonitoringHandler(env, *monitoringAddr)
 
 	css, err := server.New(env, *csIndexDir, *csScratchDir)
@@ -82,12 +89,10 @@ func main() {
 	// Add the API-Key and JWT propagating interceptors.
 	grpcServerConfig := grpc_server.GRPCServerConfig{
 		ExtraChainedUnaryInterceptors: []grpc.UnaryServerInterceptor{
-			interceptors.PropagateAPIKeyUnaryInterceptor(),
-			interceptors.PropagateJWTUnaryInterceptor(),
+			interceptors.PropagateMetadataUnaryInterceptor(headersToPropagate...),
 		},
 		ExtraChainedStreamInterceptors: []grpc.StreamServerInterceptor{
-			interceptors.PropagateAPIKeyStreamInterceptor(),
-			interceptors.PropagateJWTStreamInterceptor(),
+			interceptors.PropagateMetadataStreamInterceptor(headersToPropagate...),
 		},
 	}
 

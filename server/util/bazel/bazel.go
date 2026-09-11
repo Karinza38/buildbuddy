@@ -10,8 +10,14 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/buildbuddy-io/buildbuddy/cli/parser/bazel_command"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+)
+
+const (
+	bazelCommand    = "bazel"
+	bazeliskCommand = "bazelisk"
 )
 
 var (
@@ -93,4 +99,18 @@ func FindWorkspaceFile(startDir string) (string, error) {
 		path = filepath.Dir(path)
 	}
 	return "", status.NotFoundError("could not detect workspace root (WORKSPACE.bazel, WORKSPACE, MODULE, MODULE.bazel file not found)")
+}
+
+// GetStartupOptions makes a best-attempt effort to return the startup options for a bazel command.
+// Ex. for `bazel --digest_function=blake3 build //...` it will return ['--digest_function=blake3']
+func GetStartupOptions(bazelCommandArgs []string) ([]string, error) {
+	_, cmdIdx := bazel_command.GetCommandAndIndex(bazelCommandArgs)
+	if cmdIdx == -1 {
+		return nil, status.InvalidArgumentErrorf("no bazel command in %v", bazelCommandArgs)
+	}
+	startupOptions := bazelCommandArgs[:cmdIdx]
+	if len(startupOptions) > 0 && (startupOptions[0] == bazelCommand || startupOptions[0] == bazeliskCommand) {
+		startupOptions = startupOptions[1:]
+	}
+	return startupOptions, nil
 }

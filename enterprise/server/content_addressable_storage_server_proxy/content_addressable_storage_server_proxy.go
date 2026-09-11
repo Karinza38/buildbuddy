@@ -7,13 +7,17 @@ import (
 	"io"
 	"strconv"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_crypter"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/proxy_util"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/lru"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -25,13 +29,41 @@ import (
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 )
 
-var enableGetTreeCaching = flag.Bool("cache_proxy.enable_get_tree_caching", false, "If true, the Cache Proxy attempts to serve GetTree requests out of the local cache. If false, GetTree requests are always proxied to the remote, authoritative cache.")
+var (
+	enableGetTreeCaching             = flag.Bool("cache_proxy.enable_get_tree_caching", false, "If true, the Cache Proxy attempts to serve GetTree requests out of the local cache. If false, GetTree requests are always proxied to the remote, authoritative cache.")
+	findMissingBlobsCacheTTL         = flag.Duration("cache_proxy.find_missing_blobs_cache_ttl", 0, "If greater than 0, the proxy caches digests reported by the backing cache as 'present' locally for FindMissingBlobs requests for this long.")
+	findMissingBlobsCacheSizeEntries = flag.Int64("cache_proxy.find_missing_blobs_cache_size_entries", 500*1000, "The number of digests to hold in each in-memory FindMissingBlobs digest cache. Only used if cache_proxy.find_missing_blobs_cache_ttl is greater than 0.")
+)
 
 type CASServerProxy struct {
-	atimeUpdater  interfaces.AtimeUpdater
-	authenticator interfaces.Authenticator
-	local         repb.ContentAddressableStorageClient
-	remote        repb.ContentAddressableStorageClient
+	supportsEncryption func(context.Context) bool
+	authenticator      interfaces.Authenticator
+	efp                interfaces.ExperimentFlagProvider
+	local              repb.ContentAddressableStorageServer
+	remote             repb.ContentAddressableStorageClient
+	localCache         interfaces.Cache
+
+	// Local, in-memory caches for digests served in response to FindMissingBlobs
+	// requests. It would be better if this could be in the backing "local"
+	// cache, but that poses two problems:
+	// 1. How can we control the TTL of those caches and ensure that the remote
+	//    (authoritative) cache serves these requests every so often to update
+	//    blob access times.
+	// 2. We don't have a mechanism through which we can tell the local cache
+	//    "this digest exists, even if we don't have it" which we need for the
+	//    remote-return path (local cache didn't have the digest, remote cache
+	//    did).
+	// TODO(go/b/7780): fix those issues.
+	findMissingBlobsCache             lru.LRU[struct{}]
+	findMissingChunksCache            lru.LRU[struct{}]
+	findMissingCacheCountersByChunked map[bool]findMissingCacheCounters
+}
+
+type findMissingCacheCounters struct {
+	blobCacheHits  prometheus.Counter
+	chunkCacheHits prometheus.Counter
+	misses         prometheus.Counter
+	uncacheable    prometheus.Counter
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -44,15 +76,11 @@ func Register(env *real_environment.RealEnv) error {
 }
 
 func New(env environment.Env) (*CASServerProxy, error) {
-	atimeUpdater := env.GetAtimeUpdater()
-	if atimeUpdater == nil {
-		return nil, fmt.Errorf("An AtimeUpdater is required to enable the ContentAddressableStorageServerProxy")
-	}
 	authenticator := env.GetAuthenticator()
 	if authenticator == nil {
 		return nil, fmt.Errorf("An Authenticator is required to enable the ContentAddressableStorageServerProxy")
 	}
-	local := env.GetLocalCASClient()
+	local := env.GetLocalCASServer()
 	if local == nil {
 		return nil, fmt.Errorf("A local ContentAddressableStorageClient is required to enable the ContentAddressableStorageServerProxy")
 	}
@@ -60,104 +88,309 @@ func New(env environment.Env) (*CASServerProxy, error) {
 	if remote == nil {
 		return nil, fmt.Errorf("A remote ContentAddressableStorageClient is required to enable the ContentAddressableStorageServerProxy")
 	}
+	efp := env.GetExperimentFlagProvider()
+	if efp == nil {
+		log.Warning("No experiment flag provider configured; ContentAddressableStorageServerProxy experiment flags will not take effect")
+	}
 	proxy := CASServerProxy{
-		atimeUpdater:  atimeUpdater,
-		authenticator: authenticator,
-		local:         local,
-		remote:        remote,
+		supportsEncryption: remote_crypter.SupportsEncryption(env),
+		authenticator:      authenticator,
+		efp:                efp,
+		local:              local,
+		remote:             remote,
+		localCache:         env.GetCache(),
+	}
+	if *findMissingBlobsCacheTTL > 0 {
+		newCache := func() (lru.LRU[struct{}], error) {
+			return lru.New[struct{}](&lru.Config[struct{}]{
+				MaxSize:    *findMissingBlobsCacheSizeEntries,
+				SizeFn:     func(struct{}) int64 { return 1 },
+				ThreadSafe: true,
+				TTL:        *findMissingBlobsCacheTTL,
+				Clock:      env.GetClock(),
+			})
+		}
+		blobsCache, err := newCache()
+		if err != nil {
+			return nil, status.InvalidArgumentErrorf("Error initializing FindMissingBlobs blobs cache: %s", err)
+		}
+		chunksCache, err := newCache()
+		if err != nil {
+			return nil, status.InvalidArgumentErrorf("Error initializing FindMissingBlobs chunks cache: %s", err)
+		}
+		proxy.findMissingBlobsCache = blobsCache
+		proxy.findMissingChunksCache = chunksCache
+		proxy.findMissingCacheCountersByChunked = make(map[bool]findMissingCacheCounters, 2)
+		for _, chunked := range []bool{false, true} {
+			proxy.findMissingCacheCountersByChunked[chunked] = findMissingCacheCounters{
+				blobCacheHits:  findMissingBlobsCacheLookups(metrics.HitStatusLabel, chunked, "blob_cache"),
+				chunkCacheHits: findMissingBlobsCacheLookups(metrics.HitStatusLabel, chunked, "chunk_cache"),
+				misses:         findMissingBlobsCacheLookups(metrics.MissStatusLabel, chunked, "remote"),
+				uncacheable:    findMissingBlobsCacheLookups(metrics.UncacheableStatusLabel, chunked, "remote"),
+			}
+		}
 	}
 	return &proxy, nil
 }
 
-func recordMetrics(op, status string, perDigestStatus map[string]int) {
-	metrics.ContentAddressableStorageProxyReads.With(
+type cacheMetrics struct {
+	digestsPerStatusAndCompressor map[string]map[string]int
+	bytesPerStatusAndCompressor   map[string]map[string]int
+}
+
+func newCacheMetrics() *cacheMetrics {
+	return &cacheMetrics{
+		digestsPerStatusAndCompressor: map[string]map[string]int{
+			metrics.HitStatusLabel:         map[string]int{},
+			metrics.MissStatusLabel:        map[string]int{},
+			metrics.UncacheableStatusLabel: map[string]int{},
+		},
+		bytesPerStatusAndCompressor: map[string]map[string]int{
+			metrics.HitStatusLabel:         map[string]int{},
+			metrics.MissStatusLabel:        map[string]int{},
+			metrics.UncacheableStatusLabel: map[string]int{},
+		},
+	}
+}
+
+func (m *cacheMetrics) addUpdateMetrics(requests []*repb.BatchUpdateBlobsRequest_Request) *cacheMetrics {
+	status := metrics.MissStatusLabel
+	for _, request := range requests {
+		compressor := compressorLabel(request.GetCompressor())
+		m.digestsPerStatusAndCompressor[status][compressor]++
+		m.bytesPerStatusAndCompressor[status][compressor] += len(request.Data)
+	}
+	return m
+}
+
+func (m *cacheMetrics) addReadMetrics(status string, responses []*repb.BatchReadBlobsResponse_Response) *cacheMetrics {
+	for _, response := range responses {
+		compressor := compressorLabel(response.GetCompressor())
+		m.digestsPerStatusAndCompressor[status][compressor]++
+		m.bytesPerStatusAndCompressor[status][compressor] += len(response.Data)
+	}
+	return m
+}
+
+func compressorLabel(compressor repb.Compressor_Value) string {
+	switch compressor {
+	case repb.Compressor_IDENTITY, repb.Compressor_ZSTD:
+		return compressor.String()
+	default:
+		return "unknown"
+	}
+}
+
+func (m *cacheMetrics) addGetTreeMetrics(digests, bytes int) *cacheMetrics {
+	status := metrics.MissStatusLabel
+	compressor := repb.Compressor_IDENTITY.String()
+	m.digestsPerStatusAndCompressor[status][compressor] += digests
+	m.bytesPerStatusAndCompressor[status][compressor] += bytes
+	return m
+}
+
+func recordMetrics(op, status string, cm *cacheMetrics) {
+	metrics.ContentAddressableStorageProxiedRequests.With(
 		prometheus.Labels{
 			metrics.CASOperation:       op,
 			metrics.CacheHitMissStatus: status,
 		}).Inc()
-	for status, count := range perDigestStatus {
-		metrics.ContentAddressableStorageProxyDigestReads.With(
-			prometheus.Labels{
-				metrics.CASOperation:       op,
-				metrics.CacheHitMissStatus: status,
-			}).Add(float64(count))
+	for status, digestsPerCompressor := range cm.digestsPerStatusAndCompressor {
+		for compressor, count := range digestsPerCompressor {
+			metrics.ContentAddressableStorageProxiedDigests.With(
+				prometheus.Labels{
+					metrics.CASOperation:       op,
+					metrics.CacheHitMissStatus: status,
+					metrics.CompressionType:    compressor,
+				}).Add(float64(count))
+		}
+	}
+	for status, bytesPerCompressor := range cm.bytesPerStatusAndCompressor {
+		for compressor, bytes := range bytesPerCompressor {
+			metrics.ContentAddressableStorageProxiedBytes.With(
+				prometheus.Labels{
+					metrics.CASOperation:       op,
+					metrics.CacheHitMissStatus: status,
+					metrics.CompressionType:    compressor,
+				}).Add(float64(bytes))
+		}
 	}
 }
 
 func (s *CASServerProxy) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
+	if proxy_util.SkipRemote(ctx) {
+		return s.local.FindMissingBlobs(ctx, req)
+	}
+
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(req.BlobDigests)))
 
-	// TODO(iain): This will over-aggressively update remote atimes. If it's a
-	// problem, we can change the logic around to only update atimes for blobs
-	// that were found locally.
-	s.atimeUpdater.EnqueueByFindMissingRequest(ctx, req)
-
-	resp := &repb.FindMissingBlobsResponse{
-		MissingBlobDigests: req.BlobDigests,
+	if s.findMissingBlobsCache == nil || s.efp != nil && s.efp.Boolean(ctx, "cache_proxy.bypass_find_missing_cache", false) {
+		req.Purpose = repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH
+		return s.remote.FindMissingBlobs(ctx, req)
 	}
-	remoteOnly := authutil.EncryptionEnabled(ctx, s.authenticator)
-	if !remoteOnly {
-		localResp, err := s.local.FindMissingBlobs(ctx, req)
-		if err != nil {
-			return nil, err
+
+	// Construct all of the FindMissingBlobs cache keys upfront. We will need
+	// all of them, some of them twice.
+	user, err := s.authenticator.AuthenticatedUser(ctx)
+	groupID := interfaces.AuthAnonymousUser
+	if err == nil {
+		groupID = user.GetGroupID()
+	} else if !authutil.IsAnonymousUserError(err) {
+		log.Warningf("Error authenticating user, skipping FindMissingBlobs cache: %v", err)
+		req.Purpose = repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH
+		return s.remote.FindMissingBlobs(ctx, req)
+	}
+	chunked := cdc.IsChunked(ctx)
+	cacheKeys := make(map[digest.Key]string, len(req.GetBlobDigests()))
+	for _, d := range req.GetBlobDigests() {
+		cacheKeys[digest.NewKey(d)] = s.findMissingBlobsCacheKey(groupID, req, d)
+	}
+
+	// Consult the local FindMissingBlobs caches first to remove some digests.
+	// All chunks can be a full blob, but not all full blobs can be chunks: a
+	// full blob may exist on the remote only as a CDC manifest, with no raw
+	// bytes stored under its digest, so blob entries cannot satisfy chunk
+	// lookups.
+	misses := make([]*repb.Digest, 0, len(req.GetBlobDigests()))
+	blobCacheHits := 0
+	chunkCacheHits := 0
+	for _, d := range req.GetBlobDigests() {
+		key := cacheKeys[digest.NewKey(d)]
+		if !chunked && s.findMissingBlobsCache.Contains(key) {
+			blobCacheHits++
+			continue
 		}
-		resp = localResp
-	}
-	tracing.AddStringAttributeToCurrentSpan(ctx, "locally-missing-blobs", strconv.Itoa(len(resp.MissingBlobDigests)))
-	if len(resp.MissingBlobDigests) == 0 {
-		recordMetrics("FindMissingBlobs", "hit", map[string]int{"hit": len(req.BlobDigests)})
-		return resp, nil
-	}
-
-	if remoteOnly {
-		recordMetrics("FindMissingBlobs", "remote-only", map[string]int{"remote-only": len(req.BlobDigests)})
-	} else if len(resp.MissingBlobDigests) == len(req.BlobDigests) {
-		recordMetrics("FindMissingBlobs", "miss", map[string]int{"miss": len(req.BlobDigests)})
-	} else {
-		recordMetrics("FindMissingBlobs", "partial", map[string]int{
-			"hit":  len(req.BlobDigests) - len(resp.MissingBlobDigests),
-			"miss": len(resp.MissingBlobDigests),
-		})
+		if s.findMissingChunksCache.Contains(key) {
+			chunkCacheHits++
+			continue
+		}
+		misses = append(misses, d)
 	}
 
-	remoteReq := repb.FindMissingBlobsRequest{
-		InstanceName:   req.InstanceName,
-		BlobDigests:    resp.MissingBlobDigests,
-		DigestFunction: req.DigestFunction,
+	counters := s.findMissingCacheCountersByChunked[cdc.IsChunked(ctx)]
+	counters.blobCacheHits.Add(float64(blobCacheHits))
+	counters.chunkCacheHits.Add(float64(chunkCacheHits))
+
+	// All digests were found in the FindMissingBlobs cache, return.
+	if len(misses) == 0 {
+		return &repb.FindMissingBlobsResponse{}, nil
 	}
-	return s.remote.FindMissingBlobs(ctx, &remoteReq)
+
+	remoteReq := &repb.FindMissingBlobsRequest{
+		InstanceName:   req.GetInstanceName(),
+		BlobDigests:    misses,
+		DigestFunction: req.GetDigestFunction(),
+		Purpose:        repb.FindMissingBlobsRequest_CACHE_PROXY_CAS_PASSTHROUGH,
+	}
+	rsp, err := s.remote.FindMissingBlobs(ctx, remoteReq)
+	if err != nil {
+		return rsp, err
+	}
+
+	// Cache the blobs the backing cache reported as present. We need to invert
+	// the set because the remote reports what's missing, not what's present.
+	missing := make(map[string]struct{}, len(rsp.GetMissingBlobDigests()))
+	for _, d := range rsp.GetMissingBlobDigests() {
+		missing[cacheKeys[digest.NewKey(d)]] = struct{}{}
+	}
+	presentRemotely := 0
+	for _, d := range remoteReq.GetBlobDigests() {
+		key := cacheKeys[digest.NewKey(d)]
+		if _, ok := missing[key]; !ok {
+			presentRemotely++
+			if chunked {
+				s.findMissingChunksCache.Add(key, struct{}{})
+			} else {
+				s.findMissingBlobsCache.Add(key, struct{}{})
+			}
+		}
+	}
+	counters.misses.Add(float64(presentRemotely))
+	counters.uncacheable.Add(float64(len(remoteReq.GetBlobDigests()) - presentRemotely))
+	return rsp, nil
+}
+
+func findMissingBlobsCacheLookups(status string, chunked bool, resultSource string) prometheus.Counter {
+	return metrics.FindMissingBlobsCacheLookups.With(prometheus.Labels{
+		metrics.CacheHitMissStatus:     status,
+		metrics.ChunkedLabel:           strconv.FormatBool(chunked),
+		metrics.CacheProxyResultSource: resultSource,
+	})
+}
+
+func (s *CASServerProxy) findMissingBlobsCacheKey(groupID string, req *repb.FindMissingBlobsRequest, d *repb.Digest) string {
+	return groupID + "/" + digest.NewCASResourceName(d, req.GetInstanceName(), req.GetDigestFunction()).DownloadString()
 }
 
 func (s *CASServerProxy) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
+	if proxy_util.SkipRemote(ctx) {
+		return nil, status.UnimplementedError("Skip remote not implemented")
+	}
+
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 
-	if authutil.EncryptionEnabled(ctx, s.authenticator) {
+	recordMetrics("BatchUpdateBlobs", metrics.MissStatusLabel, newCacheMetrics().addUpdateMetrics(req.Requests))
+
+	if authutil.EncryptionEnabled(ctx, s.authenticator) && !s.supportsEncryption(ctx) {
 		return s.remote.BatchUpdateBlobs(ctx, req)
 	}
 
 	_, err := s.local.BatchUpdateBlobs(ctx, req)
 	if err != nil {
-		log.Warningf("Local BatchUpdateBlobs error: %s", err)
+		log.CtxWarningf(ctx, "Local BatchUpdateBlobs error: %s", err)
 	}
 	return s.remote.BatchUpdateBlobs(ctx, req)
 }
 
+func bytesInRequest(req *repb.BatchUpdateBlobsRequest) int {
+	if req == nil {
+		return 0
+	}
+	bytes := 0
+	for _, req := range req.Requests {
+		bytes += len(req.GetData())
+	}
+	return bytes
+}
+
+func bytesInResponse(resp *repb.BatchReadBlobsResponse) int {
+	if resp == nil {
+		return 0
+	}
+	bytes := 0
+	for _, response := range resp.Responses {
+		bytes += len(response.GetData())
+	}
+	return bytes
+}
+
 func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
+	if proxy_util.SkipRemote(ctx) {
+		return nil, status.UnimplementedError("Skip remote not implemented")
+	}
+
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 	tracing.AddStringAttributeToCurrentSpan(ctx, "requested-blobs", strconv.Itoa(len(req.Digests)))
 
+	// Store auth headers in context so they can be reused between the
+	// atime_updater and the hit_tracker_client.
+	ctx = authutil.ContextWithCachedAuthHeaders(ctx, s.authenticator)
+
 	mergedResp := repb.BatchReadBlobsResponse{}
 	mergedDigests := []*repb.Digest{}
 	localResp := &repb.BatchReadBlobsResponse{}
-	remoteOnly := authutil.EncryptionEnabled(ctx, s.authenticator)
+	remoteOnly := authutil.EncryptionEnabled(ctx, s.authenticator) && !s.supportsEncryption(ctx)
 	if !remoteOnly {
 		resp, err := s.local.BatchReadBlobs(ctx, req)
 		if err != nil {
-			recordMetrics("BatchReadBlobs", "miss", map[string]int{"miss": len(req.Digests)})
+			recordMetrics(
+				"BatchReadBlobs",
+				metrics.MissStatusLabel,
+				newCacheMetrics().addReadMetrics(metrics.MissStatusLabel, resp.GetResponses()))
 			return s.batchReadBlobsRemote(ctx, req)
 		}
 		localResp = resp
@@ -168,17 +401,11 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
 			mergedDigests = append(mergedDigests, resp.Digest)
 		}
 	}
-	s.atimeUpdater.Enqueue(ctx, req.InstanceName, mergedDigests, req.DigestFunction)
+
+	cacheMetrics := newCacheMetrics().addReadMetrics(metrics.HitStatusLabel, mergedResp.GetResponses())
 	if len(mergedResp.Responses) == len(req.Digests) {
-		recordMetrics("BatchReadBlobs", "hit", map[string]int{"hit": len(req.Digests)})
+		recordMetrics("BatchReadBlobs", metrics.HitStatusLabel, cacheMetrics)
 		return &mergedResp, nil
-	} else if remoteOnly {
-		recordMetrics("BatchReadBlobs", "remote-only", map[string]int{"remote-only": len(req.Digests)})
-	} else {
-		recordMetrics("BatchReadBlobs", "partial", map[string]int{
-			"hit":  len(mergedResp.Responses),
-			"miss": len(req.Digests) - len(mergedResp.Responses),
-		})
 	}
 
 	// digest.Diff returns a set of differences between two sets of digests,
@@ -204,6 +431,7 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
 	}
 	remoteResp, err := s.batchReadBlobsRemote(ctx, &remoteReq)
 	if err != nil {
+		// Don't record metrics here (for now at least)
 		return nil, err
 	}
 
@@ -212,13 +440,20 @@ func (s *CASServerProxy) BatchReadBlobs(ctx context.Context, req *repb.BatchRead
 	for _, response := range remoteResp.Responses {
 		c, ok := cardinality[digest.NewKey(response.Digest)]
 		if !ok {
-			log.Warningf("Received unexpected digest from remote CAS.BatchReadBlobs: %s/%d", response.Digest.Hash, response.Digest.SizeBytes)
+			log.CtxWarningf(ctx, "Received unexpected digest from remote CAS.BatchReadBlobs: %s/%d", response.Digest.Hash, response.Digest.SizeBytes)
 		}
-		for i := 0; i < c; i++ {
+		for range c {
 			mergedResp.Responses = append(mergedResp.Responses, response)
 		}
 	}
 
+	if remoteOnly {
+		cacheMetrics.addReadMetrics(metrics.UncacheableStatusLabel, mergedResp.Responses)
+		recordMetrics("BatchReadBlobs", metrics.UncacheableStatusLabel, cacheMetrics)
+	} else {
+		cacheMetrics.addReadMetrics(metrics.MissStatusLabel, remoteResp.Responses)
+		recordMetrics("BatchReadBlobs", metrics.PartialStatusLabel, cacheMetrics)
+	}
 	return &mergedResp, nil
 }
 
@@ -244,15 +479,19 @@ func (s *CASServerProxy) batchReadBlobsRemote(ctx context.Context, readReq *repb
 			Compressor: response.Compressor,
 		})
 	}
-	if !authutil.EncryptionEnabled(ctx, s.authenticator) {
+	if !authutil.EncryptionEnabled(ctx, s.authenticator) || s.supportsEncryption(ctx) {
 		if _, err := s.local.BatchUpdateBlobs(ctx, &updateReq); err != nil {
-			log.Warningf("Error locally updating blobs: %s", err)
+			log.CtxWarningf(ctx, "Error locally updating blobs: %s", err)
 		}
 	}
 	return readResp, nil
 }
 
 func (s *CASServerProxy) GetTree(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+	if proxy_util.SkipRemote(stream.Context()) {
+		return status.UnimplementedError("Skip remote not implemented")
+	}
+
 	if *enableGetTreeCaching {
 		return s.getTree(req, stream)
 	}
@@ -260,6 +499,12 @@ func (s *CASServerProxy) GetTree(req *repb.GetTreeRequest, stream repb.ContentAd
 }
 
 func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+	digests := 0
+	bytes := 0
+	defer func() {
+		recordMetrics("GetTree", metrics.MissStatusLabel,
+			newCacheMetrics().addGetTreeMetrics(digests, bytes))
+	}()
 	remoteStream, err := s.remote.GetTree(stream.Context(), req)
 	if err != nil {
 		return err
@@ -272,6 +517,11 @@ func (s *CASServerProxy) getTreeWithoutCaching(req *repb.GetTreeRequest, stream 
 		if err != nil {
 			return err
 		}
+		for _, dir := range rsp.GetDirectories() {
+			digests += len(dir.GetFiles())
+			digests += len(dir.GetDirectories())
+		}
+		bytes += proto.Size(rsp)
 		if err = stream.Send(rsp); err != nil {
 			return err
 		}
@@ -322,4 +572,71 @@ func (s *CASServerProxy) getTree(req *repb.GetTreeRequest, stream repb.ContentAd
 		}
 	}
 	return stream.Send(&resp)
+}
+
+func (s *CASServerProxy) SpliceBlob(ctx context.Context, req *repb.SpliceBlobRequest) (*repb.SpliceBlobResponse, error) {
+	ctx, spn := tracing.StartSpan(ctx)
+	defer spn.End()
+
+	if proxy_util.SkipRemote(ctx) {
+		return nil, status.UnimplementedErrorf("SpliceBlob RPC is not supported for skipping remote")
+	}
+
+	return s.remote.SpliceBlob(ctx, req)
+}
+
+func (s *CASServerProxy) SplitBlob(ctx context.Context, req *repb.SplitBlobRequest) (*repb.SplitBlobResponse, error) {
+	ctx, spn := tracing.StartSpan(ctx)
+	defer spn.End()
+
+	if proxy_util.SkipRemote(ctx) {
+		return nil, status.UnimplementedErrorf("SplitBlob RPC is not supported for skipping remote")
+	}
+
+	return s.remote.SplitBlob(ctx, req)
+}
+
+func (s *CASServerProxy) GetChunkMapping(req *repb.GetChunkMappingRequest, stream repb.ContentAddressableStorage_GetChunkMappingServer) error {
+	remoteStream, err := s.remote.GetChunkMapping(stream.Context(), req)
+	if err != nil {
+		return err
+	}
+	for {
+		rsp, err := remoteStream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(rsp); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *CASServerProxy) RegisterChunkMapping(stream repb.ContentAddressableStorage_RegisterChunkMappingServer) error {
+	remoteStream, err := s.remote.RegisterChunkMapping(stream.Context())
+	if err != nil {
+		return err
+	}
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			rsp, err := remoteStream.CloseAndRecv()
+			if err != nil {
+				return err
+			}
+			return stream.SendAndClose(rsp)
+		}
+		if err != nil {
+			return err
+		}
+		if sendErr := remoteStream.Send(req); sendErr != nil {
+			if _, err := remoteStream.CloseAndRecv(); err != nil {
+				return err
+			}
+			return sendErr
+		}
+	}
 }

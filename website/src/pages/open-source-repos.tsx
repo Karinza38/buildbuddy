@@ -1,10 +1,10 @@
-import React from "react";
 import Layout from "@theme/Layout";
-import common from "../css/common.module.css";
-import styles from "./open-source-repos.module.css";
-import contact from "./contact.module.css";
+import React from "react";
 import OSSList from "../components/oss/oss-list";
-import message from "../util/message";
+import common from "../css/common.module.css";
+import { sendFormsMessage } from "../util/message";
+import contact from "./contact.module.css";
+import styles from "./open-source-repos.module.css";
 
 let form = {
   name: React.createRef<HTMLInputElement>(),
@@ -15,12 +15,12 @@ let form = {
 
 function OpenSource() {
   return (
-    <Layout title="Powered By BuildBuddy">
+    <Layout title="Open source repos powered by BuildBuddy">
       <div className={common.page}>
         <div className={common.section}>
           <div className={common.container}>
             <div className={common.centeredText}>
-              <div className={common.title}>Powered by BuildBuddy</div>
+              <div className={common.title}>Open source repos powered by BuildBuddy</div>
               <div className={common.subtitle}>
                 <br />
                 Here are some of our favorite open source repos that are powered by BuildBuddy.
@@ -58,7 +58,7 @@ function OpenSource() {
 }
 
 function sendMessage() {
-  message(
+  sendFormsMessage(
     `New Open Source Repo!\nName: ${form.name.current.value}\nEmail: ${form.email.current.value}\nRepo URL: ${form.repo.current.value}`
   );
 

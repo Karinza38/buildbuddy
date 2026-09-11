@@ -8,37 +8,52 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/proto/acl"
 	"github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	"github.com/buildbuddy-io/buildbuddy/proto/user_id"
 	"github.com/buildbuddy-io/buildbuddy/server/backends/invocationdb"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/memory_kvstore"
 	"github.com/buildbuddy-io/buildbuddy/server/build_event_protocol/build_event_handler"
 	"github.com/buildbuddy-io/buildbuddy/server/buildbuddy_server"
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/http/interceptors"
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauditlog"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testauth"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testdigest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testhttp"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testport"
+	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_server"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
+	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	akpb "github.com/buildbuddy-io/buildbuddy/proto/api_key"
+	alpb "github.com/buildbuddy-io/buildbuddy/proto/auditlog"
 	bepb "github.com/buildbuddy-io/buildbuddy/proto/build_events"
+	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
+	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
+	cappb "github.com/buildbuddy-io/buildbuddy/proto/capability"
+	ctxpb "github.com/buildbuddy-io/buildbuddy/proto/context"
+	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
+	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
 	pepb "github.com/buildbuddy-io/buildbuddy/proto/publish_build_event"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
-	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
+	usagepb "github.com/buildbuddy-io/buildbuddy/proto/usage"
 )
 
 const (
@@ -47,6 +62,60 @@ const (
 	user2  = "USER2"
 	group2 = "GROUP2"
 )
+
+type fakeCASServer struct {
+	repb.UnimplementedContentAddressableStorageServer
+
+	lastGetTreeRequest *repb.GetTreeRequest
+	getTreeResponses   []*repb.GetTreeResponse
+	getTreeErr         error
+}
+
+func (s *fakeCASServer) GetTree(req *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
+	s.lastGetTreeRequest = req
+	for _, rsp := range s.getTreeResponses {
+		if err := stream.Send(rsp); err != nil {
+			return err
+		}
+	}
+	return s.getTreeErr
+}
+
+type fakeGetTreeStream struct {
+	bbspb.BuildBuddyService_GetTreeServer
+
+	ctx       context.Context
+	responses []*capb.GetTreeResponse
+}
+
+func (s *fakeGetTreeStream) Context() context.Context { return s.ctx }
+
+func (s *fakeGetTreeStream) Send(rsp *capb.GetTreeResponse) error {
+	s.responses = append(s.responses, proto.Clone(rsp).(*capb.GetTreeResponse))
+	return nil
+}
+
+type fakeUsageService struct{}
+
+func (s *fakeUsageService) GetUsage(ctx context.Context, req *usagepb.GetUsageRequest) (*usagepb.GetUsageResponse, error) {
+	return &usagepb.GetUsageResponse{}, nil
+}
+
+func (s *fakeUsageService) GetUsageAlertingRules(ctx context.Context, req *usagepb.GetUsageAlertingRulesRequest) (*usagepb.GetUsageAlertingRulesResponse, error) {
+	return &usagepb.GetUsageAlertingRulesResponse{}, nil
+}
+
+func (s *fakeUsageService) CreateUsageAlertingRule(ctx context.Context, req *usagepb.CreateUsageAlertingRuleRequest) (*usagepb.CreateUsageAlertingRuleResponse, error) {
+	return &usagepb.CreateUsageAlertingRuleResponse{}, nil
+}
+
+func (s *fakeUsageService) DeleteUsageAlertingRule(ctx context.Context, req *usagepb.DeleteUsageAlertingRuleRequest) (*usagepb.DeleteUsageAlertingRuleResponse, error) {
+	return &usagepb.DeleteUsageAlertingRuleResponse{}, nil
+}
+
+func (s *fakeUsageService) GetAlertsEnabled() bool {
+	return true
+}
 
 func createInvocationForTesting(te environment.Env, user string) (string, error) {
 	ctx := context.Background()
@@ -57,12 +126,16 @@ func createInvocationForTesting(te environment.Env, user string) (string, error)
 	testInvocationID := testUUID.String()
 
 	handler := build_event_handler.NewBuildEventHandler(te)
-	channel := handler.OpenChannel(ctx, testInvocationID)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	if err != nil {
+		return "", err
+	}
+	defer channel.Close()
 
 	// Send started event with api key
 	options := ""
 	if user != "" {
-		options = "--remote_header='" + testauth.APIKeyHeader + "=" + user + "'"
+		options = "--remote_header='" + authutil.APIKeyHeader + "=" + user + "'"
 	}
 	started, err := anypb.New(&build_event_stream.BuildEvent{
 		Payload: &build_event_stream.BuildEvent_Started{
@@ -89,12 +162,54 @@ func createInvocationForTesting(te environment.Env, user string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	return testInvocationID, err
+	return testInvocationID, nil
+}
+
+func TestUsageAlertingRules_AuditLogsCreateAndDelete(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
+	te.SetAuthenticator(auth)
+	te.SetUsageService(&fakeUsageService{})
+	al := testauditlog.New(t)
+	te.SetAuditLogger(al)
+	server, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+	ctx, err := auth.WithAuthenticatedUser(context.Background(), user1)
+	require.NoError(t, err)
+
+	// Creating a usage alerting rule records the admin mutation against the authenticated group.
+	createReq := &usagepb.CreateUsageAlertingRuleRequest{
+		RequestContext: &ctxpb.RequestContext{GroupId: group1},
+		Configuration: &usagepb.UsageAlertingRuleConfiguration{
+			Metric:            usagepb.UsageAlertingMetric_CAS_CACHE_HITS,
+			AbsoluteThreshold: 1,
+			Window:            usagepb.UsageAlertingWindow_DAY,
+		},
+	}
+	_, err = server.CreateUsageAlertingRule(ctx, createReq)
+	require.NoError(t, err)
+
+	// Deleting a usage alerting rule is audited the same way.
+	deleteReq := &usagepb.DeleteUsageAlertingRuleRequest{
+		RequestContext:      &ctxpb.RequestContext{GroupId: group1},
+		UsageAlertingRuleId: "UR1",
+	}
+	_, err = server.DeleteUsageAlertingRule(ctx, deleteReq)
+	require.NoError(t, err)
+
+	entries := al.GetAllEntries()
+	require.Len(t, entries, 2)
+	require.Equal(t, &alpb.ResourceID{Type: alpb.ResourceType_GROUP, Id: group1}, entries[0].Resource)
+	require.Equal(t, alpb.Action_CREATE, entries[0].Action)
+	require.Same(t, createReq, entries[0].Request)
+	require.Equal(t, &alpb.ResourceID{Type: alpb.ResourceType_GROUP, Id: group1}, entries[1].Resource)
+	require.Equal(t, alpb.Action_DELETE, entries[1].Action)
+	require.Same(t, deleteReq, entries[1].Request)
 }
 
 func TestGetInvocation(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1, user2, group2))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1, user2, group2))
 	te.SetAuthenticator(auth)
 
 	iid, err := createInvocationForTesting(te, user1)
@@ -131,9 +246,9 @@ func TestGetInvocation(t *testing.T) {
 func TestGetInvocation_FetchChildren(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1, user2, group2))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1, user2, group2))
 	te.SetAuthenticator(auth)
-	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te)
+	ctx, err := prefix.AttachUserPrefixToContext(context.Background(), te.GetAuthenticator())
 	require.NoError(t, err)
 	ctx, err = auth.WithAuthenticatedUser(ctx, user1)
 	require.NoError(t, err)
@@ -150,7 +265,7 @@ func TestGetInvocation_FetchChildren(t *testing.T) {
 	require.True(t, created)
 
 	// Create child invocations
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		created, err = idb.CreateInvocation(ctx, &tables.Invocation{
 			InvocationID: fmt.Sprintf("child-%d", i),
 			ParentRunID:  "parent-id",
@@ -178,14 +293,14 @@ func TestGetInvocation_FetchChildren(t *testing.T) {
 
 	// Ensure child invocations are sorted by increasing creation time
 	require.Equal(t, 10, len(inv.ChildInvocations))
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		require.Equal(t, fmt.Sprintf("child-%d", i), inv.ChildInvocations[i].InvocationId)
 	}
 }
 
 func TestSearchInvocation(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
 	te.SetAuthenticator(auth)
 
 	// Search Service is enterprise-only
@@ -208,7 +323,7 @@ func TestSearchInvocation(t *testing.T) {
 
 func TestUpdateInvocation(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1, user2, group2))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1, user2, group2))
 	te.SetAuthenticator(auth)
 	te.GetDBHandle().NewQuery(context.Background(), "create_invocation").Create(&tables.Group{GroupID: group1, SharingEnabled: true})
 
@@ -246,7 +361,7 @@ func TestUpdateInvocation(t *testing.T) {
 
 func TestDeleteInvocation(t *testing.T) {
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
 	te.SetAuthenticator(auth)
 
 	iid, err := createInvocationForTesting(te, user1)
@@ -282,81 +397,472 @@ func TestDeleteInvocation(t *testing.T) {
 	require.Error(t, err)
 }
 
+type fakeAuthDB struct {
+	interfaces.AuthDB
+	keys []*tables.APIKey
+}
+
+func (f *fakeAuthDB) GetAPIKeys(ctx context.Context, groupID string) ([]*tables.APIKey, error) {
+	return f.keys, nil
+}
+
+type fakeUserDB struct {
+	interfaces.UserDB
+	users map[string]*tables.User
+	errs  map[string]error
+}
+
+func (f *fakeUserDB) GetUserByIDWithoutAuthCheck(ctx context.Context, id string, opts *interfaces.GetUserOpts) (*tables.User, error) {
+	if err, ok := f.errs[id]; ok {
+		return nil, err
+	}
+	if u, ok := f.users[id]; ok {
+		return u, nil
+	}
+	return nil, status.NotFoundError("user not found")
+}
+
+func testUserWithCapabilities(userID, groupID string, caps ...cappb.Capability) *testauth.TestUser {
+	u := testauth.User(userID, groupID)
+	u.GroupMemberships[0].Capabilities = caps
+	return u
+}
+
+func tableUser(userID, firstName, lastName, email string) *tables.User {
+	return &tables.User{
+		UserID:    userID,
+		FirstName: firstName,
+		LastName:  lastName,
+		Email:     email,
+	}
+}
+
+func TestGetApiKeys_CreationMetadata(t *testing.T) {
+	const (
+		serverAdminGroup = "SERVER_ADMIN_GROUP"
+		adminID          = "ADMIN"
+		serverAdminID    = "SERVER_ADMIN"
+		devID            = "DEV"
+		leaverID         = "LEAVER"
+		bbAdminID        = "BB_ADMIN"
+		deletedID        = "DELETED"
+		brokenID         = "BROKEN"
+	)
+	flags.Set(t, "auth.admin_group_id", serverAdminGroup)
+	createdAt := time.Date(2026, time.September, 2, 12, 0, 0, 0, time.UTC)
+	model := tables.Model{CreatedAtUsec: createdAt.UnixMicro()}
+
+	// A server admin viewing group1's keys: an org admin of group1 who is also
+	// an admin of the server admin group.
+	serverAdmin := testUserWithCapabilities(serverAdminID, group1, cappb.Capability_ORG_ADMIN)
+	serverAdmin.GroupMemberships = append(serverAdmin.GroupMemberships, &interfaces.GroupMembership{
+		GroupID:      serverAdminGroup,
+		Capabilities: []cappb.Capability{cappb.Capability_ORG_ADMIN},
+	})
+
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, map[string]interfaces.UserInfo{
+		adminID:       testUserWithCapabilities(adminID, group1, cappb.Capability_ORG_ADMIN),
+		serverAdminID: serverAdmin,
+		devID:         testUserWithCapabilities(devID, group1, cappb.Capability_CACHE_WRITE),
+	})
+	te.SetAuthenticator(auth)
+	te.SetAuthDB(&fakeAuthDB{keys: []*tables.APIKey{
+		{APIKeyID: "member", Model: model, CreatedByUserID: adminID},
+		{APIKeyID: "leaver", Model: model, CreatedByUserID: leaverID},
+		{APIKeyID: "bb-admin", Model: model, CreatedByUserID: bbAdminID},
+		{APIKeyID: "deleted", Model: model, CreatedByUserID: deletedID},
+		{APIKeyID: "broken", Model: model, CreatedByUserID: brokenID},
+		{APIKeyID: "time-only", Model: model},
+		{APIKeyID: "legacy"},
+	}})
+	te.SetUserDB(&fakeUserDB{
+		users: map[string]*tables.User{
+			adminID:   tableUser(adminID, "Ada", "Admin", "ada@example.com"),
+			leaverID:  tableUser(leaverID, "", "", "leaver@example.com"),
+			bbAdminID: tableUser(bbAdminID, "Bob", "Buildbuddy", "bob@buildbuddy.io"),
+		},
+		errs: map[string]error{brokenID: status.UnavailableError("db unavailable")},
+	})
+	server, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+
+	getKeys := func(t *testing.T, userID string) map[string]*akpb.ApiKey {
+		ctx, err := auth.WithAuthenticatedUser(context.Background(), userID)
+		require.NoError(t, err)
+		rsp, err := server.GetApiKeys(ctx, &akpb.GetApiKeysRequest{
+			RequestContext: testauth.RequestContext(userID, group1),
+		})
+		require.NoError(t, err)
+		keys := map[string]*akpb.ApiKey{}
+		for _, k := range rsp.GetApiKey() {
+			keys[k.GetId()] = k
+		}
+		require.Len(t, keys, 7)
+		return keys
+	}
+	createdBy := func(t *testing.T, keys map[string]*akpb.ApiKey, id string) string {
+		md := keys[id].GetCreationMetadata()
+		require.NotNil(t, md, id)
+		require.Equal(t, createdAt.UnixMicro(), md.GetCreatedAt().AsTime().UnixMicro(), id)
+		return md.GetCreatedBy()
+	}
+
+	t.Run("admin", func(t *testing.T) {
+		keys := getKeys(t, adminID)
+		require.Equal(t, "Ada Admin", createdBy(t, keys, "member"))
+		// Users with no name fall back to their email, even if they have since
+		// left the group.
+		require.Equal(t, "leaver@example.com", createdBy(t, keys, "leaver"))
+		// BuildBuddy employees are not identified to customers.
+		require.Equal(t, "Buildbuddy Admin", createdBy(t, keys, "bb-admin"))
+		// Creators who no longer exist or can't be looked up are not
+		// attributed, but the timestamp is still returned.
+		require.Empty(t, createdBy(t, keys, "deleted"))
+		require.Empty(t, createdBy(t, keys, "broken"))
+		require.Empty(t, createdBy(t, keys, "time-only"))
+		// Keys with nothing to show get no metadata at all.
+		require.Nil(t, keys["legacy"].GetCreationMetadata())
+	})
+
+	t.Run("server_admin", func(t *testing.T) {
+		keys := getKeys(t, serverAdminID)
+		require.Equal(t, "Ada Admin", createdBy(t, keys, "member"))
+		require.Equal(t, "Bob Buildbuddy", createdBy(t, keys, "bb-admin"))
+	})
+
+	t.Run("developer", func(t *testing.T) {
+		keys := getKeys(t, devID)
+		for id, k := range keys {
+			require.Nil(t, k.GetCreationMetadata(), id)
+		}
+	})
+}
+
+func TestGetTree(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	fakeCAS := &fakeCASServer{
+		getTreeResponses: []*repb.GetTreeResponse{
+			{
+				Directories: []*repb.Directory{
+					{
+						Files: []*repb.FileNode{{Name: "first.txt"}},
+					},
+				},
+				NextPageToken: "page-1",
+			},
+			{
+				Directories: []*repb.Directory{
+					{
+						Files: []*repb.FileNode{{Name: "second.txt"}},
+					},
+				},
+			},
+		},
+	}
+	te.SetCASServer(fakeCAS)
+
+	server, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+
+	req := &capb.GetTreeRequest{
+		RootDigest:     &repb.Digest{Hash: "root", SizeBytes: 1},
+		InstanceName:   "remote",
+		PageSize:       123,
+		PageToken:      "resume-here",
+		DigestFunction: repb.DigestFunction_SHA256,
+	}
+	stream := &fakeGetTreeStream{ctx: context.Background()}
+
+	err = server.GetTree(req, stream)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(&repb.GetTreeRequest{
+		RootDigest:     req.GetRootDigest(),
+		InstanceName:   req.GetInstanceName(),
+		PageSize:       req.GetPageSize(),
+		PageToken:      req.GetPageToken(),
+		DigestFunction: req.GetDigestFunction(),
+	}, fakeCAS.lastGetTreeRequest))
+	require.Len(t, stream.responses, 2)
+	require.True(t, proto.Equal(&capb.GetTreeResponse{
+		Directories:   fakeCAS.getTreeResponses[0].GetDirectories(),
+		NextPageToken: fakeCAS.getTreeResponses[0].GetNextPageToken(),
+	}, stream.responses[0]))
+	require.True(t, proto.Equal(&capb.GetTreeResponse{
+		Directories:   fakeCAS.getTreeResponses[1].GetDirectories(),
+		NextPageToken: fakeCAS.getTreeResponses[1].GetNextPageToken(),
+	}, stream.responses[1]))
+}
+
 func TestFileDownloadEndpoint(t *testing.T) {
 	ctx := context.Background()
 	te := testenv.GetTestEnv(t)
-	auth := testauth.NewTestAuthenticator(testauth.TestUsers(user1, group1))
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
 	te.SetAuthenticator(auth)
 	err := buildbuddy_server.Register(te)
 	require.NoError(t, err)
-	// Start gRPC server (for cache API)
-	grpcPort := testport.FindFree(t)
-	gs, err := grpc_server.New(te, grpcPort, false /*=ssl*/, grpc_server.GRPCServerConfig{})
+	for _, tc := range []struct {
+		Name                      string
+		ClientUseLocalPort        bool
+		RestrictBytestreamDialing bool
+		ExpectError               bool
+	}{
+		{
+			Name:                      "localhost_norestrict",
+			ClientUseLocalPort:        true,
+			RestrictBytestreamDialing: false,
+		},
+		{
+			Name:                      "localhost_restrict",
+			ClientUseLocalPort:        true,
+			RestrictBytestreamDialing: true,
+		},
+		{
+			Name:                      "remote_norestrict",
+			ClientUseLocalPort:        false,
+			RestrictBytestreamDialing: false,
+		},
+		{
+			Name:                      "remote_restrict",
+			ClientUseLocalPort:        false,
+			RestrictBytestreamDialing: true,
+			ExpectError:               true,
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			// Start gRPC server (for cache API)
+			grpcPort := testport.FindFree(t)
+			if tc.ClientUseLocalPort {
+				flags.Set(t, "grpc_port", grpcPort)
+			} else {
+				// Tell client to use the wrong port
+				flags.Set(t, "grpc_port", grpcPort+1)
+			}
+			if tc.RestrictBytestreamDialing {
+				flags.Set(t, "app.restrict_bytestream_dialing", true)
+			} else {
+				flags.Set(t, "app.restrict_bytestream_dialing", false)
+			}
+			gs, err := grpc_server.New(te, grpcPort, false /*=ssl*/, grpc_server.GRPCServerConfig{})
+			require.NoError(t, err)
+			te.SetGRPCServer(gs.GetServer())
+			testcache.RegisterServers(t, te)
+			err = gs.Start()
+			require.NoError(t, err)
+			// Register gRPC clients
+			conn, err := grpc_client.DialSimpleWithoutPooling(fmt.Sprintf("grpc://localhost:%d", grpcPort))
+			require.NoError(t, err)
+			t.Cleanup(func() { conn.Close() })
+			testcache.RegisterClients(te, conn)
+			// Start HTTP server (for /file/download endpoint)
+			mux := http.NewServeMux()
+			mux.Handle("/file/download", interceptors.WrapAuthenticatedExternalHandler(te, te.GetBuildBuddyServer()))
+			baseURL := testhttp.StartServer(t, mux)
+
+			iid, err := createInvocationForTesting(te, "" /*=user*/)
+			require.NoError(t, err)
+
+			t.Run("CAS_resource", func(t *testing.T) {
+				rn, b := testdigest.RandomCASResourceBuf(t, 100)
+				casrn, err := digest.CASResourceNameFromProto(rn)
+				require.NoError(t, err)
+				_, _, err = cachetools.UploadFromReader(ctx, te.GetByteStreamClient(), casrn, bytes.NewReader(b))
+				require.NoError(t, err)
+
+				// Fetch it from /file/download endpoint
+				bsURL := fmt.Sprintf("bytestream://localhost:%d/blobs/%s", grpcPort, digest.String(rn.GetDigest()))
+				rsp, err := http.Get(fmt.Sprintf(
+					"%s/file/download?invocation_id=%s&bytestream_url=%s",
+					baseURL, iid, url.QueryEscape(bsURL)))
+				require.NoError(t, err)
+				defer rsp.Body.Close()
+				body, err := io.ReadAll(rsp.Body)
+				require.NoError(t, err)
+
+				if tc.ExpectError {
+					require.Equal(t, http.StatusInternalServerError, rsp.StatusCode)
+					require.Equal(t, "rpc error: code = Internal desc = Internal server error\n", string(body))
+				} else {
+					require.Equal(t, http.StatusOK, rsp.StatusCode)
+					require.Equal(t, b, body)
+				}
+			})
+
+			t.Run("AC_resource", func(t *testing.T) {
+				key := &repb.Digest{
+					// Note: hash here can be arbitrary.
+					Hash:      "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+					SizeBytes: 111,
+				}
+				rn := digest.NewACResourceName(key, "", repb.DigestFunction_SHA256)
+				ar := &repb.ActionResult{
+					StdoutRaw: []byte("test-stdout"),
+					ExecutionMetadata: &repb.ExecutedActionMetadata{
+						// Set worker explicitly, otherwise AC server sets it to a uuid.
+						Worker: "test-worker",
+					},
+				}
+				err = cachetools.UploadActionResult(ctx, te.GetActionCacheClient(), rn, ar)
+				require.NoError(t, err)
+				arb, err := proto.Marshal(ar)
+				require.NoError(t, err)
+
+				// Fetch it with /file/download endpoint
+				acURL := fmt.Sprintf("actioncache://localhost:%d/blobs/ac/%s", grpcPort, digest.String(key))
+				rsp, err := http.Get(fmt.Sprintf(
+					"%s/file/download?invocation_id=%s&bytestream_url=%s",
+					baseURL, iid, url.QueryEscape(acURL)))
+				require.NoError(t, err)
+				defer rsp.Body.Close()
+				body, err := io.ReadAll(rsp.Body)
+				require.NoError(t, err)
+				if tc.ExpectError {
+					require.Equal(t, http.StatusNotFound, rsp.StatusCode)
+					require.Equal(t, "rpc error: code = NotFound desc = File not found.\n", string(body))
+				} else {
+					require.Equal(t, http.StatusOK, rsp.StatusCode)
+					require.Equal(t, arb, body)
+				}
+			})
+		})
+	}
+}
+
+func TestWriteEventLog(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
+	te.SetAuthenticator(auth)
+	kvStore, err := memory_kvstore.NewMemoryKeyValStore()
 	require.NoError(t, err)
-	te.SetGRPCServer(gs.GetServer())
-	testcache.RegisterServers(t, te)
-	err = gs.Start()
+	te.SetKeyValStore(kvStore)
+
+	ctx, err := auth.WithAuthenticatedUser(t.Context(), user1)
 	require.NoError(t, err)
-	// Register gRPC clients
-	conn, err := grpc_client.DialSimpleWithoutPooling(fmt.Sprintf("grpc://localhost:%d", grpcPort))
+	bbServer, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+
+	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, te)
+	bbspb.RegisterBuildBuddyServiceServer(grpcServer, bbServer)
+	go runFunc()
+
+	conn, err := testenv.LocalGRPCConn(ctx, lis)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
-	testcache.RegisterClients(te, conn)
-	// Start HTTP server (for /file/download endpoint)
-	mux := http.NewServeMux()
-	mux.Handle("/file/download", interceptors.WrapAuthenticatedExternalHandler(te, te.GetBuildBuddyServer()))
-	baseURL := testhttp.StartServer(t, mux)
+	client := bbspb.NewBuildBuddyServiceClient(conn)
 
-	iid, err := createInvocationForTesting(te, "" /*=user*/)
+	// Create an invocation that is generating run logs.
+	iid, err := createInvocationForTesting(te, user1)
+	require.NoError(t, err)
+	_, err = bbServer.UpdateRunStatus(ctx, &elpb.UpdateRunStatusRequest{
+		InvocationId: iid,
+		Status:       inspb.OverallStatus_IN_PROGRESS,
+	})
 	require.NoError(t, err)
 
-	{
-		// Upload CAS resource
-		rn, b := testdigest.NewRandomResourceAndBuf(t, 100, rspb.CacheType_CAS, "")
-		_, _, err = cachetools.UploadFromReader(ctx, te.GetByteStreamClient(), digest.ResourceNameFromProto(rn), bytes.NewReader(b))
-		require.NoError(t, err)
+	// Write event logs
+	stream, err := client.WriteEventLog(ctx)
+	require.NoError(t, err)
 
-		// Fetch it from /file/download endpoint
-		bsURL := fmt.Sprintf("bytestream://localhost:%d/blobs/%s", grpcPort, digest.String(rn.GetDigest()))
-		rsp, err := http.Get(fmt.Sprintf(
-			"%s/file/download?invocation_id=%s&bytestream_url=%s",
-			baseURL, iid, url.QueryEscape(bsURL)))
-		require.NoError(t, err)
-		defer rsp.Body.Close()
-		body, err := io.ReadAll(rsp.Body)
-		require.NoError(t, err)
-		require.Equal(t, b, body)
-	}
+	err = stream.Send(&elpb.WriteEventLogRequest{
+		Type: elpb.LogType_RUN_LOG,
+		Metadata: &elpb.LogMetadata{
+			InvocationId: iid,
+		},
+		Data: []byte("Line 1\n"),
+	})
+	require.NoError(t, err)
 
-	{
-		// Upload AC resource
-		key := &repb.Digest{
-			// Note: hash here can be arbitrary.
-			Hash:      "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
-			SizeBytes: 111,
-		}
-		rn := digest.NewResourceName(key, "", rspb.CacheType_AC, repb.DigestFunction_SHA256)
-		ar := &repb.ActionResult{
-			StdoutRaw: []byte("test-stdout"),
-			ExecutionMetadata: &repb.ExecutedActionMetadata{
-				// Set worker explicitly, otherwise AC server sets it to a uuid.
-				Worker: "test-worker",
-			},
-		}
-		err = cachetools.UploadActionResult(ctx, te.GetActionCacheClient(), rn, ar)
-		require.NoError(t, err)
+	err = stream.Send(&elpb.WriteEventLogRequest{
+		Type: elpb.LogType_RUN_LOG,
+		Metadata: &elpb.LogMetadata{
+			InvocationId: iid,
+		},
+		Data: []byte("Line 2\n"),
+	})
+	require.NoError(t, err)
 
-		// Fetch it with /file/download endpoint
-		acURL := fmt.Sprintf("actioncache://localhost:%d/blobs/ac/%s", grpcPort, digest.String(key))
-		rsp, err := http.Get(fmt.Sprintf(
-			"%s/file/download?invocation_id=%s&bytestream_url=%s",
-			baseURL, iid, url.QueryEscape(acURL)))
-		require.NoError(t, err)
-		defer rsp.Body.Close()
-		body, err := io.ReadAll(rsp.Body)
-		require.NoError(t, err)
-		arb, err := proto.Marshal(ar)
-		require.NoError(t, err)
-		require.Equal(t, arb, body)
-	}
+	resp, err := stream.CloseAndRecv()
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// Make sure we can read back the logs.
+	getLogStream, err := client.GetEventLog(ctx, &elpb.GetEventLogChunkRequest{
+		InvocationId: iid,
+		Type:         elpb.LogType_RUN_LOG,
+	})
+	require.NoError(t, err)
+
+	data, err := getLogStream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "Line 1\nLine 2\n", string(data.GetBuffer()))
+}
+
+func TestWriteEventLog_ServerTimeout(t *testing.T) {
+	// Use a short timeout for testing
+	originalTimeout := buildbuddy_server.WriteEventLogTimeout
+	buildbuddy_server.WriteEventLogTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { buildbuddy_server.WriteEventLogTimeout = originalTimeout })
+
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers(user1, group1))
+	te.SetAuthenticator(auth)
+	kvStore, err := memory_kvstore.NewMemoryKeyValStore()
+	require.NoError(t, err)
+	te.SetKeyValStore(kvStore)
+
+	ctx, err := auth.WithAuthenticatedUser(t.Context(), user1)
+	require.NoError(t, err)
+
+	bbServer, err := buildbuddy_server.NewBuildBuddyServer(te, nil)
+	require.NoError(t, err)
+
+	grpcServer, runFunc, lis := testenv.RegisterLocalGRPCServer(t, te)
+	bbspb.RegisterBuildBuddyServiceServer(grpcServer, bbServer)
+	go runFunc()
+
+	conn, err := testenv.LocalGRPCConn(ctx, lis)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := bbspb.NewBuildBuddyServiceClient(conn)
+
+	// Create an invocation
+	iid, err := createInvocationForTesting(te, user1)
+	require.NoError(t, err)
+	_, err = bbServer.UpdateRunStatus(ctx, &elpb.UpdateRunStatusRequest{
+		InvocationId: iid,
+		Status:       inspb.OverallStatus_IN_PROGRESS,
+	})
+	require.NoError(t, err)
+
+	// Open stream and send one message, but don't close the stream
+	stream, err := client.WriteEventLog(ctx)
+	require.NoError(t, err)
+
+	err = stream.Send(&elpb.WriteEventLogRequest{
+		Type: elpb.LogType_RUN_LOG,
+		Metadata: &elpb.LogMetadata{
+			InvocationId: iid,
+		},
+		Data: []byte("Line 1\n"),
+	})
+	require.NoError(t, err)
+
+	// Wait until the server timeout has been exceeded.
+	time.Sleep(600 * time.Millisecond)
+
+	// The server should return a deadline exceeded error
+	_, err = stream.CloseAndRecv()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "DeadlineExceeded")
+
+	// Make sure we can read back the logs that were written before the timeout.
+	getLogStream, err := client.GetEventLog(ctx, &elpb.GetEventLogChunkRequest{
+		InvocationId: iid,
+		Type:         elpb.LogType_RUN_LOG,
+	})
+	require.NoError(t, err)
+
+	data, err := getLogStream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, "Line 1\n", string(data.GetBuffer()))
 }

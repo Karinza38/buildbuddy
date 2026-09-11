@@ -1,20 +1,31 @@
 module.exports = {
   someSidebar: {
-    "Getting Started": ["introduction", "cloud", "on-prem", "contributing"],
+    "Getting Started": [
+      "introduction",
+      "quickstart",
+      { type: "link", label: "Changelog", href: "/changelog" },
+      "contributing",
+    ],
     Guides: ["guides", "guide-auth", "guide-metadata"],
     Cache: ["cache-encryption-keys"],
     "Remote Build Execution": [
       "remote-build-execution",
       "rbe-setup",
       "rbe-platforms",
+      "rbe-container-image-caching",
       "secrets",
       "rbe-microvms",
       "rbe-github-actions",
       "rbe-pools",
     ],
-    "Workflows (CI)": ["workflows-introduction", "workflows-setup", "workflows-config"],
-    "Remote Bazel": ["remote-bazel-introduction"],
-    CLI: ["cli", "cli-plugins"],
+    "Remote Runners (CI)": [
+      "remote-runner-introduction",
+      "remote-runner-features",
+      "workflows-setup",
+      "workflows-config",
+      "remote-bazel",
+    ],
+    CLI: ["cli", "cli-config", "cli-commands", "cli-plugins"],
     Troubleshooting: ["troubleshooting", "troubleshooting-rbe", "troubleshooting-slow-upload"],
     Enterprise: [
       "enterprise",
@@ -23,7 +34,9 @@ module.exports = {
       "enterprise-helm",
       "enterprise-rbe",
       "enterprise-mac-rbe",
+      "enterprise-proxy",
       "enterprise-api",
+      "enterprise-mcp",
     ],
     Monitoring: ["prometheus-metrics-on-prem", "prometheus-metrics-for-cloud"],
     Architecture: [

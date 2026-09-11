@@ -10,9 +10,11 @@ container_image(
         "--logtostderr",
     ],
     files = [
+        "//tools/probers/bazelcache",
         "//tools/probers/bazelrbe",
         "//tools/probers/remote_runner",
         "@cloudprober",
+        "@net_busybox_busybox-linux-amd64//file:busybox",
     ],
     tags = ["manual"],
     tars = [
@@ -35,9 +37,11 @@ container_push(
 pkg_tar(
     name = "files_tar",
     srcs = [
+        "//tools/probers/bazelcache",
         "//tools/probers/bazelrbe",
         "//tools/probers/remote_runner",
         "@cloudprober",
+        "@net_busybox_busybox-linux-amd64//file:busybox",
     ],
 )
 

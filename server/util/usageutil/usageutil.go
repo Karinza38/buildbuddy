@@ -1,34 +1,83 @@
+// TODO: rename to "usage" and rename enterprise/server/usage to
+// "usagetracker"
 package usageutil
 
 import (
 	"context"
 	"flag"
+	"net/url"
+	"sort"
+	"strings"
 
+	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/tables"
+	"github.com/buildbuddy-io/buildbuddy/server/usage/sku"
+	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
 	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
+	"github.com/buildbuddy-io/buildbuddy/server/util/claims"
 	"google.golang.org/grpc/metadata"
 )
 
-// Client label constants.
 const (
+	// gRPC metadata header constants.
+	ClientHeaderName            = "x-buildbuddy-client"
+	OriginHeaderName            = "x-buildbuddy-origin"
+	ProxyHeaderName             = "x-buildbuddy-proxy"
+	SkipUsageTrackingHeaderName = "x-buildbuddy-skip-tracking"
+
+	// Client label constants.
 	bazelClientLabel    = "bazel"
 	executorClientLabel = "executor"
+
+	SkipUsageTrackingEnabledValue = "1"
 )
 
 var (
 	origin = flag.String("grpc_client_origin_header", "", "Header value to set for x-buildbuddy-origin.")
 
-	// Header value to set for x-buildbuddy-client.
-	// See: WithLocalServerLabels
-	clientType string
+	// The server name to record in usage.  This will be used for the "client" usage label when sending RPCS
+	// and the "server" usage label when a usage-generating request terminates at this server.
+	serverName string
+
+	// The proxy type ("buildbuddy" or "customer") to record in usage. This is
+	// set on cache proxies and used for the "proxy" usage label so that
+	// BuildBuddy-run and customer-run proxy traffic can be billed separately. It
+	// is empty on servers that are not cache proxies.
+	proxyType string
 )
 
-// Labels returns usage labels for the given request context.
-func Labels(ctx context.Context) (*tables.UsageLabels, error) {
-	return &tables.UsageLabels{
-		Origin: originLabel(ctx),
-		Client: clientLabel(ctx),
-	}, nil
+func DisableUsageTracking(ctx context.Context) context.Context {
+	if ClientOrigin() != interfaces.ClientIdentityInternalOrigin || ServerName() != interfaces.ClientIdentityCacheProxy {
+		alert.CtxUnexpectedEvent(ctx, "unexpected-tracking-disablement", "Tried to disable usage tracking from an unsupported origin: %s %s", ClientOrigin(), ServerName())
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, SkipUsageTrackingHeaderName, SkipUsageTrackingEnabledValue)
+}
+
+func LabelsForUsageRecording(ctx context.Context, server string) (*tables.UsageLabels, sku.Labels, error) {
+	origin := originLabel(ctx)
+	client := clientLabel(ctx)
+	proxy := proxyLabel(ctx)
+	primaryDBLabels := &tables.UsageLabels{
+		Origin: origin,
+		Client: client,
+		Server: server,
+		Proxy:  proxy,
+	}
+	olapLabels := make(sku.Labels, 4)
+	if origin != "" {
+		olapLabels[sku.Origin] = sku.LabelValue(origin)
+	}
+	if client != "" {
+		olapLabels[sku.Client] = sku.LabelValue(client)
+	}
+	if server != "" {
+		olapLabels[sku.Server] = sku.LabelValue(server)
+	}
+	if proxy != "" {
+		olapLabels[sku.Proxy] = sku.LabelValue(proxy)
+	}
+	return primaryDBLabels, olapLabels, nil
 }
 
 // WithLocalServerLabels causes outgoing gRPC requests to be labeled with the
@@ -45,8 +94,8 @@ func Labels(ctx context.Context) (*tables.UsageLabels, error) {
 func WithLocalServerLabels(ctx context.Context) context.Context {
 	// Note: we set the header values here even if they're empty so that they
 	// override other header values, e.g. bazel request metadata.
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-buildbuddy-origin", *origin)
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-buildbuddy-client", clientType)
+	ctx = metadata.AppendToOutgoingContext(ctx, OriginHeaderName, *origin)
+	ctx = metadata.AppendToOutgoingContext(ctx, ClientHeaderName, serverName)
 	return ctx
 }
 
@@ -56,14 +105,59 @@ func ClientOrigin() string {
 	return *origin
 }
 
-// SetClientType sets the value of the x-buildbuddy-client header for *outgoing*
-// gRPC requests with label propagation enabled.
-func SetClientType(value string) {
-	clientType = value
+// SetServerName will be used for x-buildbuddy-client header for *outgoing* gRPC
+// requests and recorded for usage-generating requests that terminated at this server.
+func SetServerName(value string) {
+	serverName = value
+}
+
+func ServerName() string {
+	return serverName
+}
+
+// SetProxyType sets the proxy type ("buildbuddy" or "customer") recorded for
+// the "proxy" usage label on cache proxies.
+func SetProxyType(value string) {
+	proxyType = value
+}
+
+// ProxyType returns the proxy type ("internal" or "external") configured for
+// this server, or "" if it is not a cache proxy. It is recorded for the "proxy"
+// usage label and propagated on outgoing requests via AddUsageHeadersToContext.
+func ProxyType() string {
+	return proxyType
+}
+
+func CollectionFromRPCContext(ctx context.Context) *Collection {
+	groupID := interfaces.AuthAnonymousUser
+	if claims, err := claims.ClaimsFromContext(ctx); err == nil {
+		groupID = claims.GetGroupID()
+	}
+	c := &Collection{
+		GroupID: groupID,
+		Server:  ServerName(),
+		Client:  clientLabel(ctx),
+		Origin:  originLabel(ctx),
+		Proxy:   ProxyType(),
+	}
+	return c
+}
+
+func AddUsageHeadersToContext(ctx context.Context, client string, origin string, proxy string) context.Context {
+	if client != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, ClientHeaderName, client)
+	}
+	if origin != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, OriginHeaderName, origin)
+	}
+	if proxy != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, ProxyHeaderName, proxy)
+	}
+	return ctx
 }
 
 func originLabel(ctx context.Context) string {
-	vals := metadata.ValueFromIncomingContext(ctx, "x-buildbuddy-origin")
+	vals := metadata.ValueFromIncomingContext(ctx, OriginHeaderName)
 	if len(vals) == 0 {
 		return ""
 	}
@@ -71,7 +165,7 @@ func originLabel(ctx context.Context) string {
 }
 
 func clientLabel(ctx context.Context) string {
-	vals := metadata.ValueFromIncomingContext(ctx, "x-buildbuddy-client")
+	vals := metadata.ValueFromIncomingContext(ctx, ClientHeaderName)
 	if len(vals) > 0 {
 		return vals[0]
 	}
@@ -80,4 +174,136 @@ func clientLabel(ctx context.Context) string {
 		return bazelClientLabel
 	}
 	return ""
+}
+
+func proxyLabel(ctx context.Context) string {
+	vals := metadata.ValueFromIncomingContext(ctx, ProxyHeaderName)
+	if len(vals) == 0 {
+		return ""
+	}
+	// The proxy label is read from an untrusted incoming header but feeds into
+	// usage/billing labels, so only let known proxy types through. Record any
+	// other value as "unknown" rather than passing it through.
+	switch vals[0] {
+	case sku.ProxyBuildBuddy, sku.ProxyCustomer:
+		return vals[0]
+	default:
+		return sku.ProxyUnknown
+	}
+}
+
+// A Collection consists of all of the fields that we currently use to identify
+// different types of usage--these fields are ultimately written out to the
+// `Usages` table as `UsageLabels`, where they determine cost bucketing.
+// See documentation on `UsageLabels` for an explanation of each field.
+type Collection struct {
+	// TODO: maybe make GroupID a field of tables.UsageLabels.
+	GroupID string
+	Origin  string
+	Server  string
+	Client  string
+	Proxy   string
+}
+
+func (c *Collection) UsageLabels() *tables.UsageLabels {
+	return &tables.UsageLabels{
+		Origin: c.Origin,
+		Client: c.Client,
+		Server: c.Server,
+		Proxy:  c.Proxy,
+	}
+}
+
+// EncodeCollection encodes the collection to a human readable format.
+func EncodeCollection(c *Collection) string {
+	// Using a handwritten encoding scheme for performance reasons (this
+	// runs on every cache request).
+	s := "group_id=" + c.GroupID
+	if c.Origin != "" {
+		s += "&origin=" + url.QueryEscape(c.Origin)
+	}
+	if c.Client != "" {
+		s += "&client=" + url.QueryEscape(c.Client)
+	}
+	if c.Server != "" {
+		s += "&server=" + url.QueryEscape(c.Server)
+	}
+	if c.Proxy != "" {
+		s += "&proxy=" + url.QueryEscape(c.Proxy)
+	}
+	return s
+}
+
+// DecodeCollection decodes a string encoded using encodeCollection.
+// It returns the raw url.Values so that apps can detect collections encoded
+// by newer apps.
+func DecodeCollection(s string) (*Collection, url.Values, error) {
+	q, err := url.ParseQuery(s)
+	if err != nil {
+		return nil, nil, err
+	}
+	c := &Collection{
+		GroupID: q.Get("group_id"),
+		Origin:  q.Get("origin"),
+		Client:  q.Get("client"),
+		Server:  q.Get("server"),
+		Proxy:   q.Get("proxy"),
+	}
+	return c, q, nil
+}
+
+// OLAPCollection consists of all of the fields that we currently use to
+// identify different types of usage. These fields are ultimately written out to
+// the `RawUsage` table, where they determine cost bucketing.
+type OLAPCollection struct {
+	GroupID string
+	Labels  map[sku.LabelName]sku.LabelValue
+}
+
+// EncodeOLAPCollection encodes the OLAP collection to a deterministic string.
+// The encoding is human-readable and uses sorted label keys for determinism.
+// Format: "group_id=X&label=key1=val1&label=key2=val2..." (labels are
+// encoded as repeated "label" parameters with key=value format).
+func EncodeOLAPCollection(c *OLAPCollection) string {
+	var b strings.Builder
+	b.WriteString("group_id=" + url.QueryEscape(c.GroupID))
+
+	if len(c.Labels) > 0 {
+		// Sort label keys for deterministic encoding
+		keys := make([]string, 0, len(c.Labels))
+		for k := range c.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			b.WriteString("&label=" + url.QueryEscape(k) + "=" + url.QueryEscape(c.Labels[k]))
+		}
+	}
+
+	return b.String()
+}
+
+// DecodeOLAPCollection decodes a string encoded using EncodeOLAPCollection.
+// Labels are expected in the format "label=key=value".
+func DecodeOLAPCollection(s string) (*OLAPCollection, error) {
+	q, err := url.ParseQuery(s)
+	if err != nil {
+		return nil, err
+	}
+	c := &OLAPCollection{
+		GroupID: q.Get("group_id"),
+	}
+	// Parse labels from "label" params (format: "key=value")
+	for _, labelParam := range q["label"] {
+		key, value, found := strings.Cut(labelParam, "=")
+		if !found {
+			continue
+		}
+		if c.Labels == nil {
+			c.Labels = make(map[sku.LabelName]sku.LabelValue)
+		}
+		c.Labels[key] = value
+	}
+	return c, nil
 }

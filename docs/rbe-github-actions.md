@@ -78,6 +78,15 @@ Add your BuildBuddy API Key as GitHub Secret named `BUILDBUDDY_ORG_API_KEY`. For
 
 If you'd like BuildBuddy to publish commit statuses to your repo, you can do so by [logging in](https://app.buildbuddy.io) and clicking `Link Github Account` in the user menu in the top right.
 
+By default, each status is named after its Bazel command and target pattern. You can assign a name that matches the logical GitHub Actions step with build metadata:
+
+```yaml
+- name: Run unit tests
+  run: bazel test //... --config=ci --build_metadata=COMMIT_STATUS_LABEL="Unit tests"
+```
+
+To keep a Bazel invocation from publishing a BuildBuddy status, set `--build_metadata=DISABLE_COMMIT_STATUS_REPORTING=true`. This only disables the status reported by BuildBuddy, not the GitHub Actions job status.
+
 ### Visibility
 
 By default, authenticated builds are only visible to members of your BuildBuddy organization. If you'd like your BuildBuddy results pages to be visible to members outside of your organization, you can add the following line to your `.bazelrc`:
@@ -107,9 +116,8 @@ And the following lines to your `WORKSPACE` file:
 ```python title="WORKSPACE"
 http_archive(
     name = "io_buildbuddy_buildbuddy_toolchain",
-    sha256 = "747dbf28cb8b8d27b2d909aa05e00691fe6d9d8a28026e359cc4943261687592",
-    strip_prefix = "buildbuddy-toolchain-702567fd8a561ec94a0e8e7fd8aa00bb15d87b4f",
-    urls = ["https://github.com/buildbuddy-io/buildbuddy-toolchain/archive/702567fd8a561ec94a0e8e7fd8aa00bb15d87b4f.tar.gz"],
+    integrity = "sha256-5zVDos35dx9w9zmrcenyTg8tKwSg1/nUAZPLK8mo5KI=",
+    urls = ["https://github.com/buildbuddy-io/buildbuddy-toolchain/releases/download/v0.0.3/buildbuddy-toolchain-v0.0.3.tar.gz"],
 )
 
 load("@io_buildbuddy_buildbuddy_toolchain//:deps.bzl", "buildbuddy_deps")

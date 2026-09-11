@@ -10,13 +10,32 @@
 }
 
 .api-keys .error-container {
-  background: #ffcdd2;
+  background: var(--color-banner-error-bg);
+  color: var(--color-banner-error-text);
   padding: 16px;
   border-radius: 8px;
 }
 
 .api-keys .api-keys-list {
   padding: 8px 0;
+  /* Tracks: label | capabilities | value | edit | delete. Rows are subgrids
+   * so columns stay aligned across keys; tracks whose cells aren't rendered
+   * collapse to zero width. */
+  display: grid;
+  grid-template-columns: minmax(224px, max-content) repeat(4, max-content);
+  overflow-x: auto;
+}
+
+.api-keys .api-key-created-banner-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.api-keys .api-key-created-value-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
 }
 
 .api-keys .api-keys-list > :not(:last-child) {
@@ -24,69 +43,53 @@
 }
 
 .api-keys .api-key-list-item {
-  display: flex;
-  align-items: baseline;
-  min-height: 40px;
-}
-
-.api-keys .api-key-list-item button {
-  flex-shrink: 0;
-}
-
-.api-keys .api-key-label,
-.api-keys .api-key-capabilities {
-  display: flex;
-  align-self: stretch;
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
   align-items: center;
+  min-height: 40px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eee;
 }
 
 .api-keys .api-key-label {
   font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow-x: hidden;
 }
 
 .api-keys .api-key-capabilities {
   white-space: nowrap;
-  overflow-x: hidden;
+}
+
+.api-keys .api-key-creation-details {
+  /* Own row spanning the full width, so the rest of the key's details stay
+   * inline with the label. The width/min-width pair keeps the text from
+   * contributing to the max-content width of any column it spans. */
+  grid-row: 2;
+  grid-column: 1 / -1;
   width: 0;
-  max-width: 192px;
-  flex-basis: 192px;
-  flex-shrink: 0;
+  min-width: 100%;
+  margin-right: 0;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 20px;
+  color: var(--color-text-emphasis);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .api-keys .untitled-key {
   color: #757575;
 }
 
-.api-keys .api-key-label,
-.api-keys .api-key-value {
-  width: 0;
-  display: flex;
-}
-
-.api-keys .api-key-label {
-  flex-basis: 224px;
-  flex-grow: 1;
-  flex-shrink: 1;
-}
-
 .api-keys .api-key-value {
   box-sizing: border-box;
-  width: fit-content;
-  flex-shrink: 0;
-}
-
-.api-keys .api-key-label > span {
-  flex-grow: 1;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  text-align: left;
-  overflow-x: hidden;
-}
-
-.api-keys .api-key-value {
   font-family: monospace;
   font-size: 12px;
-  background: #eee;
+  background: var(--color-bg-code);
+  color: var(--color-text-primary);
   border-radius: 8px;
   padding-left: 16px;
   padding-right: 4px;
@@ -122,12 +125,6 @@
   margin-right: 0px;
 }
 
-.api-keys .api-key-list-item {
-  padding-bottom: 8px;
-  border-bottom: 1px solid #eee;
-  max-width: 816px;
-}
-
 .api-keys .api-key-list-item > :not(:last-child) {
   margin-right: 8px;
 }
@@ -150,8 +147,13 @@
   align-items: center;
 }
 
+/* Make the disabled state more obvious in Firefox by dimming the entire row. */
+.api-keys-form .checkbox-row:has(input:disabled) {
+  opacity: 0.5;
+}
+
 .api-keys-form .field-description {
-  color: #444;
+  color: var(--color-text-emphasis);
 }
 
 .api-keys-form label {
@@ -180,7 +182,12 @@
 }
 
 .api-keys .no-api-keys-message {
-  background: #e1f5fe;
+  background: var(--color-banner-info-bg);
+  color: var(--color-banner-info-text);
   padding: 16px;
   border-radius: 8px;
+  /* Span all list columns and wrap instead of widening the grid. */
+  grid-column: 1 / -1;
+  max-width: 800px;
+  box-sizing: border-box;
 }

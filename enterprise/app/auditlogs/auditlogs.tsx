@@ -1,27 +1,26 @@
+import { startOfTomorrow } from "date-fns";
 import React from "react";
-import moment from "moment";
-import rpcService from "../../../app/service/rpc_service";
-import { auditlog } from "../../../proto/auditlog_ts_proto";
-import * as proto from "../../../app/util/proto";
-import { formatDate, formatDateRange } from "../../../app/format/format";
-import Button, { OutlinedButton } from "../../../app/components/button/button";
-import { Calendar } from "lucide-react";
-import Popup from "../../../app/components/popup/popup";
-import { DateRangePicker, Range, RangeKeyDict } from "react-date-range";
-import error_service from "../../../app/errors/error_service";
-import Spinner from "../../../app/components/spinner/spinner";
 import { User } from "../../../app/auth/user";
+import Breadcrumbs from "../../../app/components/breadcrumbs/breadcrumbs";
+import Button from "../../../app/components/button/button";
+import Spinner from "../../../app/components/spinner/spinner";
+import error_service from "../../../app/errors/error_service";
+import { formatDate } from "../../../app/format/format";
+import rpcService from "../../../app/service/rpc_service";
+import * as proto from "../../../app/util/proto";
+import { auditlog } from "../../../proto/auditlog_ts_proto";
+import DateRangePickerButton from "../filter/date_range_picker_button";
+import { getEndDate, getStartDate } from "../filter/filter_util";
 import Action = auditlog.Action;
 
 interface AuditLogsComponentProps {
   user: User;
+  search: URLSearchParams;
 }
 interface State {
   loading: boolean;
   entries: auditlog.Entry[];
   nextPageToken: string;
-  isDatePickerOpen: boolean;
-  dateRange: Range;
 }
 
 export default class AuditLogsComponent extends React.Component<AuditLogsComponentProps, State> {
@@ -29,28 +28,24 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
     loading: false,
     entries: [],
     nextPageToken: "",
-    isDatePickerOpen: false,
-    dateRange: {
-      startDate: new Date(),
-      endDate: new Date(),
-      key: "selection",
-    },
   };
 
   componentDidMount() {
     document.title = "Audit logs | BuildBuddy";
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const dateRange: Range = { startDate: today, endDate: today, key: "selection" };
-    this.setState({ dateRange: dateRange });
-    this.fetchAuditLogs(dateRange);
+    this.fetchAuditLogs();
   }
 
-  async fetchAuditLogs(dateRange: Range) {
-    // Default start time to the midnight today, local time.
-    const start = dateRange.startDate ?? moment().startOf("day").toDate();
-    // Default end time to the end of today, local time (regardless of start date).
-    const end = this.getRealEndTime(dateRange.endDate);
+  componentDidUpdate(prevProps: AuditLogsComponentProps) {
+    if (prevProps.search.toString() !== this.props.search.toString()) {
+      this.setState({ nextPageToken: "" }, () => this.fetchAuditLogs());
+    }
+  }
+
+  async fetchAuditLogs() {
+    const start = getStartDate(this.props.search);
+    // Default the end time to the start of tomorrow, local time, so that the
+    // range includes all of today.
+    const end = getEndDate(this.props.search) ?? startOfTomorrow();
     let req = auditlog.GetAuditLogsRequest.create({
       pageToken: this.state.nextPageToken,
       timestampAfter: proto.dateToTimestamp(start),
@@ -77,7 +72,7 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
 
   onClickLoadMore() {
     this.setState({ loading: true });
-    this.fetchAuditLogs(this.state.dateRange).then(() => {
+    this.fetchAuditLogs().then(() => {
       this.setState({ loading: false });
     });
   }
@@ -125,6 +120,9 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
       case auditlog.ResourceType.IP_RULE:
         res = "IP Rule";
         break;
+      case auditlog.ResourceType.USER_LIST:
+        res = "IAM Group";
+        break;
     }
     return (
       <>
@@ -163,6 +161,8 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
         return "Update IP Rules Config";
       case Action.INVALIDATE_VM_SNAPSHOT:
         return "Invalidate VM Snapshot";
+      case Action.UPDATE_SSO_CONFIG:
+        return "Update SSO Config";
     }
     return "";
   }
@@ -186,6 +186,13 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
         }
       }
     }
+    if (request.apiRequest.updateUserListMembership) {
+      for (const update of request.apiRequest.updateUserListMembership.update) {
+        if (update.userId?.id && idDescriptors.has(update.userId.id)) {
+          update.userId.id += " (" + idDescriptors.get(update.userId.id) + ")";
+        }
+      }
+    }
 
     let obj = request.apiRequest.toJSON();
     let vals = Object.values(obj);
@@ -202,69 +209,22 @@ export default class AuditLogsComponent extends React.Component<AuditLogsCompone
     return lines.slice(1, lines.length - 1).join("\n");
   }
 
-  private onOpenDatePicker() {
-    this.setState({ isDatePickerOpen: true });
-  }
-  private onCloseDatePicker() {
-    this.setState({ isDatePickerOpen: false });
-  }
-
-  private onDateChange(range: RangeKeyDict) {
-    let dateRange = range.selection;
-    this.setState({ dateRange: dateRange, nextPageToken: "" });
-    this.fetchAuditLogs(dateRange);
-  }
-
-  // We let the date picker say that the end of a date range is "2024-10-02"
-  // when what we really mean is "midnight 2024-10-03, exclusive".  This
-  // function does that conversion.
-  private getRealEndTime(endDate?: Date): Date {
-    return moment(endDate ?? new Date())
-      .add(1, "day")
-      .startOf("day")
-      .toDate();
-  }
-
   render() {
     return (
       <div className="audit-logs-page">
         <div className="shelf">
           <div className="container">
-            <div className="breadcrumbs">
-              <span>{this.props.user.selectedGroupName()}</span>
+            <div className="top-bar">
+              <Breadcrumbs>
+                <span>{this.props.user.selectedGroupName()}</span>
+              </Breadcrumbs>
+              <DateRangePickerButton search={this.props.search} />
             </div>
             <div className="title">Audit logs</div>
           </div>
         </div>
         <div className="container">
           <div className="audit-logs">
-            <div className="popup-wrapper">
-              <OutlinedButton
-                className="date-picker-button icon-text-button"
-                onClick={this.onOpenDatePicker.bind(this)}>
-                <Calendar className="icon" />
-                <span>
-                  {formatDateRange(this.state.dateRange.startDate!, this.getRealEndTime(this.state.dateRange.endDate))}
-                </span>
-              </OutlinedButton>
-              <Popup
-                anchor="left"
-                isOpen={this.state.isDatePickerOpen}
-                onRequestClose={this.onCloseDatePicker.bind(this)}
-                className="date-picker-popup">
-                <DateRangePicker
-                  ranges={[this.state.dateRange]}
-                  onChange={this.onDateChange.bind(this)}
-                  // Disable textbox inputs, like "days from today", or "days until today".
-                  inputRanges={[]}
-                  editableDateInputs
-                  color="#212121"
-                  rangeColors={["#212121"]}
-                  startDatePlaceholder="Start date"
-                  endDatePlaceholder="End date"
-                />
-              </Popup>
-            </div>
             {this.state.entries.length == 0 && (
               <div className="empty-state">There are no audit logs in the specified time range.</div>
             )}

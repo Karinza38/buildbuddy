@@ -1,0 +1,49 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "annotations",
+    srcs = [
+        "annotations.go",
+        "cpp.go",
+        "golang.go",
+        "java.go",
+        "nav.go",
+        "python.go",
+        "rust.go",
+        "typescript.go",
+    ],
+    importpath = "github.com/buildbuddy-io/buildbuddy/codesearch/annotations",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//codesearch/indexprofile",
+        "@com_github_smacker_go_tree_sitter//:go-tree-sitter",
+        "@com_github_smacker_go_tree_sitter//c",
+        "@com_github_smacker_go_tree_sitter//cpp",
+        "@com_github_smacker_go_tree_sitter//golang",
+        "@com_github_smacker_go_tree_sitter//java",
+        "@com_github_smacker_go_tree_sitter//javascript",
+        "@com_github_smacker_go_tree_sitter//python",
+        "@com_github_smacker_go_tree_sitter//rust",
+        "@com_github_smacker_go_tree_sitter//typescript/tsx",
+        "@com_github_smacker_go_tree_sitter//typescript/typescript",
+        "@org_golang_x_mod//modfile",
+    ],
+)
+
+go_test(
+    name = "annotations_test",
+    srcs = [
+        "annotations_test.go",
+        "cpp_test.go",
+        "nav_test.go",
+        "nav_ts_test.go",
+        "python_test.go",
+        "rust_test.go",
+        "typescript_test.go",
+    ],
+    embed = [":annotations"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

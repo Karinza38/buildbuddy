@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,20 +17,41 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/vsock"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
+	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/networking"
+	"github.com/buildbuddy-io/buildbuddy/server/util/retry"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/elastic/gosigar"
+	"github.com/miekg/dns"
 	"github.com/tklauser/go-sysconf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
 
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
 	vmxpb "github.com/buildbuddy-io/buildbuddy/proto/vmexec"
+	hlpb "google.golang.org/grpc/health/grpc_health_v1"
 	gstatus "google.golang.org/grpc/status"
 )
 
+const (
+	dockerdInitTimeout       = 30 * time.Second
+	dockerdDefaultSocketPath = "/var/run/docker.sock"
+
+	vmDNSInitTimeout                   = 5 * time.Second
+	vmExecReadySignalInitialRetryDelay = 2 * time.Millisecond
+	vmExecReadySignalMaxRetryDelay     = 1 * time.Second
+)
+
 func init() {
+	// Record the process start time as early as possible; init() runs before
+	// any of main's code, so this is as close to actual process start as we
+	// can easily get.
+	processStartTime = time.Now()
+
 	clktck, err := sysconf.Sysconf(sysconf.SC_CLK_TCK)
 	if err != nil {
 		// Treat this as a fatal error because we could potentially report
@@ -57,15 +79,162 @@ const (
 var (
 	// Number of CPU ticks per second - used for CPU usage stats.
 	ticksPerSec int64
+
+	// The time at which this process started, recorded in init().
+	processStartTime time.Time
 )
 
 type execServer struct {
 	// workspaceDevice is the path to the hot-swappable workspace block device.
 	workspaceDevice string
+
+	// metrics holds metrics about this VM, and is returned from every Exec.
+	metrics *vmxpb.Metrics
 }
 
 func NewServer(workspaceDevice string) (*execServer, error) {
-	return &execServer{workspaceDevice}, nil
+	return &execServer{
+		workspaceDevice: workspaceDevice,
+		metrics:         &vmxpb.Metrics{},
+	}, nil
+}
+
+func Run(ctx context.Context, port uint32, workspaceDevice string, initDockerd bool, enableDockerdTCP bool, dnsOverrides []*networking.DNSOverride) error {
+	listener, err := vsock.NewGuestListener(ctx, port)
+	if err != nil {
+		return err
+	}
+	log.Infof("Starting vm exec listener on vsock port: %d", port)
+	// 50MB - matches the default from grpc_server.MaxRecvMsgSizeBytes() at the time of writing,
+	// but does not need to be kept in sync (this value should be fine for vmexec's purposes)
+	// Inlined here to avoid pulling in the heavy grpc_server package and
+	// all of its transitive deps into the goinit binary.
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(50_000_000))
+
+	vmService, err := NewServer(workspaceDevice)
+	if err != nil {
+		return err
+	}
+	vmxpb.RegisterExecServer(server, vmService)
+	hc := healthcheck.NewHealthChecker("vmexec")
+	// For now, don't register any explicit health checks; if we can ping the
+	// health check service at all (within a short timeframe) then assume all is
+	// well.
+	hlpb.RegisterHealthServer(server, hc)
+
+	// If applicable, wait for dockerd to start before accepting commands, so
+	// that commands depending on dockerd do not need to explicitly wait for it.
+	if initDockerd {
+		start := time.Now()
+		if err := waitForDockerd(ctx, enableDockerdTCP); err != nil {
+			return err
+		}
+		vmService.metrics.DockerdWaitDurationUsec = time.Since(start).Microseconds()
+	}
+
+	// If applicable, wait for the local DNS server to initialize before accepting
+	// commands on the vmExec server, to guarantee DNS requests are handled
+	// correctly.
+	if len(dnsOverrides) > 0 {
+		start := time.Now()
+		if err := waitForVMDNS(ctx, dnsOverrides); err != nil {
+			return err
+		}
+		vmService.metrics.VmDnsWaitDurationUsec = time.Since(start).Microseconds()
+	}
+
+	vmService.metrics.VmExecInitDurationUsec = time.Since(processStartTime).Microseconds()
+	go maintainVMExecReadySignal(ctx)
+	return server.Serve(listener)
+}
+
+// maintainVMExecReadySignal tells the host that vmexec is ready, then keeps the
+// connection open. Firecracker resets vsock connections across snapshot
+// restore, so the read below unblocks in a restored guest and causes it to
+// reconnect and send a fresh readiness signal.
+func maintainVMExecReadySignal(ctx context.Context) {
+	r := retry.New(ctx, &retry.Options{
+		InitialBackoff: vmExecReadySignalInitialRetryDelay,
+		MaxBackoff:     vmExecReadySignalMaxRetryDelay,
+		Multiplier:     2,
+		MaxRetries:     math.MaxInt,
+	})
+	for r.Next() {
+		conn, err := vsock.DialGuestToHost(vsock.HostVMExecReadyPort)
+		if err == nil {
+			_, err = io.WriteString(conn, vsock.VMExecReadyMessage)
+		}
+		if err == nil {
+			log.Debugf("Signaled vmexec readiness to host")
+			r.Reset()
+			// The host deliberately sends no data. This read returns when the
+			// connection is reset, including after snapshot restore.
+			var buf [1]byte
+			for err == nil && ctx.Err() == nil {
+				_, err = conn.Read(buf[:])
+			}
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func waitForDockerd(ctx context.Context, enableDockerdTCP bool) error {
+	ctx, cancel := context.WithTimeout(ctx, dockerdInitTimeout)
+	defer cancel()
+	r := retry.New(ctx, &retry.Options{
+		InitialBackoff: 10 * time.Microsecond,
+		MaxBackoff:     100 * time.Millisecond,
+		Multiplier:     1.5,
+		MaxRetries:     math.MaxInt, // retry until context deadline
+	})
+	for r.Next() {
+		args := []string{}
+		if enableDockerdTCP {
+			args = append(args, "--host=tcp://127.0.0.1:2375")
+		}
+		args = append(args, "ps")
+		err := exec.CommandContext(ctx, "docker", args...).Run()
+		if err == nil {
+			log.Infof("dockerd is ready")
+			return nil
+		}
+	}
+	return status.DeadlineExceededErrorf("docker init timed out after %s", dockerdInitTimeout)
+}
+
+// Wait for the local DNS server to accept requests.
+func waitForVMDNS(ctx context.Context, dnsOverrides []*networking.DNSOverride) error {
+	if len(dnsOverrides) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, vmDNSInitTimeout)
+	defer cancel()
+
+	// Check that you can query the local DNS server for an overwritten hostname.
+	c := &dns.Client{
+		Timeout: 200 * time.Millisecond,
+	}
+	override := dnsOverrides[0]
+	m := new(dns.Msg)
+	m.SetQuestion(override.HostnameToOverride, dns.TypeA)
+
+	r := retry.New(ctx, &retry.Options{
+		InitialBackoff: 10 * time.Microsecond,
+		MaxBackoff:     200 * time.Millisecond,
+		Multiplier:     1.5,
+		MaxRetries:     math.MaxInt, // retry until context deadline
+	})
+	for r.Next() {
+		r, _, err := c.Exchange(m, "127.0.0.1:53")
+		if err == nil && r.Rcode == dns.RcodeSuccess {
+			log.Info("local DNS server is ready")
+			return nil
+		}
+	}
+	return status.DeadlineExceededErrorf("polling local DNS server timed out after %s", vmDNSInitTimeout)
 }
 
 func clearARPCache() error {
@@ -222,6 +391,7 @@ func (x *execServer) Exec(ctx context.Context, req *vmxpb.ExecRequest) (*vmxpb.E
 	rsp.Status = gstatus.Convert(err).Proto()
 	rsp.Stdout = stdoutBuf.Bytes()
 	rsp.Stderr = stderrBuf.Bytes()
+	rsp.Metrics = x.metrics
 	return rsp, nil
 }
 
@@ -289,6 +459,9 @@ func (x *execServer) ExecStreamed(stream vmxpb.Exec_ExecStreamedServer) error {
 					if err != nil {
 						msgs <- &message{Err: err}
 						return
+					}
+					if res.GetResponse() != nil {
+						res.Response.Metrics = x.metrics
 					}
 					msgs <- &message{Response: res}
 				}()

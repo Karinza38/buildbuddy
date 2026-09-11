@@ -1,9 +1,9 @@
+import { AlertCircle, CheckCircle, Clock, Package, RotateCw, XCircle } from "lucide-react";
 import React from "react";
 import { execution_stats } from "../../proto/execution_stats_ts_proto";
 import { google as google_grpc } from "../../proto/grpc_code_ts_proto";
-import { google as google_ts } from "../../proto/timestamp_ts_proto";
 import { build } from "../../proto/remote_execution_ts_proto";
-import { RotateCw, Package, Clock, AlertCircle, XCircle, CheckCircle } from "lucide-react";
+import { google as google_ts } from "../../proto/timestamp_ts_proto";
 import { digestToString } from "../util/cache";
 
 const ExecutionStage = build.bazel.remote.execution.v2.ExecutionStage;
@@ -13,10 +13,10 @@ const GRPC_STATUS_LABEL_BY_CODE: Record<number, string> = Object.fromEntries(
 );
 
 const STATUSES_BY_STAGE: Record<number, ExecutionStatus> = {
-  [ExecutionStage.Value.UNKNOWN]: { name: "Starting", icon: <RotateCw className="icon blue rotating" /> },
-  [ExecutionStage.Value.CACHE_CHECK]: { name: "Cache check", icon: <Package className="icon brown" /> },
-  [ExecutionStage.Value.QUEUED]: { name: "Queued", icon: <Clock className="icon" /> },
-  [ExecutionStage.Value.EXECUTING]: { name: "Executing", icon: <RotateCw className="icon blue rotating" /> },
+  [ExecutionStage.Value.UNKNOWN]: { name: "Starting", icon: <RotateCw className="blue rotating" /> },
+  [ExecutionStage.Value.CACHE_CHECK]: { name: "Cache check", icon: <Package className="brown" /> },
+  [ExecutionStage.Value.QUEUED]: { name: "Queued", icon: <Clock /> },
+  [ExecutionStage.Value.EXECUTING]: { name: "Executing", icon: <RotateCw className="blue rotating" /> },
   // COMPLETED is not included here because it depends on the gRPC status and exit code.
 };
 
@@ -33,26 +33,30 @@ export function getExecutionStatus(execution: execution_stats.Execution): Execut
         name: `Error (${
           execution.status?.code ? GRPC_STATUS_LABEL_BY_CODE[execution.status.code] || "UNKNOWN" : "UNKNOWN"
         })`,
-        icon: <AlertCircle className="icon red" />,
+        icon: <AlertCircle className="red" />,
       };
     }
     if (execution.exitCode !== 0) {
       return {
         name: `Failed (exit code ${execution.exitCode})`,
-        icon: <XCircle className="icon red" />,
+        icon: <XCircle className="red" />,
       };
     }
-    return { name: "Succeeded", icon: <CheckCircle className="icon green" /> };
+    return { name: "Succeeded", icon: <CheckCircle className="green" /> };
   }
 
   return STATUSES_BY_STAGE[execution.stage];
+}
+
+function isZeroTimestamp(ts: google_ts.protobuf.ITimestamp) {
+  return !ts.seconds && !ts.nanos;
 }
 
 export function subtractTimestamp(
   timestampA?: google_ts.protobuf.ITimestamp | null,
   timestampB?: google_ts.protobuf.ITimestamp | null
 ) {
-  if (!timestampA || !timestampB) return NaN;
+  if (!timestampA || !timestampB || isZeroTimestamp(timestampA) || isZeroTimestamp(timestampB)) return NaN;
   let microsA = +(timestampA.seconds ?? 0) * 1000000 + +(timestampA.nanos ?? 0) / 1000;
   let microsB = +(timestampB.seconds ?? 0) * 1000000 + +(timestampB.nanos ?? 0) / 1000;
   return microsA - microsB;
@@ -62,6 +66,13 @@ export function totalDuration(execution: execution_stats.IExecution) {
   return subtractTimestamp(
     execution?.executedActionMetadata?.workerCompletedTimestamp,
     execution?.executedActionMetadata?.queuedTimestamp
+  );
+}
+
+export function workerDuration(execution: execution_stats.IExecution) {
+  return subtractTimestamp(
+    execution?.executedActionMetadata?.workerCompletedTimestamp,
+    execution?.executedActionMetadata?.workerStartTimestamp
   );
 }
 

@@ -36,7 +36,8 @@ var (
 	useTimezoneInHeatmapQueries    = flag.Bool("app.use_timezone_in_heatmap_queries", true, "If enabled, use timezone instead of 'timezone offset' to compute day boundaries in heatmap queries.")
 	invocationSummaryAvailableUsec = flag.Int64("app.invocation_summary_available_usec", 0, "The timstamp when the invocation summary is available in the DB")
 	tagsInDrilldowns               = flag.Bool("app.fetch_tags_drilldown_data", true, "If enabled, DrilldownType_TAG_DRILLDOWN_TYPE can be returned in GetStatDrilldownRequests")
-	finerTimeBuckets               = flag.Bool("app.finer_time_buckets", false, "If enabled, split trends and drilldowns into smaller time buckets when the user has a smaller date range selected.")
+	finerTimeBuckets               = flag.Bool("app.finer_time_buckets", true, "If enabled, split trends and drilldowns into smaller time buckets when the user has a smaller date range selected.")
+	targetTrendsEnabled            = flag.Bool("app.enable_target_trends", true, "Enables GetTargetTrends, which returns execution data aggregated by Bazel target.")
 )
 
 type InvocationStatService struct {
@@ -236,9 +237,9 @@ func (i *InvocationStatService) getTrendTimeSettings(tq *stpb.TrendQuery, timezo
 	}
 }
 
-func (i *InvocationStatService) getTrendBasicQuery(tq *stpb.TrendQuery, timeSettings *trendTimeSettings, timezoneOffsetMinutes int32) (string, []interface{}) {
+func (i *InvocationStatService) getTrendBasicQuery(tq *stpb.TrendQuery, timeSettings *trendTimeSettings, timezoneOffsetMinutes int32) (string, []any) {
 	var q string
-	var qArgs []interface{}
+	var qArgs []any
 	if i.isOLAPDBEnabled() {
 		if i.finerTimeBucketsEnabled() {
 			bucketStr, bucketArgs := i.olapdbh.BucketFromUsecTimestamp("updated_at_usec", timeSettings.location, timeSettings.interval.ClickhouseInterval())
@@ -509,18 +510,18 @@ func (i *InvocationStatService) getInvocationTrend(ctx context.Context, req *stp
 	return res, nil
 }
 
-func (i *InvocationStatService) getExecutionTrendQuery(timeSettings *trendTimeSettings, timezoneOffsetMinutes int32) (string, []interface{}) {
+func (i *InvocationStatService) getExecutionTrendQuery(timeSettings *trendTimeSettings, timezoneOffsetMinutes int32) (string, []any) {
 	if !i.finerTimeBucketsEnabled() {
 		return fmt.Sprintf("SELECT %s as name,", i.olapdbh.DateFromUsecTimestamp("updated_at_usec", timezoneOffsetMinutes)) + `
-		quantilesExactExclusive(0.5, 0.75, 0.9, 0.95, 0.99)(IF(worker_start_timestamp_usec > queued_timestamp_usec, worker_start_timestamp_usec - queued_timestamp_usec, 0)) AS queue_duration_usec_quantiles,
+		quantilesExactExclusive(0.5, 0.75, 0.9, 0.95, 0.99)(IF(worker_start_timestamp_usec > queued_timestamp_usec AND queued_timestamp_usec > 0, worker_start_timestamp_usec - queued_timestamp_usec, 0)) AS queue_duration_usec_quantiles,
 		SUM(GREATEST(COALESCE(worker_completed_timestamp_usec - worker_start_timestamp_usec, 0), 0)) as total_build_time_usec
-		FROM "Executions"`, make([]interface{}, 0)
+		FROM "Executions"`, make([]any, 0)
 	}
 
 	bucketStr, bucketArgs := i.olapdbh.BucketFromUsecTimestamp("updated_at_usec", timeSettings.location, timeSettings.interval.ClickhouseInterval())
 
 	return fmt.Sprintf("SELECT %s as bucket_start_time_micros,", bucketStr) + `
-	quantilesExactExclusive(0.5, 0.75, 0.9, 0.95, 0.99)(IF(worker_start_timestamp_usec > queued_timestamp_usec, worker_start_timestamp_usec - queued_timestamp_usec, 0)) AS queue_duration_usec_quantiles,
+	quantilesExactExclusive(0.5, 0.75, 0.9, 0.95, 0.99)(IF(worker_start_timestamp_usec > queued_timestamp_usec AND queued_timestamp_usec > 0, worker_start_timestamp_usec - queued_timestamp_usec, 0)) AS queue_duration_usec_quantiles,
 	SUM(GREATEST(COALESCE(worker_completed_timestamp_usec - worker_start_timestamp_usec, 0), 0)) as total_build_time_usec
 	FROM "Executions"
 	`, bucketArgs
@@ -535,9 +536,9 @@ func (i *InvocationStatService) getExecutionTrendQuery(timeSettings *trendTimeSe
 // The returned "flattened" query will return row with the following column
 //
 //	name | p50 | ... | p99
-func getQueryWithFlattenedArray(innerQuery string) string {
+func getQueryWithFlattenedArray(innerQuery string, finerTimeBucketsEnabled bool) string {
 	var q string
-	if *finerTimeBuckets {
+	if finerTimeBucketsEnabled {
 		q = "SELECT bucket_start_time_micros,"
 	} else {
 		q = "SELECT name,"
@@ -562,14 +563,14 @@ func (i *InvocationStatService) getExecutionTrend(ctx context.Context, req *stpb
 	if err := i.addWhereClauses(q, req.GetQuery(), true, req.GetRequestContext()); err != nil {
 		return nil, err
 	}
-	if *finerTimeBuckets {
+	if i.finerTimeBucketsEnabled() {
 		q.SetGroupBy("bucket_start_time_micros")
 	} else {
 		q.SetGroupBy("name")
 	}
 
 	qStr, qArgs := q.Build()
-	qStr = getQueryWithFlattenedArray(qStr)
+	qStr = getQueryWithFlattenedArray(qStr, i.finerTimeBucketsEnabled())
 	rq := i.olapdbh.NewQuery(ctx, "invocation_stat_service_trends").Raw(qStr, qArgs...)
 	res, err := db.ScanAll(rq, &stpb.ExecutionStat{})
 	if err != nil {
@@ -688,13 +689,28 @@ func getTableForMetric(metric *sfpb.Metric) string {
 	return "Invocations"
 }
 
-type MetricRange = struct {
-	Start      int64
-	BucketSize int64
-	NumBuckets int64
-}
+// maxNumMetricBuckets is the number of buckets used to split a metric's value
+// range in a heatmap. The linear scale always produces exactly this many
+// buckets; the log scale uses it as an upper bound on the number of
+// powers-of-10 buckets.
+const maxNumMetricBuckets = 20
 
-func (i *InvocationStatService) getMetricRange(ctx context.Context, table string, metric string, whereClauseStr string, whereClauseArgs []interface{}) (*MetricRange, error) {
+// If the data spans fewer than maxDecadesToSubdivideCoarsely decades, we will
+// subdivide the data into the buckets [1, 2), [2, 4), [4, 6), [6, 8), [8, 10)
+// for each decade.
+const maxDecadesToSubdivideCoarsely = 4
+
+// If the data spans fewer than maxDecadesToSubdivideFinely decades, we will
+// subdivide the data into the buckets [1, 2), [2, 3), [3, 4), etc.
+// for each decade.
+const maxDecadesToSubdivideFinely = 2
+
+var fineLogStepMultipliers = []int64{1, 2, 3, 4, 5, 6, 7, 8, 9}
+var coarseLogStepMultipliers = []int64{1, 2, 4, 6, 8}
+
+// getMetricMinMax returns the smallest and largest values of the given metric
+// matching the where clause. found is false when there are no matching rows.
+func (i *InvocationStatService) getMetricMinMax(ctx context.Context, table string, metric string, whereClauseStr string, whereClauseArgs []any) (low int64, high int64, found bool, err error) {
 	rangeQuery := fmt.Sprintf(`SELECT min(%s) as low, max(%s) as high FROM "%s" %s`, metric, metric, table, whereClauseStr)
 	rq := i.olapdbh.NewQuery(ctx, "invocation_stat_service_metric_range").Raw(rangeQuery, whereClauseArgs...)
 	valueRange := struct {
@@ -703,52 +719,157 @@ func (i *InvocationStatService) getMetricRange(ctx context.Context, table string
 	}{}
 	if err := rq.Take(&valueRange); err != nil {
 		if db.IsRecordNotFound(err) {
-			return nil, nil
+			return 0, 0, false, nil
 		}
-		return nil, err
+		return 0, 0, false, err
 	}
-	// A fun hack: make "High" value 1 higher so that we can put an exclusive
-	// limit on the upper bound of requested ranges. Each bucket is [min, max).
-	width := valueRange.High + 1 - valueRange.Low
-	var step int64
+	return valueRange.Low, valueRange.High, true, nil
+}
 
-	bucketCount := int64(20)
-	if width <= bucketCount {
+// getLinearMetricBuckets evenly divides [low, high] into maxNumMetricBuckets
+// buckets and returns the maxNumMetricBuckets+1 bucket boundaries. Each bucket
+// is [start, end).
+func getLinearMetricBuckets(low int64, high int64) []int64 {
+	// Number of distinct integer values in [low, high].
+	width := high + 1 - low
+	var step int64
+	if width <= maxNumMetricBuckets {
 		step = 1
 	} else {
-		step = width / bucketCount
-		if (width % bucketCount) != 0 {
+		step = width / maxNumMetricBuckets
+		if (width % maxNumMetricBuckets) != 0 {
 			step = step + 1
 		}
 	}
-
-	return &MetricRange{
-			Start:      valueRange.Low,
-			BucketSize: step,
-			NumBuckets: bucketCount,
-		},
-		nil
+	buckets := make([]int64, maxNumMetricBuckets+1)
+	for i := range buckets {
+		buckets[i] = low + int64(i)*step
+	}
+	return buckets
 }
 
-func (i *InvocationStatService) getMetricBuckets(ctx context.Context, table string, metric string, whereClauseStr string, whereClauseArgs []interface{}) ([]int64, string, error) {
-	metricRange, err := i.getMetricRange(ctx, table, metric, whereClauseStr, whereClauseArgs)
-	if err != nil {
-		return nil, "", err
+func trimBuckets(buckets []int64, low int64, high int64) []int64 {
+	start := 0
+	end := len(buckets) - 1
+	for i := range buckets {
+		if buckets[i] <= low {
+			start = i
+		}
+		if buckets[i] > high {
+			end = i
+			break
+		}
 	}
-	if metricRange == nil {
-		return nil, "", nil
+	return buckets[start : end+1]
+}
+
+// getLogMetricBuckets returns powers-of-10 bucket boundaries spanning
+// [low, high]. The lowest bucket is anchored at the largest power of 10 <= low,
+// and the final boundary is the smallest power of 10 strictly greater than high
+// (so high falls inside a [start, end) bucket). Our metrics are all integers,
+// and log scales can't represent values under zero, so all values in [0, 1] are
+// placed into a single bucket and values below zero are dropped.
+func getLogMetricBuckets(low int64, high int64) ([]int64, bool) {
+	hadNegativeMetricValues := low < 0
+	if low < 0 {
+		low = 0
+	}
+	if high < 0 {
+		high = 0
 	}
 
-	metricBuckets := make([]int64, metricRange.NumBuckets+1)
-	for i := range metricBuckets[:] {
-		metricBuckets[i] = metricRange.Start + int64(i)*metricRange.BucketSize
+	decadesSpanned := math.Log10(float64(high / max(low, 1)))
+	if decadesSpanned < 1 {
+		return trimBuckets(getLinearMetricBuckets(low, high), low, high), hadNegativeMetricValues
 	}
-	mStr := make([]string, metricRange.NumBuckets)
+
+	buckets := make([]int64, 0, maxNumMetricBuckets+1)
+	power := int64(1)
+	if low < 1 {
+		// Prepend a [0, 1) catch-all bucket for sub-1 (and clamped negative)
+		// values.
+		buckets = append(buckets, 0)
+	} else {
+		for power*10 <= low {
+			power *= 10
+		}
+	}
+	buckets = append(buckets, power)
+	// Append powers of 10 until we pass high. The final boundary is the
+	// exclusive top of the highest bucket. Guard against int64 overflow and cap
+	// the total number of buckets.
+	for power <= high && power <= math.MaxInt64/10 && len(buckets) <= maxNumMetricBuckets {
+		power *= 10
+		buckets = append(buckets, power)
+	}
+
+	// The number of true decade buckets, ignoring the [0, 1) catch-all bucket.
+	decadeCount := len(buckets) - 1
+	if len(buckets) > 0 && buckets[0] == 0 {
+		decadeCount--
+	}
+
+	// When the powers-of-10 scheme yields only a handful of buckets, subdivide
+	// each decade for finer resolution while still staying at or under
+	// maxNumMetricBuckets: down to single integers (1,2,...,9,10) for one or two
+	// decades, or 1-2-4-6-8-10 for up to four.
+	if decadeCount <= maxDecadesToSubdivideFinely {
+		buckets = subdivideLogBuckets(buckets, fineLogStepMultipliers)
+	} else if len(buckets)-1 <= maxDecadesToSubdivideCoarsely {
+		buckets = subdivideLogBuckets(buckets, coarseLogStepMultipliers)
+	}
+
+	// Because we take the original log_10 scale and add extra buckets, we might
+	// end up going from (10, 100) to (10, 20, 30, ... 100).  If the "low" value
+	// is 27, this means we don't actually want to return the (10, 20) interval
+	// as a bucket, so we trim that out here.
+	return trimBuckets(buckets, low, high), hadNegativeMetricValues
+}
+
+// subdivideLogBuckets replaces each powers-of-10 decade boundary 10^k with the
+// boundaries m*10^k for each m in stepMultipliers (which must start at 1). The
+// [0, 1) catch-all bucket (a leading 0 boundary) is left intact.
+func subdivideLogBuckets(buckets []int64, stepMultipliers []int64) []int64 {
+	subdivided := make([]int64, 0, len(stepMultipliers)*len(buckets))
+	for idx := 0; idx < len(buckets)-1; idx++ {
+		lo := buckets[idx]
+		if lo == 0 {
+			// The [0, 1) catch-all bucket is not subdivided.
+			subdivided = append(subdivided, 0)
+			continue
+		}
+		for _, m := range stepMultipliers {
+			subdivided = append(subdivided, m*lo)
+		}
+	}
+	// Append the final (exclusive) upper boundary.
+	subdivided = append(subdivided, buckets[len(buckets)-1])
+	return subdivided
+}
+
+func (i *InvocationStatService) getMetricBuckets(ctx context.Context, table string, metric string, whereClauseStr string, whereClauseArgs []any, logScale bool) (buckets []int64, arrayStr string, hadNegative bool, err error) {
+	low, high, found, err := i.getMetricMinMax(ctx, table, metric, whereClauseStr, whereClauseArgs)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if !found {
+		return nil, "", false, nil
+	}
+
+	if logScale {
+		buckets, hadNegative = getLogMetricBuckets(low, high)
+	} else {
+		buckets = getLinearMetricBuckets(low, high)
+	}
+
+	// The heatmap query buckets values with roundDown against the bucket starts,
+	// which are all boundaries except the final (exclusive) upper bound.
+	mStr := make([]string, len(buckets)-1)
 	for i := range mStr {
-		mStr[i] = fmt.Sprint(metricBuckets[i])
+		mStr[i] = fmt.Sprint(buckets[i])
 	}
-	metricArrayStr := "array(" + strings.Join(mStr, ",") + ")"
-	return metricBuckets, metricArrayStr, nil
+	arrayStr = "array(" + strings.Join(mStr, ",") + ")"
+	return buckets, arrayStr, hadNegative, nil
 }
 
 // Given a duration for which we are computing a heatmap, return an
@@ -842,19 +963,20 @@ func (i *InvocationStatService) getTimestampBuckets(q *stpb.TrendQuery, requestC
 }
 
 type HeatmapQueryInputs = struct {
-	PlaceholderBucketQuery string
-	TimestampBuckets       []int64
-	TimestampArrayStr      string
-	MetricBuckets          []int64
-	MetricArrayStr         string
+	PlaceholderBucketQuery  string
+	TimestampBuckets        []int64
+	TimestampArrayStr       string
+	MetricBuckets           []int64
+	MetricArrayStr          string
+	HadNegativeMetricValues bool
 }
 
-func (i *InvocationStatService) generateQueryInputs(ctx context.Context, table string, metric string, q *stpb.TrendQuery, whereClauseStr string, whereClauseArgs []interface{}, requestContext *ctxpb.RequestContext) (*HeatmapQueryInputs, error) {
+func (i *InvocationStatService) generateQueryInputs(ctx context.Context, table string, metric string, q *stpb.TrendQuery, whereClauseStr string, whereClauseArgs []any, requestContext *ctxpb.RequestContext, logScale bool) (*HeatmapQueryInputs, error) {
 	timestampBuckets, timestampArrayStr, err := i.getTimestampBuckets(q, requestContext)
 	if err != nil {
 		return nil, err
 	}
-	metricBuckets, metricArrayStr, err := i.getMetricBuckets(ctx, table, metric, whereClauseStr, whereClauseArgs)
+	metricBuckets, metricArrayStr, hadNegative, err := i.getMetricBuckets(ctx, table, metric, whereClauseStr, whereClauseArgs, logScale)
 	if err != nil {
 		return nil, err
 	}
@@ -863,7 +985,7 @@ func (i *InvocationStatService) generateQueryInputs(ctx context.Context, table s
 	}
 
 	pbq := fmt.Sprintf(`
-	  SELECT toInt64(timestamp) as timestamp, toInt64(bucket) as bucket, 0 as v FROM (
+	  SELECT toInt64(timestamp) as timestamp, toInt64(bucket) as bucket, 0 as v, 0 as t FROM (
 			SELECT arrayElement(%s, number + 1) AS timestamp FROM numbers(%d)) AS a
 		CROSS JOIN (
 			SELECT arrayElement(%s, number + 1) AS bucket FROM numbers(%d)) AS b
@@ -871,14 +993,15 @@ func (i *InvocationStatService) generateQueryInputs(ctx context.Context, table s
 		timestampArrayStr, len(timestampBuckets)-1, metricArrayStr, len(metricBuckets)-1)
 
 	return &HeatmapQueryInputs{
-		PlaceholderBucketQuery: pbq,
-		TimestampBuckets:       timestampBuckets,
-		TimestampArrayStr:      timestampArrayStr,
-		MetricBuckets:          metricBuckets,
-		MetricArrayStr:         metricArrayStr}, nil
+		PlaceholderBucketQuery:  pbq,
+		TimestampBuckets:        timestampBuckets,
+		TimestampArrayStr:       timestampArrayStr,
+		MetricBuckets:           metricBuckets,
+		MetricArrayStr:          metricArrayStr,
+		HadNegativeMetricValues: hadNegative}, nil
 }
 
-func (i *InvocationStatService) getWhereClauseForHeatmapQuery(m *sfpb.Metric, q *stpb.TrendQuery, reqCtx *ctxpb.RequestContext) (string, []interface{}, error) {
+func (i *InvocationStatService) getWhereClauseForHeatmapQuery(m *sfpb.Metric, q *stpb.TrendQuery, reqCtx *ctxpb.RequestContext) (string, []any, error) {
 	placeholderQuery := query_builder.NewQuery("")
 	if err := i.addWhereClauses(placeholderQuery, q, m.Execution != nil, reqCtx); err != nil {
 		return "", nil, err
@@ -891,10 +1014,11 @@ func (i *InvocationStatService) getWhereClauseForHeatmapQuery(m *sfpb.Metric, q 
 }
 
 type QueryAndBuckets = struct {
-	Query            string
-	QueryArgs        []interface{}
-	TimestampBuckets []int64
-	MetricBuckets    []int64
+	Query                   string
+	QueryArgs               []any
+	TimestampBuckets        []int64
+	MetricBuckets           []int64
+	HadNegativeMetricValues bool
 }
 
 // getHeatmapQueryAndBuckets usually returns the query that should be run to
@@ -903,6 +1027,9 @@ type QueryAndBuckets = struct {
 // indicate a no-error state with no results--in this case we should return an
 // empty response.
 func (i *InvocationStatService) getHeatmapQueryAndBuckets(ctx context.Context, req *stpb.GetStatHeatmapRequest) (*QueryAndBuckets, error) {
+	if req.GetMetric() == nil {
+		return nil, status.InvalidArgumentError("Missing metric for heatmap request.")
+	}
 	table := getTableForMetric(req.GetMetric())
 	metric, err := filter.MetricToDbField(req.GetMetric())
 	if err != nil {
@@ -913,7 +1040,7 @@ func (i *InvocationStatService) getHeatmapQueryAndBuckets(ctx context.Context, r
 		return nil, err
 	}
 
-	qi, err := i.generateQueryInputs(ctx, table, metric, req.GetQuery(), whereClauseStr, whereClauseArgs, req.GetRequestContext())
+	qi, err := i.generateQueryInputs(ctx, table, metric, req.GetQuery(), whereClauseStr, whereClauseArgs, req.GetRequestContext(), req.GetLogScale())
 	if err != nil {
 		return nil, err
 	}
@@ -921,24 +1048,26 @@ func (i *InvocationStatService) getHeatmapQueryAndBuckets(ctx context.Context, r
 		return nil, nil
 	}
 	qStr := fmt.Sprintf(`
-		SELECT timestamp, groupArray(v) AS value FROM (
-			SELECT timestamp, bucket, CAST(SUM(v) AS Int64) AS v FROM (
+		SELECT timestamp, groupArray(v) AS value, groupArray(t) AS total FROM (
+			SELECT timestamp, bucket, CAST(SUM(v) AS Int64) AS v, CAST(SUM(t) AS Int64) AS t FROM (
 				%s UNION ALL
 				SELECT
 					roundDown(updated_at_usec, CAST(%s AS Array(Int64))) AS timestamp,
 					roundDown(%s, CAST(%s AS Array(Int64))) AS bucket,
-					count(*) AS v
+					count(*) AS v,
+					sum(%s) AS t
 					FROM "%s" %s
 					GROUP BY timestamp, bucket)
 			GROUP BY timestamp, bucket ORDER BY timestamp, bucket)
 		GROUP BY timestamp ORDER BY timestamp`,
-		qi.PlaceholderBucketQuery, qi.TimestampArrayStr, metric, qi.MetricArrayStr, table, whereClauseStr)
+		qi.PlaceholderBucketQuery, qi.TimestampArrayStr, metric, qi.MetricArrayStr, metric, table, whereClauseStr)
 
 	return &QueryAndBuckets{
-			TimestampBuckets: qi.TimestampBuckets,
-			MetricBuckets:    qi.MetricBuckets,
-			Query:            qStr,
-			QueryArgs:        whereClauseArgs,
+			TimestampBuckets:        qi.TimestampBuckets,
+			MetricBuckets:           qi.MetricBuckets,
+			Query:                   qStr,
+			QueryArgs:               whereClauseArgs,
+			HadNegativeMetricValues: qi.HadNegativeMetricValues,
 		},
 		nil
 }
@@ -966,19 +1095,22 @@ func (i *InvocationStatService) GetStatHeatmap(ctx context.Context, req *stpb.Ge
 	rq := i.olapdbh.NewQuery(ctx, "invocation_stat_service_heatmap").Raw(qAndBuckets.Query, qAndBuckets.QueryArgs...)
 
 	rsp := &stpb.GetStatHeatmapResponse{
-		TimestampBracket: qAndBuckets.TimestampBuckets,
-		BucketBracket:    qAndBuckets.MetricBuckets,
-		Column:           make([]*stpb.HeatmapColumn, 0),
+		TimestampBracket:        qAndBuckets.TimestampBuckets,
+		BucketBracket:           qAndBuckets.MetricBuckets,
+		Column:                  make([]*stpb.HeatmapColumn, 0),
+		MetricHadNegativeValues: qAndBuckets.HadNegativeMetricValues,
 	}
 
 	type stat struct {
 		Timestamp int64
 		Value     []int64 `gorm:"type:int64[]"`
+		Total     []int64 `gorm:"type:int64[]"`
 	}
 	err = db.ScanEach(rq, func(ctx context.Context, stat *stat) error {
 		column := &stpb.HeatmapColumn{
 			TimestampUsec: stat.Timestamp,
 			Value:         stat.Value,
+			Total:         stat.Total,
 		}
 		rsp.Column = append(rsp.Column, column)
 		return nil
@@ -1026,6 +1158,10 @@ func (i *InvocationStatService) GetInvocationStat(ctx context.Context, req *inpb
 	}
 
 	if repoURL := req.GetQuery().GetRepoUrl(); repoURL != "" {
+		// Attempt normalization, and if it succeeds, use the normalized URL.
+		if u, err := git.NormalizeRepoURL(repoURL); err == nil {
+			repoURL = u.String()
+		}
 		q.AddWhereClause("repo_url = ?", repoURL)
 	}
 
@@ -1068,6 +1204,13 @@ func (i *InvocationStatService) GetInvocationStat(ctx context.Context, req *inpb
 
 	if end := req.GetQuery().GetUpdatedBefore(); end.IsValid() {
 		q.AddWhereClause("updated_at_usec < ?", end.AsTime().UnixMicro())
+	}
+
+	if minDuration := req.GetQuery().GetMinimumDuration().AsDuration(); minDuration > 0 {
+		q.AddWhereClause(`duration_usec >= ?`, minDuration.Microseconds())
+	}
+	if maxDuration := req.GetQuery().GetMaximumDuration().AsDuration(); maxDuration > 0 {
+		q.AddWhereClause(`duration_usec <= ?`, maxDuration.Microseconds())
 	}
 
 	for _, f := range req.GetQuery().GetFilter() {
@@ -1126,7 +1269,7 @@ func (i *InvocationStatService) GetInvocationStat(ctx context.Context, req *inpb
 	return rsp, err
 }
 
-func (i *InvocationStatService) getDrilldownSubquery(ctx context.Context, drilldownFields []string, req *stpb.GetStatDrilldownRequest, where string, whereArgs []interface{}, drilldown string, drilldownArgs []interface{}, col string) (string, []interface{}) {
+func (i *InvocationStatService) getDrilldownSubquery(ctx context.Context, drilldownFields []string, req *stpb.GetStatDrilldownRequest, where string, whereArgs []any, drilldown string, drilldownArgs []any, col string) (string, []any) {
 	// This is really ugly--the clickhouse SQL engine doesn't play nice with GORM
 	// when you set a field name to NULL that matches a field in the table you are
 	// selecting--it blows away the type info and turns it into Sql.RawBytes.  To
@@ -1137,6 +1280,8 @@ func (i *InvocationStatService) getDrilldownSubquery(ctx context.Context, drilld
 			queryFields[i] = "NULL as gorm_" + f
 		} else if col == "tag" {
 			queryFields[i] = "arrayJoin(tags) as gorm_tag"
+		} else if col == "exit_code" {
+			queryFields[i] = "toString(exit_code) as gorm_exit_code"
 		} else {
 			columnName := f
 			if columnName == "user" {
@@ -1163,21 +1308,25 @@ func (i *InvocationStatService) getDrilldownSubquery(ctx context.Context, drilld
 			nulledOutFieldList, drilldown, drilldown, table, where), args
 	}
 	col = "gorm_" + col
+	groupByCol := col
+	if col == "gorm_exit_code" {
+		groupByCol = "toString(exit_code)" // column aliases can't be used in GROUP BY
+	}
 
 	return fmt.Sprintf(`
 		(SELECT %s, 1 AS totals_first, count(*) AS total, countIf(%s) AS selection,
 			countIf(not(%s)) AS inverse
 		FROM "%s" %s
 		GROUP BY %s ORDER BY selection DESCENDING, total DESCENDING LIMIT 25)`,
-		nulledOutFieldList, drilldown, drilldown, table, where, col), args
+		nulledOutFieldList, drilldown, drilldown, table, where, groupByCol), args
 }
 
-func getDrilldownQueryFilter(filters []*sfpb.StatFilter) (string, []interface{}, error) {
+func getDrilldownQueryFilter(filters []*sfpb.StatFilter) (string, []any, error) {
 	if len(filters) == 0 {
-		return "", nil, status.InvalidArgumentError("Empty filter for drilldown.")
+		return "FALSE", []any{}, nil
 	}
 	var result []string
-	var resultArgs []interface{}
+	var resultArgs []any
 	for _, f := range filters[:] {
 		str, args, err := filter.GenerateFilterStringAndArgs(f)
 		if err != nil {
@@ -1192,17 +1341,21 @@ func getDrilldownQueryFilter(filters []*sfpb.StatFilter) (string, []interface{},
 // TODO(jdhollen): This can be made much efficient using GROUPING SETS when we
 // are able to upgrade to clickhouse 22.6 or later.  The release date for 22.8
 // from Altinity is supposed to be 2023-02-15.
-func (i *InvocationStatService) getDrilldownQuery(ctx context.Context, req *stpb.GetStatDrilldownRequest) (string, []interface{}, error) {
+func (i *InvocationStatService) getDrilldownQuery(ctx context.Context, req *stpb.GetStatDrilldownRequest) (string, []any, error) {
+	if req.GetDrilldownMetric() == nil {
+		return "", nil, status.InvalidArgumentError("Missing metric for drilldown request.")
+	}
 	drilldownFields := []string{"user", "host", "pattern", "repo_url", "branch_name", "commit_sha"}
 	if *tagsInDrilldowns {
 		drilldownFields = append(drilldownFields, "tag")
 	}
-	if req.GetDrilldownMetric().Execution != nil {
-		drilldownFields = append(drilldownFields, "worker")
+	executionDrilldownFields := []string{"worker", "target_label", "action_mnemonic", "effective_pool", "exit_code", "os", "arch"}
+	if req.GetDrilldownMetric().GetExecution() != sfpb.ExecutionMetricType_UNKNOWN_EXECUTION_METRIC {
+		drilldownFields = append(drilldownFields, executionDrilldownFields...)
 	}
 	placeholderQuery := query_builder.NewQuery("")
 
-	if err := i.addWhereClauses(placeholderQuery, req.GetQuery(), req.GetDrilldownMetric().Execution != nil, req.GetRequestContext()); err != nil {
+	if err := i.addWhereClauses(placeholderQuery, req.GetQuery(), req.GetDrilldownMetric().GetExecution() != sfpb.ExecutionMetricType_UNKNOWN_EXECUTION_METRIC, req.GetRequestContext()); err != nil {
 		return "", nil, err
 	}
 
@@ -1213,7 +1366,7 @@ func (i *InvocationStatService) getDrilldownQuery(ctx context.Context, req *stpb
 
 	whereString, whereArgs := placeholderQuery.Build()
 
-	args := make([]interface{}, 0)
+	args := make([]any, 0)
 	queries := make([]string, 0)
 	subQStr, subQArgs := i.getDrilldownSubquery(ctx, drilldownFields, req, whereString, whereArgs, drilldownStr, drilldownArgs, "")
 	queries = append(queries, subQStr)
@@ -1233,30 +1386,119 @@ func addOutputChartEntry(m map[stpb.DrilldownType]*stpb.DrilldownChart, dm map[s
 		chart = &stpb.DrilldownChart{}
 		chart.DrilldownType = ddType
 		m[ddType] = chart
-		dm[ddType] = -math.MaxFloat64
+		dm[ddType] = 0
 	}
-	dm[ddType] = math.Max(dm[ddType], math.Abs(float64(selection)/float64(totalInSelection)-float64(inverse)/float64(totalInBase)))
+	if totalInSelection != 0 && totalInBase != 0 {
+		dm[ddType] = math.Max(dm[ddType], math.Abs(float64(selection)/float64(totalInSelection)-float64(inverse)/float64(totalInBase)))
+	}
 	chart.Entry = append(chart.Entry, &stpb.DrilldownEntry{Label: *label, BaseValue: inverse, SelectionValue: selection})
 }
 
 func sortDrilldownChartKeys(dm map[stpb.DrilldownType]float64) *[]stpb.DrilldownType {
 	type pair struct {
-		a stpb.DrilldownType
-		v float64
+		ddType stpb.DrilldownType
+		value  float64
 	}
 	slice := make([]pair, 0)
-	for k, v := range dm {
-		slice = append(slice, pair{k, v})
+	for ddType, value := range dm {
+		slice = append(slice, pair{ddType, value})
 	}
-	sort.SliceStable(slice, func(a, b int) bool {
-		return slice[a].v >= slice[b].v
+	sort.Slice(slice, func(i, j int) bool {
+		// Sort by value, breaking ties by drilldown type.
+		if slice[i].value == slice[j].value {
+			return slice[i].ddType < slice[j].ddType
+		}
+		return slice[i].value >= slice[j].value
 	})
 
 	result := make([]stpb.DrilldownType, len(slice))
-	for v, i := range slice {
-		result[v] = i.a
+	for i, pair := range slice {
+		result[i] = pair.ddType
 	}
 	return &result
+}
+
+func getAggregationFnString(a stpb.TargetAggregation) string {
+	switch a {
+	case stpb.TargetAggregation_SUM_TARGET_AGGREGATION:
+		return "sum"
+	case stpb.TargetAggregation_AVG_TARGET_AGGREGATION:
+		return "avg"
+	case stpb.TargetAggregation_MAX_TARGET_AGGREGATION:
+		return "max"
+	case stpb.TargetAggregation_MIN_TARGET_AGGREGATION:
+		return "min"
+	case stpb.TargetAggregation_P50_TARGET_AGGREGATION:
+		return "quantile(0.5)"
+	case stpb.TargetAggregation_P90_TARGET_AGGREGATION:
+		return "quantile(0.9)"
+	case stpb.TargetAggregation_P99_TARGET_AGGREGATION:
+		return "quantile(0.99)"
+	default:
+		return "sum"
+	}
+}
+
+func (i *InvocationStatService) GetTargetTrends(ctx context.Context, req *stpb.GetTargetTrendsRequest) (*stpb.GetTargetTrendsResponse, error) {
+	if !*targetTrendsEnabled {
+		return nil, status.UnimplementedError("GetTargetTrends RPC is disabled.")
+	}
+	if !i.isOLAPDBEnabled() {
+		return nil, status.UnimplementedError("Target trends require using an OLAP DB, but none is configured.")
+	}
+	if err := authutil.AuthorizeGroupAccessForStats(ctx, i.env, req.GetRequestContext().GetGroupId()); err != nil {
+		return nil, err
+	}
+
+	// Normalize repo URL before we use it in any queries.
+	if repoURL := req.GetQuery().GetRepoUrl(); repoURL != "" {
+		repoURL, err := git.NormalizeRepoURL(repoURL)
+		if err == nil {
+			req = req.CloneVT()
+			req.Query.RepoUrl = repoURL.String()
+		}
+	}
+
+	metric, err := filter.ExecutionMetricToDbField(req.GetMetric())
+	if err != nil {
+		return nil, err
+	}
+
+	// Merged actions appear in ClickHouse as multiple rows with the same
+	// execution_uuid, but a different invocation_uuid. This inner query
+	// dedupes by execution_uuid and takes the highest value (though all rows
+	// should have the same value).
+	innerQ := query_builder.NewQuery(fmt.Sprintf(`
+		SELECT target_label, MAX(%s) as v
+		FROM "Executions"`, metric))
+
+	// Add where clauses from the trend query, including execution dimension filters
+	if err := i.addWhereClauses(innerQ, req.GetQuery(), true, req.GetRequestContext()); err != nil {
+		return nil, err
+	}
+
+	innerQ.AddWhereClause("cached_result = FALSE")
+	innerQ.AddWhereClause("target_label != ''")
+	innerQ.SetGroupBy("target_label, execution_uuid")
+
+	innerQStr, innerQArgs := innerQ.Build()
+
+	q := query_builder.NewQueryWithArgs(fmt.Sprintf(`
+		SELECT target_label as target, toInt64(%s(v)) as value
+		FROM ( %s )`, getAggregationFnString(req.GetAgg()), innerQStr), innerQArgs)
+	q.SetGroupBy("target_label")
+	q.SetOrderBy("value", false) // Descending order
+	q.SetLimit(1000)             // Reasonable limit to avoid overwhelming the response
+
+	qStr, qArgs := q.Build()
+	rq := i.olapdbh.NewQuery(ctx, "invocation_stat_service_target_trends").Raw(qStr, qArgs...)
+
+	targetStats, err := db.ScanAll(rq, &stpb.TargetStats{})
+	if err != nil {
+		return nil, err
+	}
+
+	return &stpb.GetTargetTrendsResponse{TargetStats: targetStats}, nil
 }
 
 func (i *InvocationStatService) GetStatDrilldown(ctx context.Context, req *stpb.GetStatDrilldownRequest) (*stpb.GetStatDrilldownResponse, error) {
@@ -1283,16 +1525,22 @@ func (i *InvocationStatService) GetStatDrilldown(ctx context.Context, req *stpb.
 	m := make(map[stpb.DrilldownType]*stpb.DrilldownChart)
 	dm := make(map[stpb.DrilldownType]float64)
 	type queryOut struct {
-		GormUser       *string
-		GormHost       *string
-		GormRepoURL    *string
-		GormBranchName *string
-		GormCommitSHA  *string
-		GormPattern    *string
-		GormWorker     *string
-		GormTag        *string
-		Selection      int64
-		Inverse        int64
+		GormUser           *string
+		GormHost           *string
+		GormRepoURL        *string
+		GormBranchName     *string
+		GormCommitSHA      *string
+		GormPattern        *string
+		GormWorker         *string
+		GormTag            *string
+		GormTargetLabel    *string
+		GormActionMnemonic *string
+		GormEffectivePool  *string
+		GormExitCode       *string
+		GormArch           *string
+		GormOs             *string
+		Selection          int64
+		Inverse            int64
 	}
 
 	firstRow := true
@@ -1321,6 +1569,18 @@ func (i *InvocationStatService) GetStatDrilldown(ctx context.Context, req *stpb.
 			addOutputChartEntry(m, dm, stpb.DrilldownType_PATTERN_DRILLDOWN_TYPE, stat.GormPattern, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
 		} else if stat.GormWorker != nil {
 			addOutputChartEntry(m, dm, stpb.DrilldownType_WORKER_DRILLDOWN_TYPE, stat.GormWorker, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormTargetLabel != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_TARGET_LABEL_DRILLDOWN_TYPE, stat.GormTargetLabel, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormActionMnemonic != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_ACTION_MNEMONIC_DRILLDOWN_TYPE, stat.GormActionMnemonic, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormEffectivePool != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_EFFECTIVE_POOL_DRILLDOWN_TYPE, stat.GormEffectivePool, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormExitCode != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_EXIT_CODE_DRILLDOWN_TYPE, stat.GormExitCode, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormOs != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_OS_DRILLDOWN_TYPE, stat.GormOs, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
+		} else if stat.GormArch != nil {
+			addOutputChartEntry(m, dm, stpb.DrilldownType_ARCH_DRILLDOWN_TYPE, stat.GormArch, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
 		} else if stat.GormTag != nil {
 			addOutputChartEntry(m, dm, stpb.DrilldownType_TAG_DRILLDOWN_TYPE, stat.GormTag, stat.Inverse, stat.Selection, rsp.TotalInBase, rsp.TotalInSelection)
 		} else {

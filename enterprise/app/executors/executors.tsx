@@ -1,17 +1,24 @@
+import { BarChart2, Cpu, Globe, Hash, Laptop, LucideIcon } from "lucide-react";
 import React from "react";
+import { Subscription } from "rxjs";
+import { User } from "../../../app/auth/auth_service";
 import Banner from "../../../app/components/banner/banner";
+import Breadcrumbs from "../../../app/components/breadcrumbs/breadcrumbs";
+import LinkButton from "../../../app/components/button/link_button";
+import Link, { TextLink } from "../../../app/components/link/link";
+import Select, { Option } from "../../../app/components/select/select";
+import UpgradePrompt, { mostUrgent } from "../../../app/components/upgrade/upgrade";
+import ViewModeToggle, { ViewMode } from "../../../app/components/view_mode_toggle/view_mode_toggle";
+import router from "../../../app/router/router";
 import rpcService from "../../../app/service/rpc_service";
 import { BuildBuddyError } from "../../../app/util/errors";
-import { User } from "../../../app/auth/auth_service";
-import { scheduler } from "../../../proto/scheduler_ts_proto";
-import ExecutorCardComponent from "./executor_card";
-import { Subscription } from "rxjs";
 import { api_key } from "../../../proto/api_key_ts_proto";
 import { bazel_config } from "../../../proto/bazel_config_ts_proto";
-import router from "../../../app/router/router";
-import Select, { Option } from "../../../app/components/select/select";
-import LinkButton from "../../../app/components/button/link_button";
-import { Cpu, Globe, Hash, Laptop, LucideIcon } from "lucide-react";
+import { capability } from "../../../proto/capability_ts_proto";
+import { scheduler } from "../../../proto/scheduler_ts_proto";
+import { stat_filter } from "../../../proto/stat_filter_ts_proto";
+import { encodeEffectivePoolUrlParam, encodeMetricUrlParam } from "../trends/common";
+import ExecutorCardComponent from "./executor_card";
 
 enum FetchType {
   Executors,
@@ -37,7 +44,13 @@ class ExecutorDeploy extends React.Component<ExecutorDeployProps, ExecutorDeploy
   render() {
     return (
       <>
-        <p>Self-hosted executors can be deployed by running a simple Docker image on any machine.</p>
+        <p>
+          Self-hosted executors can be deployed on Kubernetes using the{" "}
+          <TextLink href="https://github.com/buildbuddy-io/buildbuddy-helm/tree/master/charts/buildbuddy-executor">
+            Helm charts
+          </TextLink>
+          , or by running the Docker image directly.
+        </p>
         <p>The example below shows how to run an executor manually using the Docker CLI.</p>
         API key:
         <Select
@@ -131,6 +144,10 @@ class ExecutorSetup extends React.Component<ExecutorSetupProps> {
 
 interface ExecutorsListProps {
   regions: { name: string; response: scheduler.GetExecutionNodesResponse }[];
+  details: boolean;
+  // Rendered at the right edge of the first pool's heading row. Used when the
+  // page has no tab row to hang the summary/details toggle off of.
+  toggle?: React.ReactNode;
 }
 
 class ExecutorsList extends React.Component<ExecutorsListProps> {
@@ -141,7 +158,7 @@ class ExecutorsList extends React.Component<ExecutorsListProps> {
     >();
     for (const r of this.props.regions) {
       for (const e of r.response.executor) {
-        const key = r.name + "-" + (e.node?.os || "") + "-" + (e.node?.arch || "") + "-" + (e.node?.pool || "");
+        const key = r.name + "-" + (e.node?.osFamily || "") + "-" + (e.node?.arch || "") + "-" + (e.node?.pool || "");
         if (!executorsByPool.has(key)) {
           executorsByPool.set(key, []);
         }
@@ -152,16 +169,33 @@ class ExecutorsList extends React.Component<ExecutorsListProps> {
 
     return (
       <>
+        <UpgradePrompt prompt={mostUrgent(this.props.regions.map((r) => r.response.upgradePrompt))} />
         <div className="executor-cards">
           {keys
             .map((key) => executorsByPool.get(key))
-            .map((executors) => {
+            .map((executors, index) => {
               if (!executors || executors.length == 0) {
                 return null;
               }
+              const poolName = executors[0].executor.node?.pool || "Default Pool";
+              const poolValue = executors[0].executor.node?.pool || "";
+              const poolUrlParam = encodeEffectivePoolUrlParam(poolValue);
+              const metricUrlParam = encodeMetricUrlParam(
+                stat_filter.Metric.create({
+                  execution: stat_filter.ExecutionMetricType.EXECUTION_WALL_TIME_EXECUTION_METRIC,
+                })
+              );
               return (
                 <>
-                  <h2>{executors[0].executor.node?.pool || "Default Pool"}</h2>
+                  <div className="executor-pool-header">
+                    <h2>{poolName}</h2>
+                    <Link
+                      className="executor-history-button history-button"
+                      href={`/trends/?d=${encodeURIComponent(poolUrlParam)}&ddMetric=${metricUrlParam}#drilldown`}>
+                      <BarChart2 /> View executions
+                    </Link>
+                    {index === 0 && this.props.toggle}
+                  </div>
                   <div className="executor-details">
                     {executors[0].region && (
                       <ExecutorDetail Icon={Globe} label="">
@@ -172,7 +206,7 @@ class ExecutorsList extends React.Component<ExecutorsListProps> {
                       {executors.length} {executors.length === 1 ? "executor" : "executors"}
                     </ExecutorDetail>
                     <ExecutorDetail Icon={Laptop} label="OS">
-                      {executors[0].executor.node?.os || "unknown"}
+                      {executors[0].executor.node?.osFamily || "unknown"}
                     </ExecutorDetail>
                     <ExecutorDetail Icon={Cpu} label="Arch">
                       {executors[0].executor.node?.arch || "unknown"}
@@ -188,7 +222,12 @@ class ExecutorsList extends React.Component<ExecutorsListProps> {
                   {executors.map(
                     (node) =>
                       node.executor.node && (
-                        <ExecutorCardComponent node={node.executor.node} isDefault={node.executor.isDefault} />
+                        <ExecutorCardComponent
+                          node={node.executor.node}
+                          isDefault={node.executor.isDefault}
+                          lastCheckInTime={node.executor.lastCheckInTime}
+                          details={this.props.details}
+                        />
                       )
                   )}
                 </>
@@ -203,7 +242,7 @@ class ExecutorsList extends React.Component<ExecutorsListProps> {
 function ExecutorDetail({ Icon, label, children }: { Icon: LucideIcon; label: string; children: React.ReactNode }) {
   return (
     <span className="executor-detail">
-      <Icon className="icon" />
+      <Icon />
       <span>
         {label && <>{label}: </>}
         <b>{children}</b>
@@ -226,6 +265,7 @@ interface State {
   loading: FetchType[];
   schedulerUri: string;
   error: BuildBuddyError | null;
+  viewMode: ViewMode;
 }
 
 export default class ExecutorsComponent extends React.Component<Props, State> {
@@ -236,6 +276,7 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
     loading: [],
     schedulerUri: "",
     error: null,
+    viewMode: "summary",
   };
 
   subscription?: Subscription;
@@ -267,7 +308,7 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
         api_key.GetApiKeysRequest.create({ groupId: this.props.user.selectedGroup.id })
       );
       const executorKeys = response.apiKey.filter((key) =>
-        key.capability.some((cap) => cap == api_key.ApiKey.Capability.REGISTER_EXECUTOR_CAPABILITY)
+        key.capability.some((cap) => cap == capability.Capability.REGISTER_EXECUTOR)
       );
       this.setState({ executorKeys: executorKeys });
     } catch (e) {
@@ -346,6 +387,14 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
     router.navigateTo(`/executors/${tabId}`);
   }
 
+  onChangeViewMode(viewMode: ViewMode) {
+    this.setState({ viewMode });
+  }
+
+  renderViewModeToggle() {
+    return <ViewModeToggle viewMode={this.state.viewMode} onChange={this.onChangeViewMode.bind(this)} />;
+  }
+
   // "bring your own runners" is enabled for the installation (i.e. BuildBuddy Cloud deployment).
   renderWithGroupOwnedExecutorsEnabled() {
     const allNodes = this.state.regions.flatMap((r) => r.response.executor);
@@ -365,11 +414,12 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
             onClick={this.onClickTab.bind(this, "setup")}>
             Setup
           </div>
+          {activeTab === "status" && allNodes.length > 0 && this.renderViewModeToggle()}
         </div>
         {activeTab === "status" && (
           <>
             {allNodes.some((node) => !node.isDefault) && (
-              <Banner type="warning">
+              <Banner type="warning" className="self-hosted-executors-banner">
                 <div>
                   Self-hosted executors are not the default for this organization. To change this, enable "Default to
                   self-hosted executors" in your organization settings.
@@ -381,7 +431,7 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
                 </div>
               </Banner>
             )}
-            <ExecutorsList regions={this.state.regions} />
+            <ExecutorsList regions={this.state.regions} details={this.state.viewMode === "details"} />
             {!allNodes.length && this.props.user.selectedGroup.useGroupOwnedExecutors && (
               <div className="empty-state">
                 <h1>No self-hosted executors are connected.</h1>
@@ -426,7 +476,15 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
         </div>
       );
     } else {
-      return <ExecutorsList regions={this.state.regions} />;
+      // There's no tab row here to hang the toggle off of, so it rides along
+      // with the first pool's heading instead.
+      return (
+        <ExecutorsList
+          regions={this.state.regions}
+          details={this.state.viewMode === "details"}
+          toggle={this.renderViewModeToggle()}
+        />
+      );
     }
   }
 
@@ -435,10 +493,10 @@ export default class ExecutorsComponent extends React.Component<Props, State> {
       <div className="executors-page">
         <div className="shelf">
           <div className="container">
-            <div className="breadcrumbs">
+            <Breadcrumbs>
               {this.props.user && <span>{this.props.user?.selectedGroupName()}</span>}
               <span>Executors</span>
-            </div>
+            </Breadcrumbs>
             <div className="title">Executors</div>
           </div>
         </div>

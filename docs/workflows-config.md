@@ -5,11 +5,12 @@ sidebar_label: Workflows configuration
 ---
 
 Once you've linked your repo to BuildBuddy via
-[BuildBuddy workflows](workflows-setup.md), BuildBuddy will automatically
-run `bazel test //...` on each push to your repo, reporting results to the
-BuildBuddy UI.
+[BuildBuddy workflows](workflows-setup.md), there are two ways to start running Workflows.
 
-But you may wish to configure multiple test commands with different test
+The default workflow config runs `bazel test //...` whenever a commit is pushed to your repo's default branch or a pull request branch is updated. In order to enable this, click "Enable default workflow config"
+in the three-dot dropdown for your repository on the Workflows page.
+
+You may wish to configure multiple test commands with different test
 tag filters, or run the same tests on multiple different platform
 configurations (running some tests on Linux, and some on macOS, for
 example).
@@ -85,6 +86,58 @@ steps:
   - run: bazel test //...
 ```
 
+## Concurrent Workflow runs
+
+BuildBuddy automatically cancels in-progress
+Workflow runs when a newer run is triggered for the same action on the same branch.
+This helps avoid wasting resources on outdated runs
+when, for example, several commits are pushed in quick succession to a
+pull request branch.
+
+By default, cancellation only applies to non-default branches; runs on your
+repo's default branch are not affected. This can be customized per-action via
+`allow_concurrent_runs_on_branches` (see below).
+
+If you'd like to disable this behavior and allow concurrent runs for an
+action, set `allow_concurrent_runs: true` in the action's configuration:
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Test all targets"
+    allow_concurrent_runs: true # <-- disables auto-cancellation of concurrent runs
+    ...
+```
+
+To control which branches are allowed to run concurrently, you can set
+`allow_concurrent_runs_on_branches`. Patterns are matched using the rules described in
+[Ref pattern matching](#ref-pattern-matching).
+
+When unset, this defaults to your repo's default branch.
+
+Note that if you set `allow_concurrent_runs_on_branches`, you must explicitly
+include the default branch in the list.
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Test all targets"
+    allow_concurrent_runs: false
+    allow_concurrent_runs_on_branches: # <-- these branches are never auto-cancelled
+      - "main"
+      - "release-*"
+      - "staging"
+    ...
+```
+
+To disallow concurrent runs on all branches including the default branch, set `allow_concurrent_runs_on_branches` to an empty list.
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Test all targets"
+    allow_concurrent_runs: false
+    allow_concurrent_runs_on_branches: [] # <-- all branches are blocked from running concurrently
+    ...
+```
+
 ## Bazel configuration
 
 ### Bazel version
@@ -158,6 +211,77 @@ steps:
   - run: "bazel test ... --test_env=REGISTRY_TOKEN"
 ```
 
+## Scheduling workflows with cron expressions
+
+BuildBuddy supports running Workflows on a recurring schedule using
+standard cron expressions. This is useful for nightly builds, periodic
+integration tests, or any job that should run independently of code pushes
+or pull requests.
+
+To schedule an action, add a `schedule` trigger with one or more cron
+expressions under `triggers`:
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Nightly tests"
+    triggers:
+      schedule:
+        crons:
+          - "0 2 * * *" # 2:00 AM UTC every day
+    steps:
+      - run: "bazel test //..."
+```
+
+You can specify multiple cron expressions to run an action at different
+intervals:
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Frequent integration tests"
+    triggers:
+      schedule:
+        crons:
+          - "0 * * * *" # top of every hour
+          - "30 * * * *" # middle of every hour
+    steps:
+      - run: "bazel test //integration/..."
+```
+
+Scheduled runs always execute against the latest commit on your repo's
+default branch.
+
+:::note
+
+The minimum supported interval between cron triggers is 15 minutes.
+
+:::
+
+### Cron expression format
+
+BuildBuddy uses standard 5-field cron syntax:
+
+```
+┌─────────── minute (0–59)
+│ ┌───────── hour (0–23)
+│ │ ┌─────── day of month (1–31)
+│ │ │ ┌───── month (1–12)
+│ │ │ │ ┌─── day of week (0–6, Sunday = 0)
+│ │ │ │ │
+* * * * *
+```
+
+Common examples:
+
+| Expression     | Meaning                               |
+| -------------- | ------------------------------------- |
+| `0 * * * *`    | Every hour, on the hour               |
+| `0 2 * * *`    | Daily at 2:00 AM UTC                  |
+| `30 6 * * 1-5` | 6:30 AM UTC, Monday–Friday            |
+| `0 0 1 * *`    | Midnight UTC on the 1st of each month |
+| `0 */6 * * *`  | Every 6 hours                         |
+
+All times are interpreted as UTC.
+
 ## Merge queue support
 
 BuildBuddy workflows are compatible with GitHub's [merge queues](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
@@ -169,33 +293,177 @@ branch, as described in [Triggering merge group checks with third-party CI provi
 Example `buildbuddy.yaml` file:
 
 ```yaml title="buildbuddy.yaml"
-- action: Test
-  triggers:
-    push:
-      # Run when a merge queue branch is pushed or the main branch is
-      # pushed.
-      branches: ["main", "gh-readonly-queue/*"]
-  # ...
+actions:
+  - name: Test
+    triggers:
+      push:
+        # Run when a merge queue branch is pushed or the main branch is
+        # pushed.
+        branches: ["main", "gh-readonly-queue/*"]
+    # ...
 ```
 
-## Linux image configuration
+## Merge with base
 
-By default, workflows run on an Ubuntu 18.04-based image. You can use
-a newer, Ubuntu 20.04-based image using the `container_image` action
-setting:
+By default, when workflows are triggered by `pull_request` events, the CI runner will merge
+the PR branch with the PR's base branch (e.g. main). This is controlled by
+`merge_with_base`, which defaults to `true`.
+
+This may help catch integration problems before merge,
+such as merge conflicts or tests that only fail when the PR is combined
+with recent changes on the base branch.
 
 ```yaml title="buildbuddy.yaml"
 actions:
-  - name: "Test all targets"
-    container_image: "ubuntu-20.04" # <-- add this line
+  - name: "Test"
+    triggers:
+      pull_request:
+        branches: ["main"]
+        merge_with_base: true # default
     steps:
       - run: "bazel test //..."
 ```
 
-The supported values for `container_image` are `"ubuntu-18.04"` (default)
-or `"ubuntu-20.04"`.
+By default, the PR is merged with the current base branch tip. This may hurt CI
+performance if the base branch tip advances frequently. Merging in
+unrelated base branch changes may invalidate the Bazel cache and require
+rebuilds, even when the PR branch itself is unchanged. This behavior can be
+disabled by setting `merge_with_base: false`, or made less frequent by setting
+`merge_with_base_interval`.
 
-By default, workflow VMs have the following resources available:
+### Merge with base interval
+
+When `merge_with_base_interval` is set, the CI runner merges with the oldest base branch commit within the interval,
+rather than the base branch tip.
+
+The intention is that multiple CI runs within an interval will all merge with the same commit, even
+if the base branch tip has advanced. Repeated runs of an unchanged PR will produce the same merged result and hit a warm Bazel cache.
+
+The runner will still merge with the base branch tip once per interval, keeping the PR reasonably up to date with the base branch to catch integration issues.
+
+If the PR's merge base is already newer than the compute commit, the merge is skipped.
+And if the interval contains no base branch commits, it falls back to the tip.
+
+For example, with `merge_with_base_interval: "3h"`, the base advances at 00:00, 03:00,
+06:00, ... UTC, and all runs within the same 3h window merge with the first base
+branch commit after the window boundary:
+
+- The interval boundary is [09:00 UTC, 12:00 UTC].
+- Main is pushed at 08:00 UTC (commit `a`). This commit is outside the current interval.
+- Main is pushed at 09:05 UTC (commit `b`). This commit is the oldest commit in the current interval.
+- Main is pushed at 10:00 UTC (commit `c`). This commit is in the current interval, but is not the oldest commit in the interval.
+- Main is pushed at 12:05 UTC (commit `d`). This commit is in the next interval.
+- A PR Workflow runs at 09:30 UTC. It merges with the oldest base branch commit in the current interval (commit `b`).
+- A PR Workflow runs at 10:45 UTC. Even though Main has advanced to commit `c`, it merges with the oldest base branch commit in the current interval (commit `c`).
+  This lets it reuse the cache from the earlier PR run.
+- A run at 12:15 UTC is in the next interval, so it merges with commit `d`.
+  This helps keep the PR reasonably up to date with the base branch.
+
+With a shorter interval like `1h`, the base advances at the start of each hour.
+
+`merge_with_base_interval` is capped at `3h` so that PRs are not merged with an overly
+stale base, which would also have the negative side effect of keeping stale
+artifacts in the cache longer. Use a shorter interval when merge confidence is
+more important, and a longer interval when cache stability and reduced CI churn
+are more important.
+
+### Interaction with merge queues
+
+Merge with base is still useful when your repo uses merge queues. Merging with base on
+`pull_request` workflows can catch PR-specific issues earlier, before the PR
+reaches the merge queue.
+
+Workflows that run on merge queue branches themselves
+do not need `merge_with_base`, since the merge queue commit should already be
+merged with the base branch.
+
+Also, merge queue workflows can only be triggered on `push` events, where `merge_with_base` is not supported.
+
+## Ref pattern matching
+
+In `buildbuddy.yaml`, workflow triggers such as `push` and `pull_request`
+are configured using a list of patterns that are matched against
+the branch or tag name from the repository event.
+
+Ref patterns are evaluated using the following rules:
+
+- Patterns may contain a single wildcard character (`*`) which matches any
+  sequence of characters. For example, the branch pattern
+  `"release-*-linux"` results in a positive match for the branch
+  `"release-v1.2.3-linux"`. Note: if there is more than one wildcard, only
+  the first one is expanded, and subsequent wildcards are treated
+  literally.
+- Patterns starting with an exclamation mark (`!`) are _negated_ patterns
+  and result in a negative match if the rest of the pattern after the
+  exclamation mark is matched. For example, the branch pattern `"!main"`
+  results in a negative match for the branch `"main"`.
+- All characters other than negation flags or wildcards are matched
+  exactly. For example, the branch pattern `"main"` results in a positive
+  match for the branch `"main"`.
+- If multiple patterns are specified, then the last matching pattern
+  (positive or negative) determines whether the branch is matched. For
+  example, given the list of branch patterns
+  `["*", "!release-*", "release-special"]`, matching against the branch
+  name `"release-20210101"` results in a positive match for `"*"`, then a
+  negative match for `"!release-*"`, then a non-match for
+  `"release-special"`. The last matching pattern is `"!release-*"`, which
+  is a negative match, so the workflow is not triggered.
+
+## Linux image configuration
+
+By default, workflows run on an Ubuntu 18.04-based image. You can
+customize the image using the `container_image` action setting:
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: "Test all targets"
+    container_image: "ubuntu-24.04" # <-- add this line
+    steps:
+      - run: "bazel test //..."
+```
+
+The supported values for `container_image` are:
+
+- `"ubuntu-18.04"` (the default)
+- `"ubuntu-20.04"`
+- `"ubuntu-22.04"`
+- `"ubuntu-24.04"`
+
+These images are aliases for BuildBuddy's official Ubuntu-based CI images.
+
+### Installing custom software
+
+If BuildBuddy's official Ubuntu images do not contain the software that
+you need, you can install custom software using `apt-get` at runtime.
+
+Because workflow VMs are snapshotted and reused between runs, you can
+speed up workflows by skipping `apt-get install` if the package is already
+installed.
+
+Example:
+
+```yaml title="buildbuddy.yaml"
+actions:
+  - name: Test
+    steps:
+      # Ensure apt packages are installed ("libexample0" in this example)
+      # Note: workflow VMs are snapshotted and reused, so normally,
+      # the apt-get install step only needs to run once.
+      - run: |
+          if ! [ -e /usr/lib/libexample.so.0 ] ; do
+            # libexample0 is not installed; install it:
+            sudo apt-get update && sudo apt-get install -y libexample0
+          fi
+      - run: |
+          bazel test //some/target/that/needs:libexample
+```
+
+If you have requirements that prevent you from using one of the official
+Ubuntu images, please [contact us](https://buildbuddy.io/contact).
+
+## Linux resource configuration
+
+By default, Linux workflow VMs have the following resources available:
 
 - 3 CPU
 - 8 GB of RAM
@@ -263,31 +531,17 @@ That's it! Whenever any of the configured triggers are matched, one of
 the Mac executors in the `workflows` pool should execute the
 workflow, and BuildBuddy will publish the results to your branch.
 
-## Attaching Bazel artifacts to workflows
+## Troubleshooting
 
-Bazel supports several flags such as `--remote_grpc_log` that allow
-writing additional debug logs and metadata files associated with an
-invocation.
+### Unexpected cache misses
 
-To provide easy access to these files, BuildBuddy supports a special
-directory called the **workflow artifacts directory**. If you write files
-to this directory, BuildBuddy will automatically upload those files and
-show them in the UI for the workflow. You can get the path to the workflow
-artifacts directory using the environment variable
-`$BUILDBUDDY_ARTIFACTS_DIRECTORY`.
+If seeing unexpected cache misses from multiple runs of the same Workflow,
+check whether [merge with base](#merge-with-base) is pulling in frequent changes from the
+base branch. Even when the PR branch is unchanged, a new base branch tip can
+produce a different merged base, which can invalidate the Bazel cache
+and require rebuilds. See the [merge with base section](#merge-with-base) for more detail.
 
-Example `buildbuddy.yaml` configuration:
-
-```yaml title="buildbuddy.yaml"
-actions:
-  - name: "Test"
-    # ...
-    steps:
-      - run: "bazel test //... --remote_grpc_log=$BUILDBUDDY_ARTIFACTS_DIRECTORY/grpc.log"
-```
-
-BuildBuddy creates a new artifacts directory for each Bazel command, and
-recursively uploads all files in the directory after the command exits.
+If so, consider setting `merge_with_base_interval`.
 
 ## buildbuddy.yaml schema
 
@@ -365,6 +619,16 @@ A named group of Bazel commands that run when triggered.
 - **`timeout`** (`duration` string, e.g. '30m', '1h'): If set, workflow actions that have been
   running for longer than this duration will be canceled automatically. This
   only applies to a single invocation, and does not include multiple retry attempts.
+- **`allow_concurrent_runs`** (`boolean`, default: `false`): If set to `true`,
+  multiple runs of the same action on the same branch will be allowed to run concurrently.
+  By default or if set to `false`, concurrent runs will be automatically cancelled.
+  See [Concurrent Workflow runs](#concurrent-workflow-runs).
+- **`allow_concurrent_runs_on_branches`** (list of `string`): Branches that are allowed
+  to run concurrently, even when `allow_concurrent_runs` is `false`.
+  When unset, defaults to the repo's default branch. Has no effect when
+  `allow_concurrent_runs` is `true`. Patterns are matched using the rules
+  described in [Ref pattern matching](#ref-pattern-matching). See
+  [Concurrent Workflow runs](#concurrent-workflow-runs).
 
 ### `Triggers`
 
@@ -380,6 +644,9 @@ Defines whether an action should run when a branch is pushed to the repo.
   This is required if you want to use BuildBuddy to report the status of
   this action on pull requests, and optionally prevent pull requests from
   being merged if the action fails.
+- **`schedule`** ([`ScheduleTrigger`](#scheduletrigger)):
+  Configuration for running the action on a recurring schedule. The
+  action runs against the latest commit on the repo's default branch.
 
 ### `PushTrigger`
 
@@ -387,10 +654,14 @@ Defines whether an action should execute when a branch is pushed.
 
 **Fields:**
 
-- **`branches`** (`string` list): The branches that, when pushed to, will
-  trigger the action. This field accepts a simple wildcard character
-  (`"*"`) as a possible value, which will match any branch, as well as
-  `"gh-readonly-queue/*"`, which matches GitHub's merge queue branches.
+- **`branches`** (`string` list): The branch patterns that determine
+  whether a push to the branch will trigger the workflow. Patterns are
+  matched using the rules described in
+  [Ref pattern matching](#ref-pattern-matching)
+- **`tags`** (`string` list): The tag patterns that determine
+  whether a push to the tag will trigger the workflow. Patterns are
+  matched using the rules described in
+  [Ref pattern matching](#ref-pattern-matching)
 
 ### `PullRequestTrigger`
 
@@ -399,18 +670,44 @@ pushed.
 
 **Fields:**
 
-- **`branches`** (`string` list): The _base_ branches of a pull request.
-  For example, if this is set to `[ "v1", "v2" ]`, then the associated
-  action is only run when a PR wants to merge a branch _into_ the `v1`
-  branch or the `v2` branch. This field accepts a simple wildcard
-  character (`"*"`) as a possible value, which will match any branch.
+- **`branches`** (`string` list): The branch patterns that determine whether an
+  update to the pull request will trigger the workflow. The _base_ branch of the
+  PR is matched against this list. For example, if this is set to
+  `[ "main", "release/*" ]`, then the associated action is only run when a PR
+  wants to merge a branch _into_ the `main` branch or any branch prefixed with
+  `release/`. Branch patterns are matched using the rules described in
+  [Ref pattern matching](#ref-pattern-matching)
+- **`types`** (`string` list): The pull request actions that trigger the
+  workflow. The supported values are `opened`, `synchronize`, `reopened`,
+  `edited` (base-branch changes only), `ready_for_review`, `auto_merge_enabled`,
+  and `approved`. If unset, the trigger fires on `opened`, `synchronize`,
+  `reopened`, and base-branch edits. Set this if you only want the Workflow
+  to run on specific actions - for example, `[ "ready_for_review" ]` to run only when
+  a draft PR is marked ready for review.
 - **`merge_with_base`** (`boolean`, default: `true`): Whether to merge the
   base branch into the PR branch before running the workflow action. This
   can help ensure that the changes in the PR branch do not conflict with
   the main branch. However, the action will not be continuously re-run as
   changes are pushed to the base branch. For stronger protection against
-  breaking the main branch, you may wish to use [merge
-  queues](#merge-queue-support).
+  breaking the main branch, you may wish to use
+  [merge queues](#merge-queue-support). See
+  [Merge with base behavior](#merge-with-base).
+- **`merge_with_base_interval`** (`duration`, optional): If set with
+  `merge_with_base: true`, merge with the oldest base branch commit in the current interval (UTC)
+  instead of the base branch tip, improving cache stability across runs.
+  Capped at `3h`. See [Merge with base interval](#merge-with-base-interval) for more details.
+
+### `ScheduleTrigger`
+
+Defines a recurring schedule for an action using cron expressions.
+
+**Fields:**
+
+- **`crons`** (`string` list): One or more 5-field cron expressions
+  that define when the action should run. All times are UTC. The minimum
+  supported interval between triggers is 15 minutes. See
+  [Scheduling workflows with cron expressions](#scheduling-workflows-with-cron-expressions)
+  for format details and examples.
 
 ### `ResourceRequests`
 

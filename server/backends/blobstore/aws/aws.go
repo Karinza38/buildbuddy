@@ -28,18 +28,20 @@ import (
 
 var (
 	// AWS S3 flags
-	awsS3Region                   = flag.String("storage.aws_s3.region", "", "The AWS region.")
-	awsS3Bucket                   = flag.String("storage.aws_s3.bucket", "", "The AWS S3 bucket to store files in.")
-	awsS3CredentialsProfile       = flag.String("storage.aws_s3.credentials_profile", "", "A custom credentials profile to use.")
-	awsS3WebIdentityTokenFilePath = flag.String("storage.aws_s3.web_identity_token_file", "", "The file path to the web identity token file.")
-	awsS3RoleARN                  = flag.String("storage.aws_s3.role_arn", "", "The role ARN to use for web identity auth.")
-	awsS3RoleSessionName          = flag.String("storage.aws_s3.role_session_name", "", "The role session name to use for web identity auth.")
-	awsS3Endpoint                 = flag.String("storage.aws_s3.endpoint", "", "The AWS endpoint to use, useful for configuring the use of MinIO.")
-	awsS3StaticCredentialsID      = flag.String("storage.aws_s3.static_credentials_id", "", "Static credentials ID to use, useful for configuring the use of MinIO.")
-	awsS3StaticCredentialsSecret  = flag.String("storage.aws_s3.static_credentials_secret", "", "Static credentials secret to use, useful for configuring the use of MinIO.", flag.Secret)
-	awsS3StaticCredentialsToken   = flag.String("storage.aws_s3.static_credentials_token", "", "Static credentials token to use, useful for configuring the use of MinIO.")
-	awsS3DisableSSL               = flag.Bool("storage.aws_s3.disable_ssl", false, "Disables the use of SSL, useful for configuring the use of MinIO.", flag.Deprecated("Specify a non-HTTPS endpoint instead."))
-	awsS3ForcePathStyle           = flag.Bool("storage.aws_s3.s3_force_path_style", false, "Force path style urls for objects, useful for configuring the use of MinIO.")
+	awsS3Region                    = flag.String("storage.aws_s3.region", "", "The AWS region.")
+	awsS3Bucket                    = flag.String("storage.aws_s3.bucket", "", "The AWS S3 bucket to store files in.")
+	awsS3CredentialsProfile        = flag.String("storage.aws_s3.credentials_profile", "", "A custom credentials profile to use.")
+	awsS3WebIdentityTokenFilePath  = flag.String("storage.aws_s3.web_identity_token_file", "", "The file path to the web identity token file.")
+	awsS3RoleARN                   = flag.String("storage.aws_s3.role_arn", "", "The role ARN to use for web identity auth.")
+	awsS3RoleSessionName           = flag.String("storage.aws_s3.role_session_name", "", "The role session name to use for web identity auth.")
+	awsS3Endpoint                  = flag.String("storage.aws_s3.endpoint", "", "The AWS endpoint to use, useful for configuring the use of MinIO.")
+	awsS3StaticCredentialsID       = flag.String("storage.aws_s3.static_credentials_id", "", "Static credentials ID to use, useful for configuring the use of MinIO.")
+	awsS3StaticCredentialsSecret   = flag.String("storage.aws_s3.static_credentials_secret", "", "Static credentials secret to use, useful for configuring the use of MinIO.", flag.Secret)
+	awsS3StaticCredentialsToken    = flag.String("storage.aws_s3.static_credentials_token", "", "Static credentials token to use, useful for configuring the use of MinIO.")
+	awsS3DisableSSL                = flag.Bool("storage.aws_s3.disable_ssl", false, "Disables the use of SSL, useful for configuring the use of MinIO.", flag.Deprecated("Specify a non-HTTPS endpoint instead."))
+	awsS3ForcePathStyle            = flag.Bool("storage.aws_s3.s3_force_path_style", false, "Force path style urls for objects, useful for configuring the use of MinIO.")
+	awsS3DisableChecksumValidation = flag.Bool("storage.aws_s3.disable_checksum_validation", false, "If true, disable checksum validation. Useful for non-AWS S3 API providers.")
+	awsS3MaxUploadParts            = flag.Int("storage.aws_s3.max_upload_parts", 0, "The maximum number of parts to split blobs into when performing multi-part uploads. When not specified, uploads over 5MB are split into 5MB parts.")
 )
 
 const (
@@ -79,7 +81,7 @@ func NewAwsS3BlobStore(ctx context.Context) (*AwsS3BlobStore, error) {
 		log.Debugf("AWS blobstore endpoint found: %q", *awsS3Endpoint)
 		configOptions = append(configOptions, config.WithEndpointResolverWithOptions(
 			aws.EndpointResolverWithOptionsFunc(
-				func(_, _ string, _ ...interface{}) (aws.Endpoint, error) {
+				func(_, _ string, _ ...any) (aws.Endpoint, error) {
 					return aws.Endpoint{
 						URL:               *awsS3Endpoint,
 						SigningRegion:     *awsS3Region,
@@ -113,6 +115,11 @@ func NewAwsS3BlobStore(ctx context.Context) (*AwsS3BlobStore, error) {
 		func(o *s3.Options) {
 			log.Debug("AWS blobstore forcing path style")
 			o.UsePathStyle = *awsS3ForcePathStyle
+			if *awsS3DisableChecksumValidation {
+				log.Debug("AWS request/response checksum calculation: only when required")
+				o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+				o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+			}
 		},
 	)
 	log.Debug("AWS blobstore service client created")
@@ -121,7 +128,11 @@ func NewAwsS3BlobStore(ctx context.Context) (*AwsS3BlobStore, error) {
 		client:     client,
 		bucket:     awsS3Bucket,
 		downloader: s3manager.NewDownloader(client),
-		uploader:   s3manager.NewUploader(client),
+		uploader: s3manager.NewUploader(client, func(uploader *s3manager.Uploader) {
+			if *awsS3MaxUploadParts != 0 {
+				uploader.MaxUploadParts = int32(*awsS3MaxUploadParts)
+			}
+		}),
 	}
 
 	// S3 access points can't modify or delete buckets
@@ -145,8 +156,7 @@ func (a *AwsS3BlobStore) bucketExists(ctx context.Context, bucketName string) (b
 	if err == nil {
 		return true, nil
 	}
-	var nf *s3types.NotFound
-	if errors.As(err, &nf) {
+	if _, ok := errors.AsType[*s3types.NotFound](err); ok {
 		return false, nil
 	}
 	return false, err
@@ -178,7 +188,7 @@ func (a *AwsS3BlobStore) createBucketIfNotExists(ctx context.Context, bucketName
 func (a *AwsS3BlobStore) ReadBlob(ctx context.Context, blobName string) ([]byte, error) {
 	start := time.Now()
 	b, err := a.download(ctx, blobName)
-	util.RecordReadMetrics(awsS3Label, start, b, err)
+	util.RecordReadMetrics(awsS3Label, start, len(b), err)
 	return util.Decompress(b, err)
 }
 
@@ -193,10 +203,10 @@ func (a *AwsS3BlobStore) download(ctx context.Context, blobName string) ([]byte,
 	spn.End()
 
 	if err != nil {
-		var nsk *s3types.NoSuchKey
-		if errors.As(err, &nsk) {
+		if _, ok := errors.AsType[*s3types.NoSuchKey](err); ok {
 			return nil, status.NotFoundError(err.Error())
 		}
+		return nil, err
 	}
 
 	return buff.Bytes(), nil
@@ -262,12 +272,13 @@ func (a *AwsS3BlobStore) BlobExists(ctx context.Context, blobName string) (bool,
 		Key:    &blobName,
 	}
 
+	start := time.Now()
 	ctx, spn := tracing.StartSpan(ctx)
 	defer spn.End()
 	_, err := a.client.HeadObject(ctx, params)
+	util.RecordExistsMetrics(awsS3Label, start, err)
 	if err != nil {
-		var nf *s3types.NotFound
-		if errors.As(err, &nf) {
+		if _, ok := errors.AsType[*s3types.NotFound](err); ok {
 			return false, nil
 		}
 		return false, err
@@ -301,7 +312,7 @@ func (a *AwsS3BlobStore) Writer(ctx context.Context, blobName string) (interface
 
 	zw := util.NewCompressWriter(pw)
 	cwc := ioutil.NewCustomCommitWriteCloser(zw)
-	cwc.CommitFn = func(int64) error {
+	cwc.SetCommitFn(func(int64) error {
 		if compresserCloseErr := zw.Close(); compresserCloseErr != nil {
 			cancel() // Don't try to finish the commit op if Close() failed.
 			if pipeCloseErr := pw.Close(); pipeCloseErr != nil {
@@ -315,10 +326,10 @@ func (a *AwsS3BlobStore) Writer(ctx context.Context, blobName string) (interface
 			return writerCloseErr
 		}
 		return <-errch
-	}
-	cwc.CloseFn = func() error {
+	})
+	cwc.SetCloseFn(func() error {
 		cancel()
 		return pw.Close()
-	}
+	})
 	return cwc, nil
 }

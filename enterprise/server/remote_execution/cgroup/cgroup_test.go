@@ -1,6 +1,8 @@
 package cgroup
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,6 +65,8 @@ func TestSettingsMap(t *testing.T) {
 					Rbps:  proto.Int64(4096e3),
 					Wbps:  proto.Int64(1024e3),
 				},
+				CpusetCpus: []int32{0, 1, 2, 3},
+				NumaNode:   proto.Int32(0),
 			},
 			expectedMap: map[string]string{
 				"cpu.weight":       "200",
@@ -81,6 +85,8 @@ func TestSettingsMap(t *testing.T) {
 				"io.latency":       "279:8 target=100000",
 				"io.weight":        "279:8 300",
 				"io.max":           "279:8 riops=1000 wiops=500 rbps=4096000 wbps=1024000",
+				"cpuset.cpus":      "0,1,2,3",
+				"cpuset.mems":      "0",
 			},
 		},
 		{
@@ -125,6 +131,64 @@ func TestSettingsMap(t *testing.T) {
 	}
 }
 
+func TestReadCgroupProcs(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("123\n456\n123\n"), 0o644))
+	// Place a process in a child cgroup. Some container runtime
+	// configurations place container processes in a child cgroup of the
+	// container's top-level cgroup, which then lists no processes of its own.
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "child"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child", "cgroup.procs"), []byte("789\n"), 0o644))
+
+	// Processes listed in the cgroup and in its descendants should all appear
+	// in the returned set, with duplicate entries collapsed.
+	pids, err := ReadCgroupProcs(dir)
+	require.NoError(t, err)
+	require.Equal(t, map[int]struct{}{123: {}, 456: {}, 789: {}}, pids)
+}
+
+func TestReadCgroupProcsMissingCgroup(t *testing.T) {
+	dir := t.TempDir()
+
+	// A missing cgroup should surface as ErrNotExist so callers can
+	// distinguish a deleted cgroup from an unreadable one.
+	_, err := ReadCgroupProcs(filepath.Join(dir, "removed"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestReadMemoryMax(t *testing.T) {
+	dir := t.TempDir()
+
+	// A numeric memory.max value should be returned as the limit in bytes.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.max"), []byte("1073741824\n"), 0644))
+	limit, err := ReadMemoryMax(dir)
+	require.NoError(t, err)
+	require.NotNil(t, limit)
+	require.Equal(t, int64(1073741824), *limit)
+
+	// The special value "max" means the cgroup has no memory limit, which is
+	// reported as nil.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.max"), []byte("max\n"), 0644))
+	limit, err = ReadMemoryMax(dir)
+	require.NoError(t, err)
+	require.Nil(t, limit)
+}
+
+func TestReadMemoryStatField(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.stat"), []byte("anon 1024\nfile 2048\ninactive_file 512\n"), 0644))
+
+	// The requested field's value should be returned, ignoring other fields.
+	value, err := ReadMemoryStatField(dir, "inactive_file")
+	require.NoError(t, err)
+	require.Equal(t, int64(512), value)
+
+	// Requesting a field that is not present in memory.stat should return an
+	// error.
+	_, err = ReadMemoryStatField(dir, "nonexistent_field")
+	require.Error(t, err)
+}
+
 func TestParsePSI(t *testing.T) {
 	r := strings.NewReader(`some avg10=0.00 avg60=1.00 avg300=4.11 total=123456
 full avg10=0.01 avg60=0.50 avg300=1.23 total=23456
@@ -157,4 +221,62 @@ func TestParseIOStats(t *testing.T) {
 		{Maj: 259, Min: 1, Rbytes: 688128, Wbytes: 0, Rios: 21, Wios: 0, Dbytes: 0, Dios: 0},
 		{Maj: 9, Min: 0, Rbytes: 3952640, Wbytes: 0, Rios: 48, Wios: 0, Dbytes: 0, Dios: 0},
 	}, stats, protocmp.Transform()))
+}
+
+func TestParentPath(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{
+			name:     "root",
+			path:     "/",
+			expected: "/",
+		},
+		{
+			name:     "cgroup root",
+			path:     "/sys/fs/cgroup",
+			expected: "/sys/fs/cgroup",
+		},
+		{
+			name:     "cgroup root with trailing slash",
+			path:     "/sys/fs/cgroup/",
+			expected: "/sys/fs/cgroup",
+		},
+		{
+			name:     "single level under cgroup root",
+			path:     "/sys/fs/cgroup/foo",
+			expected: "/sys/fs/cgroup",
+		},
+		{
+			name:     "multi level under cgroup root",
+			path:     "/sys/fs/cgroup/foo/bar",
+			expected: "/sys/fs/cgroup/foo",
+		},
+		{
+			name:     "relative path",
+			path:     "foo",
+			expected: ".",
+		},
+		{
+			name:     "relative path with dot",
+			path:     "./foo",
+			expected: ".",
+		},
+		{
+			name:     "empty string",
+			path:     "",
+			expected: ".",
+		},
+		{
+			name:     "dot",
+			path:     ".",
+			expected: ".",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.expected, ParentPath(test.path))
+		})
+	}
 }

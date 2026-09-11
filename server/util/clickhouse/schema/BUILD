@@ -8,8 +8,10 @@ go_library(
     deps = [
         "//server/build_event_protocol/invocation_format",
         "//server/tables",
+        "//server/usage/sku",
         "//server/util/log",
         "//server/util/status",
+        "@com_github_clickhouse_clickhouse_go_v2//lib/column/orderedmap",
         "@io_gorm_gorm//:gorm",
     ],
 )

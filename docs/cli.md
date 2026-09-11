@@ -15,7 +15,7 @@ It's written in [go](https://go.dev/), [fully open source](https://github.com/bu
 The easiest way to install the BuildBuddy CLI is by running this simple bash script, which works on both MacOS and Linux:
 
 ```bash
-curl -fsSL install.buildbuddy.io | bash
+curl -fsSL https://install.buildbuddy.io | bash
 ```
 
 If you're not comfortable executing random bash scripts from the internet (we totally get it!), you can take a look at what this script is doing under the hood, by visiting [install.buildbuddy.io](https://install.buildbuddy.io) in your browser.
@@ -29,7 +29,7 @@ You can perform those steps manually yourself if you'd like!
 You can update the cli by re-running the installation script:
 
 ```bash
-curl -fsSL install.buildbuddy.io | bash
+curl -fsSL https://install.buildbuddy.io | bash
 ```
 
 If you installed BuildBuddy manually instead, you can repeat those installation steps to update your CLI.
@@ -45,17 +45,17 @@ bb version
 If you're already using Bazelisk, you can easily install the BuildBuddy CLI for your entire project by running:
 
 ```bash
-echo "$(echo "buildbuddy-io/5.0.100"; cat .bazelversion)" > .bazelversion
+echo "$(echo "buildbuddy-io/5.0.321"; cat .bazelversion)" > .bazelversion
 ```
 
-This will simply prepend `buildbuddy-io/5.0.100` on a new line above your `.bazelversion` file like so:
+This will simply prepend `buildbuddy-io/5.0.321` on a new line above your `.bazelversion` file like so:
 
 ```title=".bazelversion"
-buildbuddy-io/5.0.100
+buildbuddy-io/5.0.321
 7.3.0
 ```
 
-The version <span class="cli-version">5.0.25</span> of the BuildBuddy CLI will now automatically be used when you type `bazel` or `bazelisk` and continue to use the Bazel version specified on the second line of your `.bazelversion` file.
+The version <span class="cli-version">5.0.321</span> of the BuildBuddy CLI will now automatically be used when you type `bazel` or `bazelisk` and continue to use the Bazel version specified on the second line of your `.bazelversion` file.
 
 To find the latest version of the BuildBuddy CLI, you can view our releases page [here](https://github.com/buildbuddy-io/bazel/releases).
 
@@ -76,6 +76,11 @@ For more information on how to write your own plugins, check out the [plugin doc
 ### Authentication
 
 The BuildBuddy CLI makes authentication to BuildBuddy a breeze. You can simply type `bb login` and follow the instructions. Once you're logged in, all of your requests to BuildBuddy will be authenticated to your organization.
+
+### Configuration
+
+You can save BuildBuddy CLI options in a [`.bbrc` file](/docs/cli-config). It
+uses `.bazelrc`-style sections and named configs.
 
 ## Contributing
 

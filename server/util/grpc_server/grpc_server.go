@@ -6,28 +6,31 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/rpc/interceptors"
-	"github.com/buildbuddy-io/buildbuddy/server/util/bazel_request"
+	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
+	"github.com/buildbuddy-io/buildbuddy/server/util/clientip"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_forward"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
+	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric/noop"
-	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/experimental"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/stats"
 
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	_ "google.golang.org/grpc/encoding/gzip" // imported for side effects; DO NOT REMOVE.
 	hlpb "google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -46,6 +49,8 @@ var (
 	internalGRPCSPort = flag.Int("internal_grpcs_port", 1988, "The port to listen for internal gRPCS traffic on")
 
 	enablePrometheusHistograms = flag.Bool("app.enable_prometheus_histograms", true, "If true, collect prometheus histograms for all RPCs")
+
+	serverWorkerMultiplier = flag.Int("grpc_server_worker_multiplier", 2, "Multiplier applied to GOMAXPROCS to determine the number of gRPC server workers. 0 disables workers")
 )
 
 func GRPCPort() int {
@@ -74,6 +79,9 @@ func MaxRecvMsgSizeBytes() int {
 type GRPCServerConfig struct {
 	ExtraChainedUnaryInterceptors  []grpc.UnaryServerInterceptor
 	ExtraChainedStreamInterceptors []grpc.StreamServerInterceptor
+	PostAuthUnaryInterceptors      []grpc.UnaryServerInterceptor
+	PostAuthStreamInterceptors     []grpc.StreamServerInterceptor
+	ExtraStatsHandlers             []stats.Handler
 }
 
 type GRPCServer struct {
@@ -87,6 +95,9 @@ func (b *GRPCServer) GetServer() *grpc.Server {
 }
 
 func New(env environment.Env, port int, ssl bool, config GRPCServerConfig) (*GRPCServer, error) {
+	if err := clientip.Init(); err != nil {
+		return nil, err
+	}
 	b := &GRPCServer{env: env}
 	if ssl && !env.GetSSLService().IsEnabled() {
 		return nil, status.InvalidArgumentError("GRPCS requires SSL Service")
@@ -109,7 +120,7 @@ func New(env environment.Env, port int, ssl bool, config GRPCServerConfig) (*GRP
 	} else {
 		log.Infof("gRPC listening on %s", b.hostPort)
 	}
-	if fwdingOptions := grpc_forward.GetForwardingServerOption(); fwdingOptions != nil {
+	if fwdingOptions := grpc_forward.GetForwardingServerOption(env); fwdingOptions != nil {
 		grpcOptions = append(grpcOptions, fwdingOptions)
 	}
 	b.server = grpc.NewServer(grpcOptions...)
@@ -118,12 +129,8 @@ func New(env environment.Env, port int, ssl bool, config GRPCServerConfig) (*GRP
 	// enumerate our services and call them.
 	reflection.Register(b.server)
 
-	// Support prometheus grpc metrics.
-	grpc_prometheus.Register(b.server)
-
-	if *enablePrometheusHistograms {
-		grpc_prometheus.EnableHandlingTimeHistogram(grpc_prometheus.WithHistogramBuckets([]float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}))
-	}
+	// Initialize timeseries for all known grpc methods.
+	Metrics().InitializeMetrics(b.server)
 
 	// Register health check service.
 	hlpb.RegisterHealthServer(b.server, b.env.GetHealthChecker())
@@ -186,64 +193,62 @@ func GRPCShutdownFunc(grpcServer *grpc.Server) func(ctx context.Context) error {
 	}
 }
 
-func propagateActionIDToSpan(ctx context.Context) {
-	actionId := bazel_request.GetActionID(ctx)
-	if actionId == "" {
-		return
-	}
-	span := trace.SpanFromContext(ctx)
-	span.SetAttributes(attribute.String("action_id", actionId))
-}
-
-func propagateInvocationIDToSpan(ctx context.Context) {
-	invocationId := bazel_request.GetInvocationID(ctx)
-	if invocationId == "" {
-		return
-	}
-	span := trace.SpanFromContext(ctx)
-	span.SetAttributes(attribute.String("invocation_id", invocationId))
-}
-
-func propagateRequestMetadataIDsToSpanUnaryServerInterceptor() grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-		propagateInvocationIDToSpan(ctx)
-		propagateActionIDToSpan(ctx)
-		return handler(ctx, req)
-	}
-}
-
-func propagateRequestMetadataIDsToSpanStreamServerInterceptor() grpc.StreamServerInterceptor {
-	return func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		ctx := stream.Context()
-		propagateInvocationIDToSpan(ctx)
-		propagateActionIDToSpan(ctx)
-		return handler(srv, stream)
-	}
-}
-
 func CommonGRPCServerOptions(env environment.Env) []grpc.ServerOption {
 	return CommonGRPCServerOptionsWithConfig(env, GRPCServerConfig{})
 }
 
+// Metrics returns middleware that can be used to obtain gRPC interceptors
+// that add prometheus metrics for handled RPCs.
+//
+// e.g. grpc_server.Metrics().UnaryServerInterceptor()
+//
+// N.B. OnceValue is used to ensure that prometheus.MustRegister is only called
+// once.
+var Metrics = sync.OnceValue(func() *grpc_prometheus.ServerMetrics {
+	var opts []grpc_prometheus.ServerMetricsOption
+	if *enablePrometheusHistograms {
+		opts = append(opts, grpc_prometheus.WithServerHandlingTimeHistogram(
+			grpc_prometheus.WithHistogramBuckets(
+				[]float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10})))
+	}
+	ms := grpc_prometheus.NewServerMetrics(opts...)
+	prometheus.MustRegister(ms)
+	return ms
+})
+
 func CommonGRPCServerOptionsWithConfig(env environment.Env, config GRPCServerConfig) []grpc.ServerOption {
-	return []grpc.ServerOption{
+	workerMultiplier := uint32(*serverWorkerMultiplier)
+	if workerMultiplier > 1000 {
+		// Even 100 is too big, but just catch overflow.
+		alert.UnexpectedEvent(
+			"grpc_server_worker_multiplier_invalid",
+			"uint32(grpc_server_worker_multiplier) is too large (%v). Disabling workers", *serverWorkerMultiplier)
+		workerMultiplier = 0
+	}
+	statsHandler := otelgrpc.NewServerHandler(otelgrpc.WithMeterProvider(rpcutil.MeterProvider()))
+	if *rpcutil.OTELGRPCMessageEventsEnabled {
+		statsHandler = rpcutil.WithTracingMessageEvents(statsHandler)
+	}
+	opts := []grpc.ServerOption{
+		grpc.StatsHandler(statsHandler),
 		interceptors.GetUnaryInterceptor(env, config.ExtraChainedUnaryInterceptors...),
 		interceptors.GetStreamInterceptor(env, config.ExtraChainedStreamInterceptors...),
-		grpc.ChainUnaryInterceptor(
-			otelgrpc.UnaryServerInterceptor(otelgrpc.WithMeterProvider(noop.NewMeterProvider())),
-			propagateRequestMetadataIDsToSpanUnaryServerInterceptor()),
-		grpc.ChainStreamInterceptor(
-			otelgrpc.StreamServerInterceptor(otelgrpc.WithMeterProvider(noop.NewMeterProvider())),
-			propagateRequestMetadataIDsToSpanStreamServerInterceptor()),
-		grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
-		grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
+		grpc.ChainUnaryInterceptor(config.PostAuthUnaryInterceptors...),
+		grpc.ChainStreamInterceptor(config.PostAuthStreamInterceptors...),
+		grpc.StreamInterceptor(interceptors.TracedStreamServerInterceptor("grpc_server.MetricsInterceptor", Metrics().StreamServerInterceptor())),
+		grpc.UnaryInterceptor(interceptors.TracedUnaryServerInterceptor("grpc_server.MetricsInterceptor", Metrics().UnaryServerInterceptor())),
 		experimental.BufferPool(mem.DefaultBufferPool()),
 		grpc.MaxRecvMsgSize(MaxRecvMsgSizeBytes()),
-		keepaliveEnforcementPolicy(),
+		grpc.NumStreamWorkers(uint32(runtime.GOMAXPROCS(0)) * workerMultiplier),
+		KeepaliveEnforcementPolicy(),
 	}
+	for _, h := range config.ExtraStatsHandlers {
+		opts = append(opts, grpc.StatsHandler(h))
+	}
+	return opts
 }
 
-func keepaliveEnforcementPolicy() grpc.ServerOption {
+func KeepaliveEnforcementPolicy() grpc.ServerOption {
 	// Set to avoid errors: Bandwidth exhausted HTTP/2 error code: ENHANCE_YOUR_CALM Received Goaway too_many_pings
 	return grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 		MinTime:             10 * time.Second, // If a client pings more than once every 10 seconds, terminate the connection

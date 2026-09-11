@@ -10,6 +10,8 @@ They have options to deploy everything necessary to use all of BuildBuddy's bell
 
 The official BuildBuddy charts live in our [buildbuddy-helm repo](https://github.com/buildbuddy-io/buildbuddy-helm).
 
+For guidance on deploying and sizing self-hosted Cache Proxies, see the [Enterprise Cache Proxy documentation](enterprise-proxy.md).
+
 ## TL;DR
 
 ```bash
@@ -166,6 +168,7 @@ config:
     events_api_url: "grpcs://buildbuddy-grpc.example.com"
     cache_api_url: "grpcs://buildbuddy-grpc.example.com"
   auth:
+    jwt_key: "<randomly-generated-secret>"
     ## To use Google auth, get client_id and client_secret here:
     ## https://console.developers.google.com/apis/credentials
     oauth_providers:

@@ -3,6 +3,7 @@ package fetch_server
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -14,21 +15,31 @@ import (
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/environment"
+	"github.com/buildbuddy-io/buildbuddy/server/http/httpclient"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/cachetools"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/prefix"
 	"github.com/buildbuddy-io/buildbuddy/server/util/scratchspace"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
+	cachepb "github.com/buildbuddy-io/buildbuddy/proto/cache"
+	cspb "github.com/buildbuddy-io/buildbuddy/proto/cache_service"
 	rapb "github.com/buildbuddy-io/buildbuddy/proto/remote_asset"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
-	rspb "github.com/buildbuddy-io/buildbuddy/proto/resource"
+	remote_cache_config "github.com/buildbuddy-io/buildbuddy/server/remote_cache/config"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
+	gerrdetails "google.golang.org/genproto/googleapis/rpc/errdetails"
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	gcodes "google.golang.org/grpc/codes"
-	"google.golang.org/protobuf/types/known/durationpb"
+	gstatus "google.golang.org/grpc/status"
+)
+
+var (
+	allowedPrivateIPs = flag.Slice("remote_asset.allowed_private_ips", []string{}, "Allowed IP ranges for fetching remote assets. Private IPs are disallowed by default.")
 )
 
 const (
@@ -36,11 +47,31 @@ const (
 	BazelCanonicalIDQualifier         = "bazel.canonical_id"
 	BazelHttpHeaderPrefixQualifier    = "http_header:"
 	BazelHttpHeaderUrlPrefixQualifier = "http_header_url:"
-	maxHTTPTimeout                    = 60 * time.Minute
+
+	maxHTTPTimeout = 60 * time.Minute
 )
 
+// makeUnsupportedQualifiersErrStatus creates a gRPC status error that includes a list of unsupported qualifiers.
+func makeUnsupportedQualifiersErrStatus(qualifierNames []string) error {
+	fieldViolations := make([]*gerrdetails.BadRequest_FieldViolation, 0, len(qualifierNames))
+	for _, name := range qualifierNames {
+		fieldViolations = append(fieldViolations, &gerrdetails.BadRequest_FieldViolation{
+			Field:       "qualifiers.name",
+			Description: fmt.Sprintf("%q not supported", name),
+		})
+	}
+	s := gstatus.New(gcodes.InvalidArgument, fmt.Sprintf("Unsupported qualifiers: %s", strings.Join(qualifierNames, ", ")))
+	s, err := s.WithDetails(&gerrdetails.BadRequest{FieldViolations: fieldViolations})
+	// should never happen
+	if err != nil {
+		log.Warningf("Failed to encode qualifier field violation: %v", err)
+	}
+	return s.Err()
+}
+
 type FetchServer struct {
-	env environment.Env
+	env                  environment.Env
+	allowedPrivateIPNets []*net.IPNet
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -60,12 +91,26 @@ func NewFetchServer(env environment.Env) (*FetchServer, error) {
 	if err := checkPreconditions(env); err != nil {
 		return nil, err
 	}
-	return &FetchServer{env: env}, nil
+	allowedPrivateIPNets := make([]*net.IPNet, 0, len(*allowedPrivateIPs))
+	for _, r := range *allowedPrivateIPs {
+		_, ipNet, err := net.ParseCIDR(r)
+		if err != nil {
+			return nil, fmt.Errorf("parse 'remote_asset.allowed_private_ips': %w", err)
+		}
+		allowedPrivateIPNets = append(allowedPrivateIPNets, ipNet)
+	}
+	return &FetchServer{
+		env:                  env,
+		allowedPrivateIPNets: allowedPrivateIPNets,
+	}, nil
 }
 
 func checkPreconditions(env environment.Env) error {
-	if env.GetCache() == nil {
-		return status.FailedPreconditionError("missing Cache")
+	if env.GetByteStreamClient() == nil {
+		return status.FailedPreconditionError("missing ByteStreamClient")
+	}
+	if env.GetContentAddressableStorageClient() == nil {
+		return status.FailedPreconditionError("missing ContentAddressableStorageClient")
 	}
 	return nil
 }
@@ -78,7 +123,8 @@ func timeoutFromContext(ctx context.Context) (time.Duration, bool) {
 	return time.Until(deadline), true
 }
 
-func timeoutHTTPClient(ctx context.Context, protoTimeout *durationpb.Duration) *http.Client {
+// computeRequestTimeout determines the overall timeout for the request.
+func (s *FetchServer) computeRequestTimeout(ctx context.Context, protoTimeout *durationpb.Duration) time.Duration {
 	timeout := time.Duration(0)
 	if ctxDuration, ok := timeoutFromContext(ctx); ok {
 		timeout = ctxDuration
@@ -89,19 +135,7 @@ func timeoutHTTPClient(ctx context.Context, protoTimeout *durationpb.Duration) *
 	if timeout == 0 || timeout > maxHTTPTimeout {
 		timeout = maxHTTPTimeout
 	}
-
-	tp := &http.Transport{
-		Dial: (&net.Dialer{
-			Timeout: timeout,
-		}).Dial,
-		TLSHandshakeTimeout: timeout,
-		Proxy:               http.ProxyFromEnvironment,
-	}
-
-	return &http.Client{
-		Timeout:   timeout,
-		Transport: tp,
-	}
+	return timeout
 }
 
 // parseChecksumQualifier returns a digest function and digest hash
@@ -109,13 +143,13 @@ func timeoutHTTPClient(ctx context.Context, protoTimeout *durationpb.Duration) *
 func parseChecksumQualifier(qualifier *rapb.Qualifier) (repb.DigestFunction_Value, string, error) {
 	for _, digestFunc := range digest.SupportedDigestFunctions() {
 		pr := fmt.Sprintf("%s-", strings.ToLower(repb.DigestFunction_Value_name[int32(digestFunc)]))
-		if strings.HasPrefix(qualifier.GetValue(), pr) {
-			b64hash := strings.TrimPrefix(qualifier.GetValue(), pr)
+		if after, ok := strings.CutPrefix(qualifier.GetValue(), pr); ok {
+			b64hash := after
 			decodedHash, err := base64.StdEncoding.DecodeString(b64hash)
 			if err != nil {
 				return repb.DigestFunction_UNKNOWN, "", status.FailedPreconditionErrorf("Error decoding qualifier %q: %s", qualifier.GetName(), err.Error())
 			}
-			expectedChecksum := fmt.Sprintf("%x", decodedHash)
+			expectedChecksum := hex.EncodeToString(decodedHash)
 			return digestFunc, expectedChecksum, nil
 		}
 	}
@@ -123,7 +157,7 @@ func parseChecksumQualifier(qualifier *rapb.Qualifier) (repb.DigestFunction_Valu
 }
 
 func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest) (*rapb.FetchBlobResponse, error) {
-	ctx, err := prefix.AttachUserPrefixToContext(ctx, p.env)
+	ctx, err := prefix.AttachUserPrefixToContext(ctx, p.env.GetAuthenticator())
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +166,7 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 	if storageFunc == repb.DigestFunction_UNKNOWN {
 		storageFunc = repb.DigestFunction_SHA256
 	}
+	var unsupportedQualifierNames []string
 	sharedHeader := make(http.Header)
 	uriHeaders := make(map[int]http.Header)
 	var checksumFunc repb.DigestFunction_Value
@@ -144,15 +179,15 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 			}
 			continue
 		}
-		if strings.HasPrefix(qualifier.GetName(), BazelHttpHeaderPrefixQualifier) {
+		if after, ok := strings.CutPrefix(qualifier.GetName(), BazelHttpHeaderPrefixQualifier); ok {
 			sharedHeader.Add(
-				strings.TrimPrefix(qualifier.GetName(), BazelHttpHeaderPrefixQualifier),
+				after,
 				qualifier.GetValue(),
 			)
 			continue
 		}
-		if strings.HasPrefix(qualifier.GetName(), BazelHttpHeaderUrlPrefixQualifier) {
-			idxAndKey := strings.TrimPrefix(qualifier.GetName(), BazelHttpHeaderUrlPrefixQualifier)
+		if after, ok := strings.CutPrefix(qualifier.GetName(), BazelHttpHeaderUrlPrefixQualifier); ok {
+			idxAndKey := after
 			halves := strings.Split(idxAndKey, ":")
 			if len(halves) != 2 {
 				// The http_header_url qualifier should be in the form
@@ -174,11 +209,16 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 				uriHeaders[uriIndex] = make(http.Header)
 			}
 			uriHeaders[uriIndex].Add(halves[1], qualifier.GetValue())
+			continue
 		}
 		if qualifier.GetName() == BazelCanonicalIDQualifier {
 			// TODO: Implement canonical ID handling.
 			continue
 		}
+		unsupportedQualifierNames = append(unsupportedQualifierNames, qualifier.GetName())
+	}
+	if len(unsupportedQualifierNames) > 0 {
+		return nil, makeUnsupportedQualifiersErrStatus(unsupportedQualifierNames)
 	}
 	if len(expectedChecksum) != 0 {
 		blobDigest := p.findBlobInCache(ctx, req.GetInstanceName(), checksumFunc, expectedChecksum)
@@ -191,16 +231,34 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 
 		if blobDigest != nil {
 			return &rapb.FetchBlobResponse{
-				Status:     &statuspb.Status{Code: int32(gcodes.OK)},
-				BlobDigest: blobDigest,
+				Status:         &statuspb.Status{Code: int32(gcodes.OK)},
+				BlobDigest:     blobDigest,
+				DigestFunction: storageFunc,
 			}, nil
 		}
 	}
-	httpClient := timeoutHTTPClient(ctx, req.GetTimeout())
+
+	httpClient := httpclient.New(p.allowedPrivateIPNets, "fetch_server")
+	// Don't send Referer headers on redirects. Go's http.Client adds these
+	// automatically, but some sites (e.g. SourceForge) use the Referer to
+	// detect non-browser clients and serve HTML instead of the file download.
+	// Curl doesn't automatically set this after redirects either.
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		req.Header.Del("Referer")
+		return nil
+	}
+	bsClient := getByteStreamClient(p.env)
+
+	ctx, cancel := context.WithTimeout(ctx, p.computeRequestTimeout(ctx, req.GetTimeout()))
+	defer cancel()
 
 	// Keep track of the last fetch error so that if we fail to fetch, we at
 	// least have something we can return to the client.
 	var lastFetchErr error
+	var lastFetchUri string
 
 	for i, uri := range req.GetUris() {
 		_, err := url.Parse(uri)
@@ -218,7 +276,7 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 		}
 		blobDigest, err := mirrorToCache(
 			ctx,
-			p.env.GetByteStreamClient(),
+			bsClient,
 			req.GetInstanceName(),
 			httpClient,
 			uri,
@@ -228,14 +286,16 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 			expectedChecksum,
 		)
 		if err != nil {
-			lastFetchErr = err
+			lastFetchErr = fmt.Errorf("%s: %w", uri, err)
+			lastFetchUri = uri
 			log.CtxWarningf(ctx, "Failed to mirror %q to cache: %s", uri, err)
 			continue
 		}
 		return &rapb.FetchBlobResponse{
-			Uri:        uri,
-			Status:     &statuspb.Status{Code: int32(gcodes.OK)},
-			BlobDigest: blobDigest,
+			Uri:            uri,
+			Status:         &statuspb.Status{Code: int32(gcodes.OK)},
+			BlobDigest:     blobDigest,
+			DigestFunction: storageFunc,
 		}, nil
 	}
 
@@ -250,6 +310,19 @@ func (p *FetchServer) FetchBlob(ctx context.Context, req *rapb.FetchBlobRequest)
 			Code:    int32(gcodes.NotFound),
 			Message: status.Message(lastFetchErr),
 		},
+		Uri: lastFetchUri,
+		// Workaround for a bug in Bazel 8 and earlier: Bazel doesn't check
+		// the status code and continues to look up the digest in the cache
+		// even in the case of an error. The lookup for the empty Digest
+		// message may succeed and return a cache hit for the empty file,
+		// which is incorrect. To prevent this while remaining
+		// spec-compliant, we return a valid Digest message that will never
+		// be a cache hit. Spec-compliant clients should ignore it entirely.
+		// https://github.com/bazelbuild/bazel/pull/25244
+		BlobDigest: &repb.Digest{
+			Hash:      strings.Repeat("1", 64),
+			SizeBytes: 1,
+		},
 	}, nil
 }
 
@@ -258,28 +331,27 @@ func (p *FetchServer) FetchDirectory(ctx context.Context, req *rapb.FetchDirecto
 }
 
 func (p *FetchServer) rewriteToCache(ctx context.Context, blobDigest *repb.Digest, instanceName string, fromFunc, toFunc repb.DigestFunction_Value) *repb.Digest {
-	cacheRN := digest.NewResourceName(blobDigest, instanceName, rspb.CacheType_CAS, fromFunc)
-	cache := p.env.GetCache()
-	reader, err := cache.Reader(ctx, cacheRN.ToProto(), 0, 0)
+	tmpFile, err := scratchspace.CreateTemp("remote-asset-fetch-*")
 	if err != nil {
-		log.CtxErrorf(ctx, "Failed to get cache reader for %s: %s", digest.String(blobDigest), err)
-		return nil
-	}
-	defer reader.Close()
-
-	tmpFilePath, err := tempCopy(reader)
-	if err != nil {
-		log.CtxErrorf(ctx, "Failed to copy from reader to temp for %s: %s", digest.String(blobDigest), err)
+		log.CtxErrorf(ctx, "failed to create temp file: %s", err)
 		return nil
 	}
 	defer func() {
-		if err := os.Remove(tmpFilePath); err != nil {
-			log.Errorf("Failed to remove temp file: %s", err)
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			log.CtxErrorf(ctx, "Failed to remove temp file: %s", err)
 		}
 	}()
 
-	bsClient := p.env.GetByteStreamClient()
-	storageDigest, err := cachetools.UploadFile(ctx, bsClient, instanceName, toFunc, tmpFilePath)
+	cacheRN := digest.NewCASResourceName(blobDigest, instanceName, fromFunc)
+	if remote_cache_config.ZstdTranscodingEnabled() {
+		cacheRN.SetCompressor(repb.Compressor_ZSTD)
+	}
+	if err := cachetools.GetBlob(ctx, getByteStreamClient(p.env), cacheRN, tmpFile); err != nil {
+		log.CtxErrorf(ctx, "Failed to read blob from cache for %s: %s", digest.String(blobDigest), err)
+		return nil
+	}
+
+	storageDigest, err := cachetools.UploadFile(ctx, getByteStreamClient(p.env), instanceName, toFunc, tmpFile.Name())
 	if err != nil {
 		log.CtxErrorf(ctx, "Failed to re-upload blob with new digestFunc %s for %s: %s", toFunc, digest.String(blobDigest), err)
 		return nil
@@ -296,29 +368,34 @@ func (p *FetchServer) findBlobInCache(ctx context.Context, instanceName string, 
 		// doesn't matter.
 		SizeBytes: 1,
 	}
-	cacheRN := digest.NewResourceName(blobDigest, instanceName, rspb.CacheType_CAS, checksumFunc)
+	cacheRN := digest.NewCASResourceName(blobDigest, instanceName, checksumFunc)
 	log.CtxDebugf(ctx, "Looking up %s in cache", blobDigest.Hash)
 
 	// Lookup metadata to get the correct digest size to be returned to
 	// the client.
-	cache := p.env.GetCache()
-	md, err := cache.Metadata(ctx, cacheRN.ToProto())
+	md, err := getCacheClient(p.env).GetMetadata(ctx, &cachepb.GetCacheMetadataRequest{
+		ResourceName: cacheRN.ToProto(),
+	})
 	if err != nil {
 		log.CtxInfof(ctx, "FetchServer failed to get metadata for %s: %s", expectedChecksum, err)
 		return nil
 	}
+
 	blobDigest.SizeBytes = md.DigestSizeBytes
 
-	// Even though we successfully fetched metadata, we need to renew
-	// the cache entry (using Contains()) to ensure that it doesn't
-	// expire by the time the client requests it from cache.
-	cacheRN = digest.NewResourceName(blobDigest, instanceName, rspb.CacheType_CAS, checksumFunc)
-	exists, err := cache.Contains(ctx, cacheRN.ToProto())
+	// The metadata API doesn't update the last access time, so we need to use the FindMissing API to renew the entry
+	// to ensure it doesn't expire by the time the client requests it from cache.
+	rsp, err := getCASClient(p.env).FindMissingBlobs(ctx, &repb.FindMissingBlobsRequest{
+		InstanceName:   instanceName,
+		BlobDigests:    []*repb.Digest{blobDigest},
+		DigestFunction: checksumFunc,
+		Purpose:        repb.FindMissingBlobsRequest_REMOTE_ASSET_FETCH,
+	})
 	if err != nil {
 		log.CtxErrorf(ctx, "Failed to renew %s: %s", digest.String(blobDigest), err)
 		return nil
 	}
-	if !exists {
+	if len(rsp.MissingBlobDigests) > 0 {
 		log.CtxInfof(ctx, "Blob %s expired before we could renew it", digest.String(blobDigest))
 		return nil
 	}
@@ -354,7 +431,7 @@ func mirrorToCache(
 	}
 	defer rsp.Body.Close()
 	if rsp.StatusCode < 200 || rsp.StatusCode >= 400 {
-		return nil, status.UnavailableErrorf("failed to fetch %q: HTTP %s", uri, err)
+		return nil, status.UnavailableErrorf("failed to fetch %q: HTTP %s", uri, rsp.Status)
 	}
 
 	// If we know what the hash should be and the content length is known,
@@ -362,7 +439,8 @@ func mirrorToCache(
 	// response to cache.
 	if checksumFunc == storageFunc && expectedChecksum != "" && rsp.ContentLength >= 0 {
 		d := &repb.Digest{Hash: expectedChecksum, SizeBytes: rsp.ContentLength}
-		rn := digest.NewResourceName(d, remoteInstanceName, rspb.CacheType_CAS, storageFunc)
+		rn := digest.NewCASResourceName(d, remoteInstanceName, storageFunc)
+		rn.SetCompressor(repb.Compressor_ZSTD)
 		if _, _, err := cachetools.UploadFromReader(ctx, bsClient, rn, rsp.Body); err != nil {
 			return nil, status.UnavailableErrorf("failed to upload %s to cache: %s", digest.String(d), err)
 		}
@@ -434,4 +512,30 @@ func tempCopy(r io.Reader) (path string, err error) {
 		return "", status.UnavailableErrorf("failed to copy HTTP response to temp file: %s", err)
 	}
 	return f.Name(), nil
+}
+
+// TODO(https://github.com/buildbuddy-io/buildbuddy-internal/issues/6187): Reduce gRPC overhead from self-RPCs.
+func getByteStreamClient(env environment.Env) bspb.ByteStreamClient {
+	bsClient := env.GetByteStreamClient()
+	// If there is a local bytestream server, use it instead of the remote one.
+	if env.GetLocalByteStreamClient() != nil {
+		bsClient = env.GetLocalByteStreamClient()
+	}
+	return bsClient
+}
+func getCASClient(env environment.Env) repb.ContentAddressableStorageClient {
+	casClient := env.GetContentAddressableStorageClient()
+	// If there is a local content addressable storage server, use it instead of the remote one.
+	if env.GetLocalContentAddressableStorageClient() != nil {
+		casClient = env.GetLocalContentAddressableStorageClient()
+	}
+	return casClient
+}
+func getCacheClient(env environment.Env) cspb.CacheClient {
+	cacheClient := env.GetCacheClient()
+	// If there is a local cache server, use it instead of the remote one.
+	if env.GetLocalCacheClient() != nil {
+		cacheClient = env.GetLocalCacheClient()
+	}
+	return cacheClient
 }

@@ -6,14 +6,17 @@ go_library(
     importpath = "github.com/buildbuddy-io/buildbuddy/server/util/authutil",
     visibility = ["//visibility:public"],
     deps = [
-        "//proto:api_key_go_proto",
+        "//proto:capability_go_proto",
         "//server/environment",
         "//server/interfaces",
         "//server/util/alert",
         "//server/util/blocklist",
+        "//server/util/flag",
+        "//server/util/log",
         "//server/util/status",
         "@org_golang_google_genproto_googleapis_rpc//errdetails",
         "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//metadata",
         "@org_golang_google_grpc//status",
     ],
 )
@@ -24,6 +27,10 @@ go_test(
     srcs = ["authutil_test.go"],
     embed = [":authutil"],
     deps = [
+        "//server/environment",
+        "//server/interfaces",
+        "//server/util/status",
         "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )

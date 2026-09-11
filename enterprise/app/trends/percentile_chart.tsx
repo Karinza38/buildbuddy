@@ -1,19 +1,21 @@
 import React from "react";
 
-import * as format from "../../../app/format/format";
 import {
-  ResponsiveContainer,
-  ComposedChart,
   CartesianGrid,
+  ComposedChart,
+  Legend,
+  LegendPayload,
+  Line,
+  MouseHandlerDataParam,
+  ReferenceArea,
+  ResponsiveContainer,
+  Tooltip,
+  TooltipContentProps,
   XAxis,
   YAxis,
-  Line,
-  Legend,
-  Tooltip,
-  TooltipProps,
-  ReferenceArea,
 } from "recharts";
-import { CategoricalChartState } from "recharts/types/chart/types";
+import * as format from "../../../app/format/format";
+import { getHiddenSeriesAfterLegendClick } from "./chart_series";
 
 export interface PercentilesChartProps {
   title: string;
@@ -31,14 +33,47 @@ export interface PercentilesChartProps {
   onZoomSelection?: (startDate: number, endDate: number) => void;
 }
 
+interface PercentileDataSeries {
+  name: string;
+  dataKey: (datum: number) => number;
+  stroke: string;
+}
+
 interface State {
-  refAreaLeft?: string;
-  refAreaRight?: string;
+  refAreaLeft?: string | number;
+  refAreaRight?: string | number;
+  hiddenSeries: ReadonlySet<number>;
 }
 
 export default class PercentilesChartComponent extends React.Component<PercentilesChartProps, State> {
-  state: State = {};
+  state: State = { hiddenSeries: new Set() };
   private lastDataFromHover?: number;
+
+  getDataSeries(): PercentileDataSeries[] {
+    return [
+      { name: "P50", dataKey: (datum) => this.props.extractP50(datum), stroke: "#067BC2" },
+      { name: "P75", dataKey: (datum) => this.props.extractP75(datum), stroke: "#84BCDA" },
+      { name: "P90", dataKey: (datum) => this.props.extractP90(datum), stroke: "#ECC30B" },
+      { name: "P95", dataKey: (datum) => this.props.extractP95(datum), stroke: "#F37748" },
+      { name: "P99", dataKey: (datum) => this.props.extractP99(datum), stroke: "#D56062" },
+    ];
+  }
+
+  onLegendClick(payload: LegendPayload, seriesIndex: number, event: React.MouseEvent) {
+    event.stopPropagation();
+    const name = ((payload.payload ?? null) as PercentileDataSeries | null)?.name;
+    const legendIndex = this.getDataSeries().findIndex((s) => s.name === name);
+    if (legendIndex >= 0) {
+      this.setState((state) => ({
+        hiddenSeries: getHiddenSeriesAfterLegendClick(
+          state.hiddenSeries,
+          legendIndex,
+          this.getDataSeries().length,
+          event.ctrlKey || event.metaKey || event.shiftKey
+        ),
+      }));
+    }
+  }
 
   handleRowClick() {
     if (!this.props.onColumnClicked || !this.lastDataFromHover) {
@@ -47,7 +82,7 @@ export default class PercentilesChartComponent extends React.Component<Percentil
     this.props.onColumnClicked(this.lastDataFromHover);
   }
 
-  onMouseDown(e: CategoricalChartState) {
+  onMouseDown(e: MouseHandlerDataParam) {
     if (!this.props.onZoomSelection || !e) {
       this.setState({ refAreaLeft: undefined, refAreaRight: undefined });
       return;
@@ -55,7 +90,7 @@ export default class PercentilesChartComponent extends React.Component<Percentil
     this.setState({ refAreaLeft: e.activeLabel, refAreaRight: e.activeLabel });
   }
 
-  onMouseMove(e: CategoricalChartState) {
+  onMouseMove(e: MouseHandlerDataParam) {
     if (!this.props.onZoomSelection || !e) {
       this.setState({ refAreaLeft: undefined, refAreaRight: undefined });
       return;
@@ -66,7 +101,7 @@ export default class PercentilesChartComponent extends React.Component<Percentil
     this.setState({ refAreaRight: e.activeLabel });
   }
 
-  onMouseUp(e: CategoricalChartState) {
+  onMouseUp(e: MouseHandlerDataParam) {
     if (!this.props.onZoomSelection || !e) {
       this.setState({ refAreaLeft: undefined, refAreaRight: undefined });
       return;
@@ -89,75 +124,58 @@ export default class PercentilesChartComponent extends React.Component<Percentil
   }
 
   render() {
+    const dataSeries = this.getDataSeries();
+
     return (
       <div id={this.props.id} className={`trend-chart ${this.props.onZoomSelection ? "zoomable" : ""}`}>
         <div className="trend-chart-title">{this.props.title}</div>
         <ResponsiveContainer width="100%" height={300}>
           <ComposedChart
+            accessibilityLayer={false}
             data={this.props.data}
             style={this.props.onColumnClicked ? { cursor: "pointer" } : {}}
             onClick={this.props.onZoomSelection ? undefined : this.handleRowClick.bind(this)}
             onMouseDown={this.props.onZoomSelection && this.onMouseDown.bind(this)}
             onMouseMove={this.props.onZoomSelection && this.onMouseMove.bind(this)}
             onMouseUp={this.props.onZoomSelection && this.onMouseUp.bind(this)}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <Legend />
+            <CartesianGrid strokeDasharray="3 3" yAxisId="duration" />
+            <Legend onClick={this.onLegendClick.bind(this)} />
             <XAxis dataKey={(v) => v} tickFormatter={this.props.extractLabel} ticks={this.props.ticks} />
             <YAxis yAxisId="duration" tickFormatter={format.durationSec} allowDecimals={false} width={84} />
+            {/* Render a secondary y axis even though we don't have one so that chart edges align with others. */}
+            <YAxis
+              yAxisId="secondary"
+              orientation="right"
+              tick={false}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={undefined}
+              allowDecimals={undefined}
+              width={84}
+            />
             <Tooltip
               content={
                 <PercentilesChartTooltip
-                  labelFormatter={this.props.formatHoverLabel}
+                  formatLabel={this.props.formatHoverLabel}
                   shouldRender={() => this.shouldRenderTooltip()}
-                  extractP50={this.props.extractP50}
-                  extractP75={this.props.extractP75}
-                  extractP90={this.props.extractP90}
-                  extractP95={this.props.extractP95}
-                  extractP99={this.props.extractP99}
+                  dataSeries={dataSeries}
+                  hiddenSeries={this.state.hiddenSeries}
                   triggerCallback={(data) => (this.lastDataFromHover = data)}
                 />
               }
             />
-            <Line
-              yAxisId="duration"
-              name="P50"
-              dataKey={(datum) => this.props.extractP50(datum)}
-              stroke="#067BC2"
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              yAxisId="duration"
-              name="P75"
-              dataKey={(datum) => this.props.extractP75(datum)}
-              stroke="#84BCDA"
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              yAxisId="duration"
-              name="P90"
-              dataKey={(datum) => this.props.extractP90(datum)}
-              stroke="#ECC30B"
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              yAxisId="duration"
-              name="P95"
-              dataKey={(datum) => this.props.extractP95(datum)}
-              stroke="#F37748"
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              yAxisId="duration"
-              name="P99"
-              dataKey={(datum) => this.props.extractP99(datum)}
-              stroke="#D56062"
-              dot={false}
-              isAnimationActive={false}
-            />
+            {dataSeries.map((series, index) => (
+              <Line
+                key={series.name}
+                yAxisId="duration"
+                name={series.name}
+                dataKey={series.dataKey}
+                stroke={series.stroke}
+                dot={false}
+                hide={this.state.hiddenSeries.has(index)}
+                isAnimationActive={false}
+              />
+            ))}
             {this.state.refAreaLeft && this.state.refAreaRight ? (
               <ReferenceArea
                 yAxisId="duration"
@@ -174,14 +192,11 @@ export default class PercentilesChartComponent extends React.Component<Percentil
   }
 }
 
-interface PercentilesChartTooltipProps extends TooltipProps<any, any> {
-  labelFormatter: (datum: number) => string;
+interface PercentilesChartTooltipProps extends Partial<Pick<TooltipContentProps<any, any>, "active" | "payload">> {
+  formatLabel: (datum: number) => string;
   shouldRender: () => boolean;
-  extractP50: (datum: number) => number;
-  extractP75: (datum: number) => number;
-  extractP90: (datum: number) => number;
-  extractP95: (datum: number) => number;
-  extractP99: (datum: number) => number;
+  dataSeries: PercentileDataSeries[];
+  hiddenSeries: ReadonlySet<number>;
   triggerCallback: (datum: number) => void;
 }
 
@@ -204,13 +219,19 @@ class PercentilesChartTooltip extends React.Component<PercentilesChartTooltipPro
 
     return (
       <div className="trend-chart-hover">
-        <div className="trend-chart-hover-label">{this.props.labelFormatter(data)}</div>
+        <div className="trend-chart-hover-label">{this.props.formatLabel(data)}</div>
         <div className="trend-chart-hover-value">
-          <div>p99: {format.durationSec(this.props.extractP99(data))}</div>
-          <div>p95: {format.durationSec(this.props.extractP95(data))}</div>
-          <div>p90: {format.durationSec(this.props.extractP90(data))}</div>
-          <div>p75: {format.durationSec(this.props.extractP75(data))}</div>
-          <div>p50: {format.durationSec(this.props.extractP50(data))}</div>
+          {this.props.dataSeries
+            .map((series, index) => ({ series, index }))
+            .reverse()
+            .map(
+              ({ series, index }) =>
+                !this.props.hiddenSeries.has(index) && (
+                  <div key={series.name}>
+                    {series.name.toLowerCase()}: {format.durationSec(series.dataKey(data))}
+                  </div>
+                )
+            )}
         </div>
       </div>
     );

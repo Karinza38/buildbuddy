@@ -1,54 +1,53 @@
+import { AlertCircle, Check, Copy, LogOut } from "lucide-react";
 import React, { Suspense } from "react";
+import AlertComponent from "../../../app/alert/alert";
 import authService, { User } from "../../../app/auth/auth_service";
 import capabilities from "../../../app/capabilities/capabilities";
+import CompareActionsComponent from "../../../app/compare/compare_actions";
 import CompareInvocationsComponent from "../../../app/compare/compare_invocations";
+import { OutlinedButton } from "../../../app/components/button/button";
+import DebugMenu from "../../../app/debug/debug";
 import SetupComponent from "../../../app/docs/setup";
-import AlertComponent from "../../../app/alert/alert";
+import errorService from "../../../app/errors/error_service";
 import faviconService from "../../../app/favicon/favicon";
 import FooterComponent from "../../../app/footer/footer";
-import WorkflowsComponent from "../workflows/workflows";
 import InvocationComponent from "../../../app/invocation/invocation";
 import MenuComponent from "../../../app/menu/menu";
+import TimingProfilePageComponent from "../../../app/profile/profile";
 import router, { Path } from "../../../app/router/router";
-import errorService from "../../../app/errors/error_service";
+import Shortcuts from "../../../app/shortcuts/shortcuts";
+import AuditLogsComponent from "../auditlogs/auditlogs";
+import GroupSearchComponent from "../group_search/group_search";
 import HistoryComponent from "../history/history";
 import LoginComponent from "../login/login";
 import CreateOrgComponent from "../org/create_org";
 import JoinOrgComponent from "../org/join_org";
 import RepoComponent from "../repo/repo";
 import SettingsComponent from "../settings/settings";
-import SidebarComponent from "../sidebar/sidebar";
 import ShortcutsComponent from "../shortcuts/shortcuts";
+import SidebarComponent from "../sidebar/sidebar";
 import TapComponent from "../tap/tap";
+import TargetsComponent from "../targets/targets";
 import TrendsComponent from "../trends/trends";
-import Shortcuts from "../../../app/shortcuts/shortcuts";
 import UsageComponent from "../usage/usage";
-import GroupSearchComponent from "../group_search/group_search";
-import AuditLogsComponent from "../auditlogs/auditlogs";
-import { AlertCircle, Check, Copy, LogOut } from "lucide-react";
-import { OutlinedButton } from "../../../app/components/button/button";
-import Dialog, {
-  DialogBody,
-  DialogFooter,
-  DialogFooterButtons,
-  DialogHeader,
-  DialogTitle,
-} from "../../../app/components/dialog/dialog";
+import WorkflowsComponent from "../workflows/workflows";
+const SettingsThemeTransition = React.lazy(() => import("../settings/settings_theme_transition"));
 const CodeComponent = React.lazy(() => import("../code/code"));
 const CodeComponentV2 = React.lazy(() => import("../code/code_v2"));
 // TODO(siggisim): lazy load all components that make sense more gracefully.
 const CodeReviewComponent = React.lazy(() => import("../review/review"));
 
-import ExecutorsComponent from "../executors/executors";
-import UserPreferences from "../../../app/preferences/preferences";
-import OrgAccessDeniedComponent from "../org/org_access_denied";
-import rpc_service from "../../../app/service/rpc_service";
-import { api_key } from "../../../proto/api_key_ts_proto";
-import { copyToClipboard } from "../../../app/util/clipboard";
 import alert_service from "../../../app/alert/alert_service";
 import PickerComponent from "../../../app/picker/picker";
-import CodeSearchComponent from "../codesearch/codesearch";
+import UserPreferences from "../../../app/preferences/preferences";
+import rpc_service from "../../../app/service/rpc_service";
+import { copyToClipboard } from "../../../app/util/clipboard";
+import { api_key } from "../../../proto/api_key_ts_proto";
+import CacheProxiesComponent from "../cache_proxies/cache_proxies";
 import CliLoginComponent from "../cli_login/cli_login";
+import CodeSearchComponent from "../codesearch/codesearch";
+import ExecutorsComponent from "../executors/executors";
+import OrgAccessDeniedComponent from "../org/org_access_denied";
 
 interface State {
   user?: User;
@@ -62,6 +61,7 @@ interface State {
 
 capabilities.register("BuildBuddy Enterprise", true, [
   Path.invocationPath,
+  Path.profilePath,
   Path.userHistoryPath,
   Path.hostHistoryPath,
   Path.repoHistoryPath,
@@ -70,7 +70,9 @@ capabilities.register("BuildBuddy Enterprise", true, [
   Path.workflowsPath,
   Path.settingsPath,
   Path.trendsPath,
+  Path.targetsPath,
   Path.executorsPath,
+  Path.cacheProxiesPath,
   Path.tapPath,
   Path.codePath,
   Path.codesearchPath,
@@ -134,7 +136,7 @@ class ImpersonationComponent extends React.Component<ImpersonationProps, Imperso
     return (
       <div className="impersonation-toolbar">
         <div className="impersonation-caution">
-          <AlertCircle className="icon black" />
+          <AlertCircle className="black" />
           <span>
             <span className="hide-on-mobile">Caution: authenticated as a member of </span>
             <b>{this.props.user.selectedGroupName()}</b> ({this.props.user.selectedGroup?.id})
@@ -145,15 +147,11 @@ class ImpersonationComponent extends React.Component<ImpersonationProps, Imperso
           onClick={this.handleGenerateImpersonationAPIKeyClicked.bind(this)}
           className="generate-api-key-button hide-on-mobile">
           <span>{this.state.apiKey ? "Copy" : "Get"} temporary API key</span>
-          {this.state.isCopied ? (
-            <Check style={{ stroke: "green" }} className="icon black" />
-          ) : (
-            <Copy className="icon black" />
-          )}
+          {this.state.isCopied ? <Check style={{ stroke: "green" }} className="black" /> : <Copy className="black" />}
         </OutlinedButton>
         <OutlinedButton onClick={this.handleExitImpersonationModeClicked.bind(this)} className="exit-button">
           <span>Exit</span>
-          <LogOut className="icon black" />
+          <LogOut className="black" />
         </OutlinedButton>
       </div>
     );
@@ -186,6 +184,15 @@ export default class EnterpriseRootComponent extends React.Component {
 
   componentDidMount() {
     errorService.register();
+    this.updateDarkModeClass();
+  }
+
+  private updateDarkModeClass() {
+    document.documentElement.classList.toggle("dark", this.state.preferences.darkModeEnabled);
+  }
+
+  componentWillUnmount() {
+    this.state.preferences.cleanup();
   }
 
   handlePathChange() {
@@ -201,6 +208,7 @@ export default class EnterpriseRootComponent extends React.Component {
   }
 
   handlePreferencesChanged() {
+    this.updateDarkModeClass();
     this.forceUpdate();
   }
 
@@ -211,6 +219,7 @@ export default class EnterpriseRootComponent extends React.Component {
   render() {
     let invocationId = router.getInvocationId(this.state.path);
     let compareInvocationIds = this.state.user && router.getInvocationIdsForCompare(this.state.path);
+    let compareActionDetails = this.state.user && router.getActionDetailsForCompare(this.state.path);
     let historyUser = this.state.user && router.getHistoryUser(this.state.path);
     let historyHost = this.state.user && router.getHistoryHost(this.state.path);
     let historyRepo = this.state.user && router.getHistoryRepo(this.state.path);
@@ -220,18 +229,24 @@ export default class EnterpriseRootComponent extends React.Component {
     let cliLogin = this.state.user && this.state.path.startsWith("/cli-login");
     let org = this.state.user && this.state.path.startsWith("/org/");
     let orgCreate = this.state.user && this.state.path === Path.createOrgPath;
-    let orgJoinAuthenticated = this.state.path.startsWith(Path.joinOrgPath) && this.state.user;
+    let orgJoinAuthenticated =
+      capabilities.config.groupMembershipRequestsEnabled &&
+      this.state.path.startsWith(Path.joinOrgPath) &&
+      this.state.user;
     let orgAccessDenied = this.state.user && this.state.path === Path.orgAccessDeniedPath;
     let trends = this.state.user && this.state.path.startsWith("/trends");
+    let targets = this.state.user && this.state.path.startsWith("/targets");
     let usage = this.state.user && this.state.path.startsWith("/usage/");
     let auditLogs = this.state.user && this.state.path.startsWith("/audit-logs/");
     let executors = this.state.user && this.state.path.startsWith("/executors");
+    let cacheProxies = this.state.user && this.state.path.startsWith("/cache-proxies");
     let tests = this.state.user && this.state.path.startsWith("/tests");
     let workflows = this.state.user && this.state.path.startsWith("/workflows");
     let code = this.state.user && this.state.path.startsWith("/code");
     let repo = this.state.path.startsWith("/repo");
     let review = this.state.user && this.state.path.startsWith("/reviews");
     let codesearch = this.state.user && this.state.path.startsWith("/search");
+    let profile = this.state.path.startsWith(Path.profilePath);
     let fallback =
       !code &&
       !cliLogin &&
@@ -241,11 +256,14 @@ export default class EnterpriseRootComponent extends React.Component {
       !orgJoinAuthenticated &&
       !orgAccessDenied &&
       !trends &&
+      !targets &&
       !usage &&
       !executors &&
+      !cacheProxies &&
       !tests &&
       !invocationId &&
       !compareInvocationIds &&
+      !compareActionDetails &&
       !historyHost &&
       !historyUser &&
       !historyRepo &&
@@ -254,6 +272,7 @@ export default class EnterpriseRootComponent extends React.Component {
       !auditLogs &&
       !repo &&
       !codesearch &&
+      !profile &&
       !review;
 
     let setup =
@@ -261,14 +280,19 @@ export default class EnterpriseRootComponent extends React.Component {
       (fallback && !capabilities.auth);
     let login = fallback && !setup && !repo && !this.state.loading && !this.state.user;
     let home = fallback && !setup && !this.state.loading && this.state.user;
-    let sidebar = Boolean(this.state.user) && Boolean(this.state.user?.groups?.length) && !code && !repo && !cliLogin;
+    let sidebar =
+      Boolean(this.state.user) && Boolean(this.state.user?.groups?.length) && !code && !repo && !cliLogin && !profile;
     let menu = !sidebar && !repo && !code && !this.state.loading;
+
+    const rootClasses = ["root"];
+    if (this.state.preferences.denseModeEnabled) rootClasses.push("dense");
+    if (this.state.preferences.darkModeEnabled) rootClasses.push("dark");
+    if (sidebar || code) rootClasses.push("left");
 
     return (
       <>
         {this.state.user?.isImpersonating && <ImpersonationComponent user={this.state.user} />}
-        <div
-          className={`root ${this.state.preferences.denseModeEnabled ? "dense" : ""} ${sidebar || code ? "left" : ""}`}>
+        <div className={rootClasses.join(" ")}>
           <div className={`page ${menu ? "has-menu" : ""}`}>
             {menu && (
               <MenuComponent
@@ -290,7 +314,7 @@ export default class EnterpriseRootComponent extends React.Component {
             <div
               className={`root-main ${code ? "root-code" : ""} ${login ? "root-login" : ""} ${
                 tests ? "root-tests" : ""
-              }`}>
+              } ${settings ? "root-main-settings" : ""}`}>
               {!this.state.loading && (
                 <div className={`content ${login || repo ? "content-flex" : ""}`}>
                   {invocationId && (
@@ -305,11 +329,25 @@ export default class EnterpriseRootComponent extends React.Component {
                       />
                     </Suspense>
                   )}
+                  {profile && <TimingProfilePageComponent dark={this.state.preferences.darkModeEnabled} />}
                   {compareInvocationIds && (
                     <Suspense fallback={<div className="loading" />}>
                       <CompareInvocationsComponent
                         invocationAId={compareInvocationIds.a}
                         invocationBId={compareInvocationIds.b}
+                        search={this.state.search}
+                        tab={this.state.tab}
+                        user={this.state.user}
+                      />
+                    </Suspense>
+                  )}
+                  {compareActionDetails && (
+                    <Suspense fallback={<div className="loading" />}>
+                      <CompareActionsComponent
+                        invocationAId={compareActionDetails.invocationA}
+                        invocationBId={compareActionDetails.invocationB}
+                        actionADigest={compareActionDetails.actionA}
+                        actionBDigest={compareActionDetails.actionB}
                         search={this.state.search}
                         tab={this.state.tab}
                         user={this.state.user}
@@ -387,9 +425,15 @@ export default class EnterpriseRootComponent extends React.Component {
                       <TrendsComponent user={this.state.user} search={this.state.search} tab={this.state.tab} />
                     </Suspense>
                   )}
-                  {usage && this.state.user && <UsageComponent user={this.state.user} />}
-                  {auditLogs && this.state.user && <AuditLogsComponent user={this.state.user} />}
+                  {targets && this.state.user && <TargetsComponent user={this.state.user} search={this.state.search} />}
+                  {usage && this.state.user && <UsageComponent path={this.state.path} user={this.state.user} />}
+                  {auditLogs && this.state.user && (
+                    <AuditLogsComponent user={this.state.user} search={this.state.search} />
+                  )}
                   {executors && this.state.user && <ExecutorsComponent path={this.state.path} user={this.state.user} />}
+                  {cacheProxies && this.state.user && (
+                    <CacheProxiesComponent path={this.state.path} user={this.state.user} />
+                  )}
                   {home && <HistoryComponent user={this.state.user} tab={this.state.tab} search={this.state.search} />}
                   {workflows && this.state.user && <WorkflowsComponent path={this.state.path} user={this.state.user} />}
                   {repo && <RepoComponent path={this.state.path} search={this.state.search} user={this.state.user} />}
@@ -438,6 +482,11 @@ export default class EnterpriseRootComponent extends React.Component {
                 </div>
               )}
               {!this.state.loading && !code && <FooterComponent />}
+              {settings && (
+                <Suspense fallback={null}>
+                  <SettingsThemeTransition dark={this.state.preferences.darkModeEnabled} />
+                </Suspense>
+              )}
               {this.state.loading && <div className="loading loading"></div>}
             </div>
           </div>
@@ -445,6 +494,7 @@ export default class EnterpriseRootComponent extends React.Component {
           <AlertComponent />
           <PickerComponent />
           <ShortcutsComponent preferences={this.state.preferences} />
+          <DebugMenu preferences={this.state.preferences} />
         </div>
       </>
     );
